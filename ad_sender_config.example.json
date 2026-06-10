@@ -1,0 +1,13 @@
+{
+  "message_file": "message.txt",
+  "folder": "a",
+  "parse_mode": "html",
+  "link_preview": false,
+  "task_interval_minutes": 60,
+  "group_interval_seconds": 300,
+  "jitter_seconds": 20,
+  "max_groups_per_cycle": 0,
+  "max_cycles": 0,
+  "stop_on_flood_wait": true,
+  "log_file": "logs/ad-send-log.csv"
+}
