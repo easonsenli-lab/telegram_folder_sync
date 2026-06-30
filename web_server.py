@@ -45,6 +45,7 @@ from telethon import TelegramClient, functions, types, errors, utils
 from telethon.errors import SessionPasswordNeededError, UserDeactivatedError
 
 ENABLE_REALTIME_PRIVATE_DM = os.getenv("ROSEPAY_ENABLE_REALTIME_PRIVATE_DM", "1").strip().lower() not in {"0", "false", "off", "no"}
+private_relay_enabled = ENABLE_REALTIME_PRIVATE_DM
 
 app = FastAPI(title="Telegram Control Panel API", version="1.0.0")
 
@@ -3112,6 +3113,7 @@ async def mark_private_dm_events_read_api(account_id: str, user: dict = Depends(
 @app.post("/api/accounts/private-listeners/start-idle")
 async def start_idle_private_listeners(req: Optional[PrivateListenerStartRequest] = Body(default=None), user: dict = Depends(get_current_user)):
     """Bring idle account clients online so private-message listeners can receive DMs."""
+    global private_relay_enabled
     if not ENABLE_REALTIME_PRIVATE_DM:
         return {
             "started": [],
@@ -3120,6 +3122,7 @@ async def start_idle_private_listeners(req: Optional[PrivateListenerStartRequest
             "disabled": True,
             "message": "实时私聊监听已关闭，请使用 Bot 通知/中转方案"
         }
+    private_relay_enabled = True
     from db import engine, Session
     with Session(engine) as session:
         db_accounts = session.exec(query_allowed_accounts(session, user)).all()
@@ -3157,6 +3160,64 @@ async def start_idle_private_listeners(req: Optional[PrivateListenerStartRequest
             failed.append({"account_id": acc.id, "name": acc.account_name, "error": detail})
 
     return {"started": started, "skipped": skipped, "failed": failed}
+
+
+@app.post("/api/accounts/private-listeners/stop")
+async def stop_private_listeners(user: dict = Depends(get_current_user)):
+    """Stop realtime private-message relay listeners without touching account sessions on disk."""
+    global private_relay_enabled
+    private_relay_enabled = False
+
+    stopped = []
+    skipped = []
+    target_ids = list(auto_private_listener_accounts)
+    auto_private_listener_accounts.clear()
+    auto_private_listener_cooldowns.clear()
+
+    for account_id in target_ids:
+        busy_reason = get_private_poll_skip_reason(account_id)
+        client = active_clients.get(account_id)
+        if busy_reason:
+            skipped.append({"account_id": account_id, "reason": busy_reason})
+            set_account_status(
+                account_id,
+                {"private_listener": False, "private_listener_source": None},
+                source="private-listener-stop-busy"
+            )
+            continue
+
+        if client:
+            try:
+                active_clients.pop(account_id, None)
+                active_clients_last_accessed.pop(account_id, None)
+                registered_listeners.discard(account_id)
+                await _disconnect_client_safely(account_id, client)
+                stopped.append({"account_id": account_id})
+                set_account_status(
+                    account_id,
+                    {
+                        "is_connected": False,
+                        "private_listener": False,
+                        "private_listener_source": None,
+                    },
+                    source="private-listener-stop"
+                )
+            except Exception as exc:
+                skipped.append({"account_id": account_id, "reason": str(exc)})
+                set_account_status(
+                    account_id,
+                    {"private_listener": False, "private_listener_source": None, "last_error": str(exc)},
+                    source="private-listener-stop-error"
+                )
+        else:
+            stopped.append({"account_id": account_id})
+            set_account_status(
+                account_id,
+                {"private_listener": False, "private_listener_source": None},
+                source="private-listener-stop"
+            )
+
+    return {"stopped": stopped, "skipped": skipped, "enabled": private_relay_enabled}
 
 
 @app.get("/api/accounts/{account_id}/private-dialogs")
@@ -7457,6 +7518,10 @@ async def auto_private_listener_loop():
     last_heartbeat_check = {}  # account_id -> timestamp
     while True:
         try:
+            if not private_relay_enabled:
+                await asyncio.sleep(AUTO_PRIVATE_LISTENER_INTERVAL_SECONDS)
+                continue
+
             with Session(engine) as session:
                 accounts = session.exec(select(AccountDb)).all()
 

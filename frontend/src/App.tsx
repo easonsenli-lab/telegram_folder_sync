@@ -1105,6 +1105,8 @@ export default function App() {
 
   const [accountSortDesc, setAccountSortDesc] = useState<boolean>(true);
 
+  const privateRelayActive = backendAccounts.some(acc => Boolean(acc.private_listener));
+
   useEffect(() => {
     showPrivateChatModalRef.current = showPrivateChatModal;
     privateChatAccountRef.current = privateChatAccount;
@@ -1197,11 +1199,14 @@ export default function App() {
     return state === 'operation' || state === 'join' || state === 'campaign' || state === 'scraper' || state === 'expansion';
   };
 
-  const startPrivateRelayListeners = async () => {
+  const togglePrivateRelayListeners = async () => {
     if (privateRelayStarting) return;
     setPrivateRelayStarting(true);
     try {
-      const res = await fetch(`${BASE_URL}/api/accounts/private-listeners/start-idle`, {
+      const endpoint = privateRelayActive
+        ? `${BASE_URL}/api/accounts/private-listeners/stop`
+        : `${BASE_URL}/api/accounts/private-listeners/start-idle`;
+      const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({})
@@ -1212,6 +1217,10 @@ export default function App() {
       }
       if (data.disabled) {
         setToastText(data.message || '实时私聊中转未启用');
+      } else if (privateRelayActive) {
+        const stopped = Array.isArray(data.stopped) ? data.stopped.length : 0;
+        const skipped = Array.isArray(data.skipped) ? data.skipped.length : 0;
+        setToastText(`私聊中转已关闭：停止 ${stopped} 个，跳过 ${skipped} 个`);
       } else {
         const started = Array.isArray(data.started) ? data.started.length : 0;
         const skipped = Array.isArray(data.skipped) ? data.skipped.length : 0;
@@ -1222,7 +1231,7 @@ export default function App() {
       await fetchBackendAccounts(false);
       await fetchPrivateUnreadSummary(false);
     } catch (err: any) {
-      setToastText(err?.message || '启动私聊中转失败');
+      setToastText(err?.message || (privateRelayActive ? '关闭私聊中转失败' : '启动私聊中转失败'));
       setTimeout(() => setToastText(''), 4500);
     } finally {
       setPrivateRelayStarting(false);
@@ -10379,19 +10388,23 @@ export default function App() {
 
                       <button 
 
-                        onClick={startPrivateRelayListeners}
+                        onClick={togglePrivateRelayListeners}
 
                         disabled={privateRelayStarting}
 
-                        className="px-4 py-2 rounded-lg text-xs font-bold shadow-sm transition-all flex items-center gap-1.5 border bg-cyan-50 hover:bg-cyan-100 disabled:bg-cyan-50 disabled:text-cyan-400 text-cyan-700 border-cyan-200"
+                        className={`px-4 py-2 rounded-lg text-xs font-bold shadow-sm transition-all flex items-center gap-1.5 border ${
+                          privateRelayActive
+                            ? 'bg-emerald-50 hover:bg-emerald-100 disabled:bg-emerald-50 disabled:text-emerald-400 text-emerald-700 border-emerald-200'
+                            : 'bg-cyan-50 hover:bg-cyan-100 disabled:bg-cyan-50 disabled:text-cyan-400 text-cyan-700 border-cyan-200'
+                        }`}
 
-                        title="启动所有可用且空闲账号的实时私聊监听；收到私聊后由 AI Bot 转发到中转群主题。"
+                        title={privateRelayActive ? '关闭当前私聊中转监听，不删除任何 session 或数据。' : '启动所有可用且空闲账号的实时私聊监听；收到私聊后由 AI Bot 转发到中转群主题。'}
 
                       >
 
                         {privateRelayStarting ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Bell className="w-3.5 h-3.5" />}
 
-                        <span>{privateRelayStarting ? '正在启动中转' : '启动私聊中转'}</span>
+                        <span>{privateRelayStarting ? (privateRelayActive ? '正在关闭中转' : '正在启动中转') : (privateRelayActive ? '关闭私聊中转' : '启动私聊中转')}</span>
 
                       </button>
 
