@@ -354,7 +354,7 @@ export default function App() {
 
   // User management states
 
-  const [usersList, setUsersList] = useState<{id: number, username: string, role: string, company: string, telegram_contact?: string, forum_chat_id?: string, created_at: string}[]>([]);
+  const [usersList, setUsersList] = useState<{id: number, username: string, role: string, company: string, telegram_contact?: string, created_at: string}[]>([]);
 
   const [showAddUserModal, setShowAddUserModal] = useState<boolean>(false);
 
@@ -367,8 +367,6 @@ export default function App() {
   const [newUserCompany, setNewUserCompany] = useState<string>('admin');
 
   const [newUserTelegramContact, setNewUserTelegramContact] = useState<string>('');
-
-  const [newUserForumChatId, setNewUserForumChatId] = useState<string>('');
 
   const [showEditPasswordModal, setShowEditPasswordModal] = useState<boolean>(false);
 
@@ -393,8 +391,6 @@ export default function App() {
   const [editUserPassword, setEditUserPassword] = useState<string>('');
 
   const [editUserTelegramContact, setEditUserTelegramContact] = useState<string>('');
-
-  const [editUserForumChatId, setEditUserForumChatId] = useState<string>('');
 
 
 
@@ -1982,9 +1978,7 @@ export default function App() {
 
           company: newUserCompany,
 
-          telegram_contact: newUserTelegramContact.trim(),
-
-          forum_chat_id: newUserForumChatId.trim()
+          telegram_contact: newUserTelegramContact.trim()
 
         })
 
@@ -2007,8 +2001,6 @@ export default function App() {
         setNewUserCompany('admin');
 
         setNewUserTelegramContact('');
-
-        setNewUserForumChatId('');
 
         fetchUsersList();
 
@@ -2102,9 +2094,7 @@ export default function App() {
 
         company: editUserCompany,
 
-        telegram_contact: editUserTelegramContact.trim(),
-
-        forum_chat_id: editUserForumChatId.trim()
+        telegram_contact: editUserTelegramContact.trim()
 
       };
 
@@ -2139,8 +2129,6 @@ export default function App() {
         setEditUserPassword('');
 
         setEditUserTelegramContact('');
-
-        setEditUserForumChatId('');
 
         fetchUsersList();
 
@@ -14471,8 +14459,6 @@ export default function App() {
 
                             const telegramContact = (user.telegram_contact || '').trim();
 
-                            const forumChatId = (user.forum_chat_id || '').trim();
-
                             const telegramHref = telegramContact ? `https://t.me/${telegramContact.replace(/^@/, '')}` : '';
 
                             return (
@@ -14545,20 +14531,6 @@ export default function App() {
 
                                   )}
 
-                                  {forumChatId ? (
-
-                                    <span className="font-mono text-slate-500 truncate max-w-[180px]" title={forumChatId}>
-
-                                      中转群 {forumChatId}
-
-                                    </span>
-
-                                  ) : (
-
-                                    <span className="text-slate-300">未设置中转群</span>
-
-                                  )}
-
                                 </div>
 
                               </td>
@@ -14584,8 +14556,6 @@ export default function App() {
                                     setEditUserPassword('');
 
                                     setEditUserTelegramContact(user.telegram_contact || '');
-
-                                    setEditUserForumChatId(user.forum_chat_id || '');
 
                                     setShowEditUserModal(true);
 
@@ -17130,8 +17100,6 @@ export default function App() {
 
                     setNewUserTelegramContact('');
 
-                    setNewUserForumChatId('');
-
                   }}
 
                   className="w-8 h-8 hover:bg-slate-100 rounded-full flex items-center justify-center text-slate-400 hover:text-slate-600 transition-colors"
@@ -17220,47 +17188,23 @@ export default function App() {
 
 
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="flex flex-col gap-1.5">
 
-                  <div className="flex flex-col gap-1.5">
+                  <label className="text-xs font-semibold text-slate-700">电报通知账号</label>
 
-                    <label className="text-xs font-semibold text-slate-700">电报通知账号</label>
+                  <input
 
-                    <input
+                    type="text"
 
-                      type="text"
+                    value={newUserTelegramContact}
 
-                      value={newUserTelegramContact}
+                    onChange={(e) => setNewUserTelegramContact(e.target.value)}
 
-                      onChange={(e) => setNewUserTelegramContact(e.target.value)}
+                    placeholder="@username 或 t.me/username"
 
-                      placeholder="@username 或 t.me/username"
+                    className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 text-sm focus:outline-none focus:bg-white focus:border-blue-500 font-mono"
 
-                      className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 text-sm focus:outline-none focus:bg-white focus:border-blue-500 font-mono"
-
-                    />
-
-                  </div>
-
-                  <div className="flex flex-col gap-1.5">
-
-                    <label className="text-xs font-semibold text-slate-700">中转群 Chat ID</label>
-
-                    <input
-
-                      type="text"
-
-                      value={newUserForumChatId}
-
-                      onChange={(e) => setNewUserForumChatId(e.target.value)}
-
-                      placeholder="-100xxxxxxxxxx"
-
-                      className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 text-sm focus:outline-none focus:bg-white focus:border-blue-500 font-mono"
-
-                    />
-
-                  </div>
+                  />
 
                 </div>
 
@@ -17338,8 +17282,6 @@ export default function App() {
 
                     setNewUserTelegramContact('');
 
-                    setNewUserForumChatId('');
-
                   }}
 
                   className="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-700 text-xs font-bold rounded-lg transition-all"
@@ -17401,8 +17343,6 @@ export default function App() {
                     setEditUserPassword('');
 
                     setEditUserTelegramContact('');
-
-                    setEditUserForumChatId('');
 
                   }}
 
@@ -17490,47 +17430,23 @@ export default function App() {
 
 
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="flex flex-col gap-1.5">
 
-                  <div className="flex flex-col gap-1.5">
+                  <label className="text-xs font-semibold text-slate-700">电报通知账号</label>
 
-                    <label className="text-xs font-semibold text-slate-700">电报通知账号</label>
+                  <input
 
-                    <input
+                    type="text"
 
-                      type="text"
+                    value={editUserTelegramContact}
 
-                      value={editUserTelegramContact}
+                    onChange={(e) => setEditUserTelegramContact(e.target.value)}
 
-                      onChange={(e) => setEditUserTelegramContact(e.target.value)}
+                    placeholder="@username 或 t.me/username"
 
-                      placeholder="@username 或 t.me/username"
+                    className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 text-sm focus:outline-none focus:bg-white focus:border-blue-500 font-mono"
 
-                      className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 text-sm focus:outline-none focus:bg-white focus:border-blue-500 font-mono"
-
-                    />
-
-                  </div>
-
-                  <div className="flex flex-col gap-1.5">
-
-                    <label className="text-xs font-semibold text-slate-700">中转群 Chat ID</label>
-
-                    <input
-
-                      type="text"
-
-                      value={editUserForumChatId}
-
-                      onChange={(e) => setEditUserForumChatId(e.target.value)}
-
-                      placeholder="-100xxxxxxxxxx"
-
-                      className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 text-sm focus:outline-none focus:bg-white focus:border-blue-500 font-mono"
-
-                    />
-
-                  </div>
+                  />
 
                 </div>
 
@@ -17607,8 +17523,6 @@ export default function App() {
                     setEditUserPassword('');
 
                     setEditUserTelegramContact('');
-
-                    setEditUserForumChatId('');
 
                   }}
 
