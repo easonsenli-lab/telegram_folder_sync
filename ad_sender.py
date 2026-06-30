@@ -29,6 +29,7 @@ from sync_folder_groups import (
     safe_print,
 )
 from account_manager import choose_account, display_name
+from private_dm_events import register_private_dm_event_listener
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,7 @@ class RuntimeOptions:
     task_interval_seconds: int
     group_interval_seconds: int
     message: str
+    is_strategy: bool = False
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -208,6 +210,45 @@ def append_log(path: Path, group: TargetGroup, action: str, status: str, detail:
             ]
         )
 
+    # Also write to SQLite database data/rosepay.db
+    try:
+        import sqlite3
+        db_path = Path(__file__).resolve().parent / "data" / "rosepay.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ad_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    time TEXT,
+                    folder TEXT,
+                    chat_id TEXT,
+                    title TEXT,
+                    action TEXT,
+                    status TEXT,
+                    detail TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO ad_logs (time, folder, chat_id, title, action, status, detail)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    group.folder,
+                    str(group.chat_id),
+                    group.title,
+                    action,
+                    status,
+                    detail
+                )
+            )
+    except Exception as e:
+        print(f"Failed to append log to SQLite: {e}", flush=True)
+
+
 
 def prompt_text(prompt: str, default: str | None = None) -> str:
     suffix = f"（默认：{default}）" if default not in (None, "") else ""
@@ -303,6 +344,7 @@ def options_from_last_plan(plan: dict[str, Any], all_groups: list[TargetGroup], 
         task_interval_seconds=int(plan.get("task_interval_seconds", 0) or 0),
         group_interval_seconds=int(plan.get("group_interval_seconds", 0) or 0),
         message=message,
+        is_strategy=bool(plan.get("is_strategy", False))
     )
 
 
@@ -388,6 +430,7 @@ def collect_runtime_options(
     groups: list[TargetGroup],
     message_path: Path,
     config: dict[str, Any],
+    is_strategy: bool = False
 ) -> RuntimeOptions:
     chosen_groups = groups
     safe_print("")
@@ -412,6 +455,7 @@ def collect_runtime_options(
         task_interval_seconds=task_interval_minutes * 60,
         group_interval_seconds=group_interval_seconds,
         message=message,
+        is_strategy=is_strategy
     )
 
 
@@ -420,6 +464,7 @@ def get_runtime_options(
     config: dict[str, Any],
     all_groups: list[TargetGroup],
     message_path: Path,
+    is_strategy: bool = False
 ) -> RuntimeOptions:
     plan_path = last_plan_path(base_dir, config)
     last_plan = load_last_plan(plan_path)
@@ -439,7 +484,7 @@ def get_runtime_options(
     if not groups:
         raise SystemExit(f"没有找到启用状态的群组。当前文件夹：{folder or '全部文件夹'}")
 
-    options = collect_runtime_options(groups, message_path, config)
+    options = collect_runtime_options(groups, message_path, config, is_strategy=is_strategy)
     save_last_plan(plan_path, options)
     safe_print(f"已保存本次任务计划：{display_path(base_dir, plan_path)}")
     return options
@@ -458,6 +503,31 @@ async def sleep_countdown(seconds: int, label: str) -> None:
         return
     safe_print(f"{label}：等待 {seconds} 秒")
     await asyncio.sleep(seconds)
+
+
+async def call_strategy_send_api(chat_id: int, gtype: str, fallback_message: str, company: str) -> dict:
+    import urllib.request
+    import urllib.error
+    url = "http://127.0.0.1:8000/api/internal/send-strategy-message"
+    data = {
+        "chat_id": str(chat_id),
+        "gtype": gtype,
+        "fallback_message": fallback_message,
+        "company": company
+    }
+    req_body = json.dumps(data).encode("utf-8")
+    
+    def _send():
+        req = urllib.request.Request(
+            url,
+            data=req_body,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+            
+    return await asyncio.to_thread(_send)
 
 
 async def run_cycle(
@@ -480,33 +550,65 @@ async def run_cycle(
     for index, group in enumerate(targets, start=1):
         label = f"[{index}/{len(targets)}] {group.chat_id} {group.title}"
         if not send:
-            safe_print(f"预览发送：{label}")
+            safe_print(f"预览策略发送：{label}")
             append_log(log_path, group, "预览", "成功")
         else:
-            try:
-                safe_print(f"正在发送：{label}")
-                await client.send_message(
-                    group.chat_id,
-                    options.message,
-                    parse_mode=parse_mode,
-                    link_preview=link_preview,
-                )
-                append_log(log_path, group, "发送", "成功")
-            except FloodWaitError as exc:
-                detail = f"Telegram 要求等待 {exc.seconds} 秒"
-                safe_print(f"[限流] {label}：{detail}")
-                append_log(log_path, group, "发送", "限流", detail)
-                if stop_on_flood_wait:
-                    return False
-                await sleep_countdown(int(exc.seconds), "Telegram 限流等待")
-            except (ChatAdminRequiredError, ChatWriteForbiddenError, UserBannedInChannelError) as exc:
-                detail = type(exc).__name__
-                safe_print(f"[跳过] {label}：无发言权限或账号在群内不可用（{detail}）")
-                append_log(log_path, group, "发送", "无权限", detail)
-            except Exception as exc:
-                detail = f"{type(exc).__name__}: {exc}"
-                safe_print(f"[错误] {label}：{detail}")
-                append_log(log_path, group, "发送", "错误", detail)
+            if options.is_strategy:
+                try:
+                    safe_print(f"正在策略发送：{label}")
+                    # Determine group type
+                    gtype = group.folder
+                    if gtype not in ("中文长", "中文短", "英文长", "英文短"):
+                        try:
+                            import sqlite3
+                            db_path = Path(__file__).resolve().parent / "data" / "rosepay.db"
+                            with sqlite3.connect(str(db_path)) as conn:
+                                cursor = conn.cursor()
+                                cursor.execute("SELECT category FROM groups_library WHERE id = ? OR username = ?", (str(group.chat_id), group.username or ""))
+                                row = cursor.fetchone()
+                                if row:
+                                    gtype = row[0]
+                        except Exception:
+                            pass
+                    if gtype not in ("中文长", "中文短", "英文长", "英文短"):
+                        gtype = "英文短"
+                        
+                    company = config.get("company", "admin")
+                    res = await call_strategy_send_api(group.chat_id, gtype, options.message, company)
+                    
+                    act_name = res.get("account_name", "未知账号")
+                    detail = f"发送话术摘要: {message_summary(res.get('message_sent', ''))}"
+                    safe_print(f"[策略成功] {label}，执行账号：{act_name}")
+                    append_log(log_path, group, f"发送(策略:{act_name})", "成功", detail)
+                except Exception as exc:
+                    detail = f"策略发送异常: {str(exc)}"
+                    safe_print(f"[策略失败] {label}：{detail}")
+                    append_log(log_path, group, "发送(策略)", "错误", detail)
+            else:
+                try:
+                    safe_print(f"正在发送：{label}")
+                    await client.send_message(
+                        group.chat_id,
+                        options.message,
+                        parse_mode=parse_mode,
+                        link_preview=link_preview,
+                    )
+                    append_log(log_path, group, "发送", "成功")
+                except FloodWaitError as exc:
+                    detail = f"Telegram 要求等待 {exc.seconds} 秒"
+                    safe_print(f"[限流] {label}：{detail}")
+                    append_log(log_path, group, "发送", "限流", detail)
+                    if stop_on_flood_wait:
+                        return False
+                    await sleep_countdown(int(exc.seconds), "Telegram 限流等待")
+                except (ChatAdminRequiredError, ChatWriteForbiddenError, UserBannedInChannelError) as exc:
+                    detail = type(exc).__name__
+                    safe_print(f"[跳过] {label}：无发言权限或账号在群内不可用（{detail}）")
+                    append_log(log_path, group, "发送", "无权限", detail)
+                except Exception as exc:
+                    detail = f"{type(exc).__name__}: {exc}"
+                    safe_print(f"[错误] {label}：{detail}")
+                    append_log(log_path, group, "发送", "错误", detail)
 
         if index < len(targets):
             wait_seconds = delay_with_jitter(options.group_interval_seconds, jitter)
@@ -518,51 +620,141 @@ async def run_cycle(
     return True
 
 
+def load_account_from_db(db_path: Path, account_id: str) -> dict[str, Any]:
+    import sqlite3
+    if not db_path.exists():
+        raise SystemExit(f"数据库不存在：{db_path}")
+    
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM accounts WHERE id = ?", (account_id,))
+        row = cur.fetchone()
+        if not row:
+            raise SystemExit(f"在数据库中找不到账号：{account_id}")
+            
+        d = dict(row)
+        
+        # Construct the config structure exactly matching config.json structure
+        config = {
+            "account_name": d["account_name"],
+            "auth_mode": d["auth_mode"],
+            "api_id": d["api_id"],
+            "api_hash": d["api_hash"],
+            "tdata_path": d["tdata_path"],
+            "session_name": d["session_name"],
+            "folder_name": d["folder_name"],
+            "output_csv": d["output_csv"],
+            "output_db": d["output_db"],
+            "include_types": [x.strip() for x in (d["include_types"] or "group,supergroup").split(",") if x.strip()],
+            "mark_removed_disabled": bool(d["mark_removed_disabled"]),
+            "connection_timeout_seconds": int(d["connection_timeout_seconds"] or 12),
+            "connection_retries": int(d["connection_retries"] or 2),
+            "proxy": {
+                "enabled": bool(d["proxy_enabled"]),
+                "type": d["proxy_type"],
+                "host": d["proxy_host"],
+                "port": int(d["proxy_port"] or 8800),
+                "username": d["proxy_username"] or "",
+                "password": d["proxy_password"] or ""
+            },
+            # campaign details directly from DB
+            "campaign_folder": d["campaign_folder"],
+            "campaign_message": d["campaign_message"],
+            "campaign_interval_minutes": int(d["campaign_interval_minutes"] or 60),
+            "campaign_group_interval_seconds": int(d["campaign_group_interval_seconds"] or 5)
+        }
+        return config
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description="按本地配置向已同步的 Telegram 群组发送广告文本。")
     parser.add_argument("--config", default="ad_sender_config.json", help="发送配置 JSON 路径")
+    parser.add_argument("--account", help="执行任务的账号ID，使用 SQLite 数据库配置")
     parser.add_argument("--folder", help="直接使用这个文件夹；不填则先列出文件夹让用户选择")
     parser.add_argument("--send", action="store_true", help="真实发送；不加此参数只做预览")
+    parser.add_argument("--no-confirm", action="store_true", help="跳过真实发送确认提示")
+    parser.add_argument("--strategy", action="store_true", help="使用策略轰炸模式")
     args = parser.parse_args()
 
-    config_path = Path(args.config).resolve()
-    base_dir = config_path.parent
-    config = load_sender_config(config_path)
-
-    if config.get("auth_config"):
-        auth_config_path = resolve_path(base_dir, config["auth_config"])
+    db_path = Path(__file__).resolve().parent / "data" / "rosepay.db"
+    
+    if args.account:
+        account_id = args.account
+        config = load_account_from_db(db_path, args.account)
+        auth_config = config
+        auth_config_path = Path(__file__).resolve().parent / "accounts" / f"{args.account}.json"
+        auth_base_dir = auth_config_path.parent.parent
+        
+        message = config.get("campaign_message") or ""
+        if not message:
+            raise SystemExit("广告内容为空。请在控制面板配置并保存广告内容。")
+            
+        log_path = Path(__file__).resolve().parent / "logs" / "ad-send-log.csv"
+        
+        sync_groups_before_task(auth_base_dir, auth_config_path)
+        
+        groups_csv_path = account_groups_csv(auth_base_dir, auth_config)
+        all_groups = load_all_groups(groups_csv_path)
+        if not all_groups:
+            raise SystemExit("没有找到任何启用状态的群组。请先同步文件夹。")
+            
+        folder_name = args.folder or config.get("campaign_folder")
+        if not folder_name:
+            folder_name = choose_folder(all_groups)
+            
+        filtered_groups = [group for group in all_groups if group.folder == folder_name]
+        if not filtered_groups:
+            raise SystemExit(f"没有找到启用状态的群组。当前文件夹：{folder_name}")
+            
+        options = RuntimeOptions(
+            groups=filtered_groups,
+            max_cycles=0,
+            task_interval_seconds=int(config.get("campaign_interval_minutes", 60)) * 60,
+            group_interval_seconds=int(config.get("campaign_group_interval_seconds", 5)),
+            message=message,
+            is_strategy=bool(args.strategy)
+        )
+        base_dir = Path(__file__).resolve().parent
     else:
-        auth_config_path = choose_account("请选择执行任务的账号")
-    auth_config = load_auth_config(auth_config_path)
-    auth_base_dir = auth_config_path.parent
+        config_path = Path(args.config).resolve()
+        base_dir = config_path.parent
+        config = load_sender_config(config_path)
+
+        if config.get("auth_config"):
+            auth_config_path = resolve_path(base_dir, config["auth_config"])
+        else:
+            auth_config_path = choose_account("请选择执行任务的账号")
+        account_id = auth_config_path.stem
+        auth_config = load_auth_config(auth_config_path)
+        auth_base_dir = auth_config_path.parent
+        
+        sync_groups_before_task(auth_base_dir, auth_config_path)
+        
+        groups_csv_path = account_groups_csv(auth_base_dir, auth_config)
+        all_groups = load_all_groups(groups_csv_path)
+        if not all_groups:
+            raise SystemExit("没有找到任何启用状态的群组。请先同步文件夹。")
+        message_path = resolve_path(base_dir, config["message_file"])
+        message = read_message(message_path)
+        log_path = resolve_path(base_dir, config["log_file"])
+
+        if args.folder is not None:
+            filtered_groups = [group for group in all_groups if group.folder == args.folder]
+            if not filtered_groups:
+                raise SystemExit(f"没有找到启用状态的群组。当前文件夹：{args.folder}")
+            options = collect_runtime_options(filtered_groups, message_path, config, is_strategy=bool(args.strategy))
+            save_last_plan(last_plan_path(base_dir, config), options)
+        else:
+            options = get_runtime_options(base_dir, config, all_groups, message_path, is_strategy=bool(args.strategy))
 
     safe_print("")
     safe_print(f"当前任务账号：{display_name(auth_config_path)}")
     safe_print(f"账号配置：accounts/{auth_config_path.name}")
-
-    sync_groups_before_task(auth_base_dir, auth_config_path)
-
-    groups_csv_path = account_groups_csv(auth_base_dir, auth_config)
-    all_groups = load_all_groups(groups_csv_path)
-    if not all_groups:
-        raise SystemExit("没有找到任何启用状态的群组。请先同步文件夹。")
-    message_path = resolve_path(base_dir, config["message_file"])
-    message = read_message(message_path)
-    log_path = resolve_path(base_dir, config["log_file"])
-
     safe_print(f"运行模式：{'真实发送' if args.send else '预览，不发送'}")
-    safe_print(f"已同步可用群组数量：{len(all_groups)}")
-    safe_print(f"广告文本字符数：{len(message)}")
+    safe_print(f"已同步可用群组数量：{len(options.groups)}")
+    safe_print(f"广告文本字符数：{len(options.message)}")
     safe_print(f"日志文件：{display_path(base_dir, log_path)}")
-
-    if args.folder is not None:
-        filtered_groups = [group for group in all_groups if group.folder == args.folder]
-        if not filtered_groups:
-            raise SystemExit(f"没有找到启用状态的群组。当前文件夹：{args.folder}")
-        options = collect_runtime_options(filtered_groups, message_path, config)
-        save_last_plan(last_plan_path(base_dir, config), options)
-    else:
-        options = get_runtime_options(base_dir, config, all_groups, message_path)
 
     safe_print("")
     safe_print("任务参数确认：")
@@ -571,7 +763,7 @@ async def main() -> None:
     safe_print(f"- 每次任务执行间隔：{options.task_interval_seconds // 60} 分钟")
     safe_print(f"- 每个群组发送间隔：{options.group_interval_seconds} 秒")
 
-    if args.send:
+    if args.send and not args.no_confirm:
         confirm = prompt_text("确认真实发送？直接回车继续，输入 n 取消", "").lower()
         if confirm in {"n", "no", "否", "取消"}:
             raise SystemExit("已取消真实发送。")
@@ -581,6 +773,13 @@ async def main() -> None:
 
     async with client:
         await check_account_status(client)
+        register_private_dm_event_listener(
+            client,
+            account_id=str(account_id),
+            account_label=display_name(auth_config_path),
+            source="ad_sender",
+        )
+        safe_print("已开启私聊实时监听：广告任务运行时收到私聊会写入本地通知队列。")
         cycle = 1
         while True:
             should_continue = await run_cycle(client, options, config, log_path, args.send, cycle)

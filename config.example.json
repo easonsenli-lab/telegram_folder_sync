@@ -12,7 +12,7 @@
   "connection_timeout_seconds": 12,
   "connection_retries": 2,
   "proxy": {
-    "enabled": true,
+    "enabled": false,
     "type": "http",
     "host": "127.0.0.1",
     "port": 8800,

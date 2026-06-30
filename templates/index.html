@@ -1,0 +1,1151 @@
+<!DOCTYPE html>
+<html lang="zh-cn">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Telegram 营销与登录控制台</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-color: #0b0f19;
+      --card-bg: rgba(22, 30, 49, 0.7);
+      --card-border: rgba(255, 255, 255, 0.08);
+      --text-color: #e2e8f0;
+      --text-muted: #94a3b8;
+      
+      --primary: #3b82f6;
+      --primary-hover: #2563eb;
+      --accent: #8b5cf6;
+      --accent-hover: #7c3aed;
+      --success: #10b981;
+      --success-hover: #059669;
+      --danger: #ef4444;
+      --danger-hover: #dc2626;
+      --warning: #f59e0b;
+      
+      --glass-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+      --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, sans-serif;
+      background-color: var(--bg-color);
+      background-image: 
+        radial-gradient(at 10% 20%, rgba(59, 130, 246, 0.15) 0px, transparent 50%),
+        radial-gradient(at 90% 80%, rgba(139, 92, 246, 0.15) 0px, transparent 50%);
+      background-attachment: fixed;
+      color: var(--text-color);
+      min-height: 100vh;
+      padding: 24px;
+      line-height: 1.5;
+    }
+
+    h1, h2, h3, h4 {
+      font-family: 'Outfit', sans-serif;
+      font-weight: 600;
+    }
+
+    /* Layout Containers */
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 20px 24px;
+      background: var(--card-bg);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      box-shadow: var(--glass-shadow);
+    }
+
+    .header-title {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .logo-glow {
+      width: 12px;
+      height: 12px;
+      background-color: var(--primary);
+      border-radius: 50%;
+      box-shadow: 0 0 12px var(--primary);
+      animation: pulse 2s infinite;
+    }
+
+    header h1 {
+      font-size: 24px;
+      background: linear-gradient(135deg, #60a5fa 0%, #a78bfa 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    /* Grid Layout */
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 24px;
+    }
+
+    @media (min-width: 1024px) {
+      .grid {
+        grid-template-columns: 320px 1fr 1fr;
+      }
+    }
+
+    /* Card Styling */
+    .card {
+      background: var(--card-bg);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      padding: 24px;
+      box-shadow: var(--glass-shadow);
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      transition: var(--transition);
+    }
+
+    .card:hover {
+      border-color: rgba(255, 255, 255, 0.12);
+      box-shadow: 0 12px 40px 0 rgba(0, 0, 0, 0.45);
+    }
+
+    .card-title {
+      font-size: 18px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      padding-bottom: 12px;
+      color: #fff;
+    }
+
+    /* Form controls */
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .form-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    label {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-muted);
+    }
+
+    input, select, textarea {
+      width: 100%;
+      padding: 10px 14px;
+      background: rgba(15, 23, 42, 0.6);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 8px;
+      color: #fff;
+      font-family: inherit;
+      font-size: 14px;
+      transition: var(--transition);
+    }
+
+    input:focus, select:focus, textarea:focus {
+      outline: none;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+    }
+
+    input[type="checkbox"] {
+      width: auto;
+      margin-right: 8px;
+      cursor: pointer;
+    }
+
+    .checkbox-container {
+      display: flex;
+      align-items: center;
+      cursor: pointer;
+    }
+
+    /* Buttons */
+    button {
+      padding: 10px 16px;
+      font-family: 'Outfit', sans-serif;
+      font-weight: 500;
+      font-size: 14px;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: var(--transition);
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, var(--primary) 0%, #2563eb 100%);
+      color: white;
+    }
+    .btn-primary:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+    }
+
+    .btn-accent {
+      background: linear-gradient(135deg, var(--accent) 0%, #7c3aed 100%);
+      color: white;
+    }
+    .btn-accent:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(139, 92, 246, 0.3);
+    }
+
+    .btn-success {
+      background: linear-gradient(135deg, var(--success) 0%, #059669 100%);
+      color: white;
+    }
+    .btn-success:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
+    }
+
+    .btn-danger {
+      background: linear-gradient(135deg, var(--danger) 0%, #dc2626 100%);
+      color: white;
+    }
+    .btn-danger:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3);
+    }
+
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text-color);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.12);
+    }
+
+    /* Badges / Status Indicators */
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    .badge-offline {
+      background: rgba(239, 68, 68, 0.15);
+      color: #fca5a5;
+      border: 1px solid rgba(239, 68, 68, 0.25);
+    }
+
+    .badge-online {
+      background: rgba(16, 185, 129, 0.15);
+      color: #a7f3d0;
+      border: 1px solid rgba(16, 185, 129, 0.25);
+    }
+
+    .badge-pending {
+      background: rgba(245, 158, 11, 0.15);
+      color: #fde68a;
+      border: 1px solid rgba(245, 158, 11, 0.25);
+    }
+
+    /* Custom UI Components */
+    .scraper-result-box {
+      background: rgba(15, 23, 42, 0.5);
+      border: 1px dashed rgba(255, 255, 255, 0.15);
+      border-radius: 10px;
+      padding: 12px 16px;
+      font-size: 13px;
+    }
+
+    .scraper-row {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 6px;
+    }
+    .scraper-row:last-child {
+      margin-bottom: 0;
+    }
+
+    .highlight-value {
+      font-family: monospace;
+      font-weight: 600;
+      font-size: 14px;
+      color: #38bdf8;
+      background: rgba(56, 189, 248, 0.1);
+      padding: 1px 6px;
+      border-radius: 4px;
+    }
+
+    .auto-fill-btn {
+      padding: 4px 8px;
+      font-size: 11px;
+      border-radius: 4px;
+    }
+
+    .log-panel {
+      background: rgba(10, 15, 30, 0.8);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      border-radius: 12px;
+      height: 250px;
+      overflow-y: auto;
+      padding: 12px;
+      font-family: monospace;
+      font-size: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .log-item {
+      display: flex;
+      flex-direction: column;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+      padding-bottom: 6px;
+    }
+
+    .log-meta {
+      display: flex;
+      justify-content: space-between;
+      color: var(--text-muted);
+      margin-bottom: 2px;
+    }
+
+    .log-text {
+      color: #e2e8f0;
+      word-break: break-all;
+    }
+
+    .log-success { color: #34d399; }
+    .log-error { color: #f87171; }
+    .log-skip { color: #fbbf24; }
+
+    /* Animations */
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.5; transform: scale(0.9); }
+    }
+
+    @keyframes rotate {
+      to { transform: rotate(360deg); }
+    }
+
+    .spinner {
+      animation: rotate 1s linear infinite;
+    }
+
+    /* Modal for custom account creation */
+    .modal-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0, 0, 0, 0.6);
+      backdrop-filter: blur(4px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+    }
+
+    .modal {
+      background: #1e293b;
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      width: 90%;
+      max-width: 400px;
+      padding: 24px;
+      box-shadow: var(--glass-shadow);
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    
+    <!-- HEADER -->
+    <header>
+      <div class="header-title">
+        <div class="logo-glow"></div>
+        <h1>Telegram 营销登录控制面板</h1>
+      </div>
+      <div>
+        <span class="status-badge badge-online" id="global-status">Web 服务已启动</span>
+      </div>
+    </header>
+
+    <!-- MAIN GRID -->
+    <div class="grid">
+      
+      <!-- COLUMN 1: ACCOUNT & PROXY CONFIG -->
+      <div class="card">
+        <h2 class="card-title">
+          👤 账号与代理配置
+        </h2>
+        
+        <div class="form-group">
+          <label for="account-select">选择执行账号</label>
+          <div style="display: flex; gap: 8px;">
+            <select id="account-select" style="flex-grow: 1;">
+              <option value="">加载中...</option>
+            </select>
+            <button class="btn-primary" id="btn-show-create-account" style="padding: 10px;">➕</button>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="account-display-name">账号显示名称</label>
+          <input type="text" id="account-display-name" placeholder="请输入名称">
+        </div>
+
+        <div class="form-group">
+          <label for="default-folder-name">默认发送文件夹</label>
+          <input type="text" id="default-folder-name" placeholder="例如：广告">
+        </div>
+
+        <div class="card-title" style="font-size: 15px; border-bottom: none; padding-bottom: 0; margin-top: 8px;">
+          🌐 代理设置
+        </div>
+
+        <div class="form-group">
+          <label class="checkbox-container">
+            <input type="checkbox" id="proxy-enabled">
+            <span>启用代理 (推荐)</span>
+          </label>
+        </div>
+
+        <div class="form-group">
+          <label for="proxy-type">代理协议</label>
+          <select id="proxy-type">
+            <option value="http">HTTP</option>
+            <option value="socks5">SOCKS5</option>
+            <option value="socks4">SOCKS4</option>
+          </select>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="proxy-host">主机名/IP</label>
+            <input type="text" id="proxy-host" value="127.0.0.1">
+          </div>
+          <div class="form-group">
+            <label for="proxy-port">端口</label>
+            <input type="number" id="proxy-port" value="8800">
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="proxy-username">账号 (可空)</label>
+            <input type="text" id="proxy-username">
+          </div>
+          <div class="form-group">
+            <label for="proxy-password">密码 (可空)</label>
+            <input type="password" id="proxy-password">
+          </div>
+        </div>
+
+        <button class="btn-primary" id="btn-save-config">💾 保存账号配置</button>
+      </div>
+
+      <!-- COLUMN 2: CODE SCRAPER & TELEGRAM LOGIN -->
+      <div class="card">
+        <h2 class="card-title">
+          🔑 验证码提取与登录
+        </h2>
+
+        <!-- Quick Import Block -->
+        <div style="background: rgba(139, 92, 246, 0.08); border: 1px dashed rgba(139, 92, 246, 0.3); padding: 14px; border-radius: 10px; display: flex; flex-direction: column; gap: 10px;">
+          <div style="font-size: 13px; font-weight: 600; color: #a78bfa; display: flex; align-items: center; gap: 6px;">
+            <span>⚡ 快捷串导入并登录</span>
+          </div>
+          <input type="text" id="login-combined-string" placeholder="+919202322792----https://tgapi.feijige.shop/..." style="font-size: 12px; padding: 8px 12px;">
+          <button class="btn-accent" id="btn-auto-combined-login" style="width: 100%; font-size: 13px; padding: 8px 12px;">
+            🔥 一键智能解析并登录
+          </button>
+        </div>
+
+        <!-- Scraper Tool -->
+        <div class="form-group">
+          <label for="scraper-page-id">接码网页 Page ID</label>
+          <div style="display: flex; gap: 8px;">
+            <input type="text" id="scraper-page-id" placeholder="输入接码 UUID">
+            <button class="btn-accent" id="btn-fetch-scraper" style="flex-shrink: 0;">⚡ 提取</button>
+          </div>
+        </div>
+
+        <div class="scraper-result-box" id="scraper-result" style="display: none;">
+          <div class="scraper-row">
+            <span>设备验证码:</span>
+            <span class="highlight-value" id="scraped-code">-</span>
+          </div>
+          <div class="scraper-row">
+            <span>2FA 密码:</span>
+            <span class="highlight-value" id="scraped-2fa">-</span>
+          </div>
+          <div class="scraper-meta" style="margin-top: 8px; font-size: 11px; color: var(--text-muted); display: flex; justify-content: space-between; align-items: center;">
+            <span id="scraped-time">未拉取</span>
+            <button class="btn-secondary auto-fill-btn" id="btn-auto-fill">⬇️ 自动填入登录表单</button>
+          </div>
+        </div>
+
+        <!-- Telegram Connection Status -->
+        <div style="background: rgba(255,255,255,0.03); border: 1px solid var(--card-border); padding: 14px; border-radius: 10px;">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <span style="font-size: 13px; font-weight: 500;">账号连接状态</span>
+            <span id="login-status-badge" class="status-badge badge-offline">连接中...</span>
+          </div>
+          <div id="login-me-info" style="margin-top: 8px; font-size: 12px; color: var(--text-muted); font-family: monospace;"></div>
+        </div>
+
+        <!-- Interactive Login Form -->
+        <div class="form-group">
+          <label for="login-phone">第一步：输入手机号</label>
+          <div style="display: flex; gap: 8px;">
+            <input type="text" id="login-phone" placeholder="格式如：+8613800000000">
+            <button class="btn-primary" id="btn-send-code">发送验证码</button>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="login-code">第二步：验证码</label>
+            <input type="text" id="login-code" placeholder="设备验证码">
+          </div>
+          <div class="form-group">
+            <label for="login-2fa">第三步：2FA密码 (若有)</label>
+            <input type="password" id="login-2fa" placeholder="二步验证密码">
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 12px; margin-top: 8px;">
+          <button class="btn-success" id="btn-submit-login" style="flex-grow: 1;">🚀 确认登录</button>
+          <button class="btn-accent" id="btn-auto-login-all" title="从接码平台自动拉取最新凭证并尝试一步登录">🔥 一键自动登录</button>
+        </div>
+      </div>
+
+      <!-- COLUMN 3: MESSAGE CAMPAIGN & LOGS -->
+      <div class="card">
+        <h2 class="card-title">
+          📢 营销群发任务
+        </h2>
+
+        <div class="form-group">
+          <label for="campaign-folder">发送目标文件夹</label>
+          <div style="display: flex; gap: 8px;">
+            <select id="campaign-folder" style="flex-grow: 1;">
+              <option value="">请选择文件夹</option>
+            </select>
+            <button class="btn-secondary" id="btn-refresh-folders" style="padding: 10px;" title="同步并加载云端文件夹">🔄</button>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="task-interval">循环间隔 (分钟)</label>
+            <input type="number" id="task-interval" value="2">
+          </div>
+          <div class="form-group">
+            <label for="group-interval">发群间隔 (秒)</label>
+            <input type="number" id="group-interval" value="5">
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="campaign-message">广告发信文本</label>
+          <textarea id="campaign-message" rows="5" placeholder="支持使用 <b>加粗</b> 等基本 HTML 标签..."></textarea>
+        </div>
+
+        <div class="form-row">
+          <button class="btn-success" id="btn-start-campaign">🟢 开始群发</button>
+          <button class="btn-danger" id="btn-stop-campaign">🔴 停止群发</button>
+        </div>
+
+        <div class="card-title" style="font-size: 15px; border-bottom: none; padding-bottom: 0; margin-top: 10px;">
+          📝 实时发送日志
+        </div>
+
+        <div class="log-panel" id="log-display">
+          <div style="color: var(--text-muted); text-align: center; margin-top: 20px;">暂无日志输出</div>
+        </div>
+      </div>
+
+    </div>
+
+  </div>
+
+  <!-- CREATE ACCOUNT MODAL -->
+  <div class="modal-overlay" id="create-account-modal">
+    <div class="modal">
+      <h3 style="color: white;">新建账号配置</h3>
+      <div class="form-group">
+        <label for="new-account-name">账号唯一 ID / 名称</label>
+        <input type="text" id="new-account-name" placeholder="如: account_1 或 user_india">
+      </div>
+      <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px;">
+        <button class="btn-secondary" id="btn-close-modal">取消</button>
+        <button class="btn-primary" id="btn-submit-create-account">创建</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- JAVASCRIPT FRONTEND CONTROLLER -->
+  <script>
+    const API_BASE = "";
+    
+    // Store scraper config locally
+    if (!localStorage.getItem('scraper_page_id')) {
+      localStorage.setItem('scraper_page_id', 'aca5195e-d583-410a-9781-d51351c30083');
+    }
+    document.getElementById('scraper-page-id').value = localStorage.getItem('scraper_page_id');
+
+    // UI state
+    let accounts = [];
+    let activeAccountId = "";
+    let fetchedCode = "";
+    let fetched2FA = "";
+
+    // Helper: Show status banner message
+    function showBanner(text, type = "success") {
+      const banner = document.getElementById('global-status');
+      banner.innerText = text;
+      banner.className = `status-badge ${type === 'success' ? 'badge-online' : type === 'danger' ? 'badge-offline' : 'badge-pending'}`;
+    }
+
+    // Modal Operations
+    document.getElementById('btn-show-create-account').addEventListener('click', () => {
+      document.getElementById('create-account-modal').style.display = 'flex';
+    });
+    document.getElementById('btn-close-modal').addEventListener('click', () => {
+      document.getElementById('create-account-modal').style.display = 'none';
+    });
+
+    // 1. Fetch Accounts
+    async function loadAccounts() {
+      try {
+        const response = await fetch(`${API_BASE}/api/accounts`);
+        accounts = await response.json();
+        const select = document.getElementById('account-select');
+        select.innerHTML = "";
+        
+        if (accounts.length === 0) {
+          select.innerHTML = `<option value="">(请新建账号)</option>`;
+          return;
+        }
+
+        accounts.forEach(acc => {
+          const opt = document.createElement('option');
+          opt.value = acc.id;
+          opt.innerText = `${acc.name} ${acc.campaign_running ? ' (🟢群发中)' : ''}`;
+          select.appendChild(opt);
+        });
+
+        // Set default select if not set
+        if (!activeAccountId && accounts.length > 0) {
+          activeAccountId = accounts[0].id;
+        }
+        if (activeAccountId) {
+          select.value = activeAccountId;
+          loadAccountConfig(activeAccountId);
+          checkLoginStatus(activeAccountId);
+        }
+      } catch (err) {
+        showBanner("加载账号列表失败: " + err.message, "danger");
+      }
+    }
+
+    // Select account change listener
+    document.getElementById('account-select').addEventListener('change', (e) => {
+      activeAccountId = e.target.value;
+      if (activeAccountId) {
+        loadAccountConfig(activeAccountId);
+        checkLoginStatus(activeAccountId);
+      }
+    });
+
+    // 2. Load account config into inputs
+    function loadAccountConfig(id) {
+      const account = accounts.find(a => a.id === id);
+      if (!account) return;
+
+      document.getElementById('account-display-name').value = account.name || "";
+      document.getElementById('default-folder-name').value = account.config.folder_name || "广告";
+      
+      const proxy = account.config.proxy || { enabled: false, type: "http", host: "127.0.0.1", port: 8800 };
+      document.getElementById('proxy-enabled').checked = !!proxy.enabled;
+      document.getElementById('proxy-type').value = proxy.type || "http";
+      document.getElementById('proxy-host').value = proxy.host || "127.0.0.1";
+      document.getElementById('proxy-port').value = proxy.port || 8800;
+      document.getElementById('proxy-username').value = proxy.username || "";
+      document.getElementById('proxy-password').value = proxy.password || "";
+      
+      // Update Campaign Inputs
+      document.getElementById('campaign-folder').innerHTML = `<option value="${account.config.folder_name || '广告'}">${account.config.folder_name || '广告'}</option>`;
+    }
+
+    // 3. Create Account
+    document.getElementById('btn-submit-create-account').addEventListener('click', async () => {
+      const name = document.getElementById('new-account-name').value.trim();
+      if (!name) return alert("账号名称不能为空");
+
+      try {
+        const res = await fetch(`${API_BASE}/api/accounts/create`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name })
+        });
+        if (!res.ok) {
+          const detail = await res.json();
+          throw new Error(detail.detail || "创建失败");
+        }
+        const created = await res.json();
+        document.getElementById('create-account-modal').style.display = 'none';
+        document.getElementById('new-account-name').value = "";
+        activeAccountId = created.id;
+        await loadAccounts();
+        showBanner(`账号 ${created.name} 创建成功!`);
+      } catch (err) {
+        alert("错误: " + err.message);
+      }
+    });
+
+    // 4. Save Config
+    document.getElementById('btn-save-config').addEventListener('click', async () => {
+      if (!activeAccountId) return alert("当前未选择账号");
+
+      const req = {
+        account_name: document.getElementById('account-display-name').value.trim(),
+        folder_name: document.getElementById('default-folder-name').value.trim(),
+        proxy: {
+          enabled: document.getElementById('proxy-enabled').checked,
+          type: document.getElementById('proxy-type').value,
+          host: document.getElementById('proxy-host').value.trim(),
+          port: parseInt(document.getElementById('proxy-port').value) || 8800,
+          username: document.getElementById('proxy-username').value.trim(),
+          password: document.getElementById('proxy-password').value
+        }
+      };
+
+      try {
+        const res = await fetch(`${API_BASE}/api/accounts/${activeAccountId}/config`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(req)
+        });
+        if (!res.ok) throw new Error("保存失败");
+        showBanner("账号配置保存成功!");
+        await loadAccounts();
+      } catch (err) {
+        showBanner("保存失败: " + err.message, "danger");
+      }
+    });
+
+    // 5. Scraper Fetch
+    async function fetchScraper() {
+      const pageId = document.getElementById('scraper-page-id').value.trim();
+      if (!pageId) return alert("请输入接码网页 ID");
+      localStorage.setItem('scraper_page_id', pageId);
+
+      const btn = document.getElementById('btn-fetch-scraper');
+      const originalText = btn.innerText;
+      btn.innerText = "🌀 提取中...";
+      btn.disabled = true;
+
+      try {
+        const res = await fetch(`${API_BASE}/api/scraper/fetch?page_id=${pageId}`);
+        if (!res.ok) throw new Error("拉取失败");
+        const data = await res.json();
+        
+        fetchedCode = data.code || "";
+        fetched2FA = data.pass2fa || "";
+
+        document.getElementById('scraped-code').innerText = fetchedCode || "尚未产生";
+        document.getElementById('scraped-2fa').innerText = fetched2FA || "无需/暂无";
+        document.getElementById('scraped-time').innerText = `提取时间: ${data.login_time || new Date().toLocaleTimeString()}`;
+        document.getElementById('scraper-result').style.display = 'block';
+        showBanner("验证码提取成功!");
+      } catch (err) {
+        showBanner("提取失败: " + err.message, "danger");
+      } finally {
+        btn.innerText = originalText;
+        btn.disabled = false;
+      }
+    }
+    document.getElementById('btn-fetch-scraper').addEventListener('click', fetchScraper);
+
+    // Auto-fill scraper result to form
+    document.getElementById('btn-auto-fill').addEventListener('click', () => {
+      if (fetchedCode) {
+        document.getElementById('login-code').value = fetchedCode;
+      }
+      if (fetched2FA) {
+        document.getElementById('login-2fa').value = fetched2FA;
+      }
+      showBanner("已自动填充至验证登录表单!");
+    });
+
+    // 6. Check Telegram Login Status
+    async function checkLoginStatus(accountId) {
+      if (!accountId) return;
+      const statusBadge = document.getElementById('login-status-badge');
+      const meInfo = document.getElementById('login-me-info');
+      
+      statusBadge.className = "status-badge badge-pending";
+      statusBadge.innerText = "状态检查中...";
+
+      try {
+        const res = await fetch(`${API_BASE}/api/login/status/${accountId}`);
+        const data = await res.json();
+
+        if (data.is_authorized) {
+          statusBadge.className = "status-badge badge-online";
+          statusBadge.innerText = "已登录电报";
+          meInfo.innerText = data.me || "在线";
+        } else {
+          statusBadge.className = "status-badge badge-offline";
+          statusBadge.innerText = "未授权登录";
+          meInfo.innerText = data.error ? `网络连接异常: ${data.error}` : "请在下方登录";
+        }
+      } catch (err) {
+        statusBadge.className = "status-badge badge-offline";
+        statusBadge.innerText = "离线";
+        meInfo.innerText = err.message;
+      }
+    }
+
+    // 7. Send Login Verification Code
+    document.getElementById('btn-send-code').addEventListener('click', async () => {
+      if (!activeAccountId) return alert("请先选择账号");
+      const phone = document.getElementById('login-phone').value.trim();
+      if (!phone) return alert("请输入手机号，例如 +8613800000000");
+
+      const btn = document.getElementById('btn-send-code');
+      btn.disabled = true;
+      btn.innerText = "发送中...";
+      showBanner("正在向 Telegram 申请验证码...", "pending");
+
+      try {
+        const res = await fetch(`${API_BASE}/api/login/send-code`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ account_id: activeAccountId, phone })
+        });
+        const data = await res.json();
+        
+        if (!res.ok) throw new Error(data.detail || "申请失败");
+
+        if (data.status === "authorized") {
+          showBanner("该账号已登录，无需重复验证");
+          checkLoginStatus(activeAccountId);
+        } else {
+          showBanner("验证码已发出，请留意接码网页！");
+        }
+      } catch (err) {
+        showBanner("发送验证码失败: " + err.message, "danger");
+      } finally {
+        btn.disabled = false;
+        btn.innerText = "发送验证码";
+      }
+    });
+
+    // 8. Submit Login Form
+    async function submitLogin(code, pass2fa) {
+      if (!activeAccountId) return alert("请先选择账号");
+      if (!code) return alert("请输入验证码");
+
+      showBanner("提交登录验证中...", "pending");
+
+      try {
+        const res = await fetch(`${API_BASE}/api/login/submit-code`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            account_id: activeAccountId,
+            code: code,
+            pass2fa: pass2fa || null
+          })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "登录失败");
+
+        if (data.status === "2fa_required") {
+          showBanner("已开启二步验证 (2FA)，请输入2FA密码", "pending");
+          document.getElementById('login-2fa').focus();
+        } else if (data.status === "success") {
+          showBanner("登录成功！");
+          checkLoginStatus(activeAccountId);
+        }
+      } catch (err) {
+        showBanner("登录失败: " + err.message, "danger");
+      }
+    }
+
+    document.getElementById('btn-submit-login').addEventListener('click', () => {
+      const code = document.getElementById('login-code').value.trim();
+      const pass2fa = document.getElementById('login-2fa').value.trim();
+      submitLogin(code, pass2fa);
+    });
+
+    // 9. One-Click Auto Login (Fetch -> Auto-fill -> Submit)
+    document.getElementById('btn-auto-login-all').addEventListener('click', async () => {
+      showBanner("开始一键智能拉码登录流...", "pending");
+      await fetchScraper();
+      if (!fetchedCode) {
+        return showBanner("一键登录中断: 网页尚未返回有效的验证码", "danger");
+      }
+      document.getElementById('login-code').value = fetchedCode;
+      document.getElementById('login-2fa').value = fetched2FA;
+      await submitLogin(fetchedCode, fetched2FA);
+    });
+
+    // 9.5 Combined String Auto Login (Parse -> Send Code -> Wait 4s -> Scrape & Login)
+    document.getElementById('btn-auto-combined-login').addEventListener('click', async () => {
+      const combinedStr = document.getElementById('login-combined-string').value.trim();
+      if (!combinedStr) return alert("请先粘贴格式为 手机号----URL 的文本");
+
+      const btn = document.getElementById('btn-auto-combined-login');
+      const originalText = btn.innerText;
+      btn.disabled = true;
+      btn.innerText = "🌀 正在解析并申请验证码...";
+      showBanner("正在提交快捷导入数据并初始化客户端...", "pending");
+
+      try {
+        const res = await fetch(`${API_BASE}/api/login/quick-import`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ import_string: combinedStr })
+        });
+        const data = await res.json();
+        
+        if (!res.ok) throw new Error(data.detail || "解析或请求验证码失败");
+
+        // Update active variables and UI inputs
+        activeAccountId = data.account_id;
+        document.getElementById('login-phone').value = data.phone;
+        document.getElementById('scraper-page-id').value = data.page_id;
+        localStorage.setItem('scraper_page_id', data.page_id);
+
+        // Reload account list to select the newly created account
+        await loadAccounts();
+        document.getElementById('account-select').value = activeAccountId;
+
+        if (data.status === "authorized") {
+          showBanner("账号导入成功，检测到已是登录状态！");
+          checkLoginStatus(activeAccountId);
+          btn.disabled = false;
+          btn.innerText = originalText;
+          return;
+        }
+
+        // Wait 4 seconds for Telegram to deliver code and for the scraper page to update
+        showBanner("验证码申请成功，等待 4 秒以允许接码页面同步...", "pending");
+        btn.innerText = "🌀 等待接码数据就绪...";
+        await new Promise(resolve => setTimeout(resolve, 4000));
+
+        // Fetch scraper data
+        showBanner("正在从解析的网页中提取验证码与2FA...", "pending");
+        btn.innerText = "🌀 正在自动接码...";
+        await fetchScraper();
+
+        if (!fetchedCode) {
+          showBanner("自动接码失败：接码页面尚未生成验证码。已为您自动填入账号，您可以稍后点击【一键自动登录】或【确认登录】进行重试。", "warning");
+          btn.disabled = false;
+          btn.innerText = originalText;
+          return;
+        }
+
+        // Auto-fill and submit login
+        document.getElementById('login-code').value = fetchedCode;
+        document.getElementById('login-2fa').value = fetched2FA;
+        showBanner("已成功提取凭证，正在提交登录验证...", "pending");
+        btn.innerText = "🌀 正在登录客户端...";
+        
+        await submitLogin(fetchedCode, fetched2FA);
+      } catch (err) {
+        showBanner("一键导入登录失败: " + err.message, "danger");
+      } finally {
+        btn.disabled = false;
+        btn.innerText = originalText;
+      }
+    });
+
+    // 10. Load Telegram Folders Dynamically
+    async function refreshFolders() {
+      if (!activeAccountId) return alert("请先选择账号");
+      
+      const btn = document.getElementById('btn-refresh-folders');
+      btn.innerText = "🌀";
+      btn.disabled = true;
+
+      try {
+        const res = await fetch(`${API_BASE}/api/accounts/${activeAccountId}/folders`);
+        if (!res.ok) throw new Error("获取失败");
+        const folders = await res.json();
+
+        const select = document.getElementById('campaign-folder');
+        select.innerHTML = "";
+        
+        if (folders.length === 0) {
+          select.innerHTML = `<option value="">(无聊天文件夹)</option>`;
+          return;
+        }
+
+        folders.forEach(f => {
+          const opt = document.createElement('option');
+          opt.value = f;
+          opt.innerText = f;
+          select.appendChild(opt);
+        });
+        showBanner("Telegram 云端文件夹拉取成功!");
+      } catch (err) {
+        showBanner("拉取文件夹失败(请先确保账号已登录): " + err.message, "danger");
+      } finally {
+        btn.innerText = "🔄";
+        btn.disabled = false;
+      }
+    }
+    document.getElementById('btn-refresh-folders').addEventListener('click', refreshFolders);
+
+    // 11. Start Campaign
+    document.getElementById('btn-start-campaign').addEventListener('click', async () => {
+      if (!activeAccountId) return alert("请先选择账号");
+      
+      const folder = document.getElementById('campaign-folder').value;
+      const message = document.getElementById('campaign-message').value.trim();
+      const taskInterval = parseInt(document.getElementById('task-interval').value) || 2;
+      const groupInterval = parseInt(document.getElementById('group-interval').value) || 5;
+
+      if (!folder) return alert("请选择发送的目标文件夹");
+      if (!message) return alert("请输入广告文本");
+
+      showBanner("群发任务启动中...", "pending");
+
+      try {
+        const res = await fetch(`${API_BASE}/api/campaign/start`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            account_id: activeAccountId,
+            folder_name: folder,
+            message_text: message,
+            task_interval_minutes: taskInterval,
+            group_interval_seconds: groupInterval
+          })
+        });
+        if (!res.ok) throw new Error("启动失败");
+        showBanner("🟢 群发任务已在后台挂起运行！");
+        await loadAccounts();
+      } catch (err) {
+        showBanner("任务启动失败: " + err.message, "danger");
+      }
+    });
+
+    // 12. Stop Campaign
+    document.getElementById('btn-stop-campaign').addEventListener('click', async () => {
+      if (!activeAccountId) return alert("请先选择账号");
+
+      showBanner("停止群发任务中...", "pending");
+
+      try {
+        const res = await fetch(`${API_BASE}/api/campaign/stop`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ account_id: activeAccountId })
+        });
+        if (!res.ok) throw new Error("停止失败");
+        showBanner("🔴 任务已成功终止。");
+        await loadAccounts();
+      } catch (err) {
+        showBanner("任务停止失败: " + err.message, "danger");
+      }
+    });
+
+    // 13. Fetch Logs and display
+    async function loadLogs() {
+      try {
+        const res = await fetch(`${API_BASE}/api/campaign/logs?limit=50`);
+        if (!res.ok) return;
+        const logs = await res.json();
+        
+        const display = document.getElementById('log-display');
+        if (logs.length === 0) {
+          display.innerHTML = `<div style="color: var(--text-muted); text-align: center; margin-top: 20px;">暂无日志输出</div>`;
+          return;
+        }
+
+        display.innerHTML = "";
+        logs.forEach(log => {
+          const div = document.createElement('div');
+          div.className = "log-item";
+
+          // Choose class based on status
+          let statusClass = "";
+          if (log.status === "成功") statusClass = "log-success";
+          else if (log.status === "限流" || log.status === "无权限") statusClass = "log-skip";
+          else if (log.status === "错误") statusClass = "log-error";
+
+          // Format ISO time to clean local time
+          let timeStr = log.time || "";
+          try {
+            timeStr = new Date(log.time).toLocaleTimeString();
+          } catch(e) {}
+
+          div.innerHTML = `
+            <div class="log-meta">
+              <span>[${log.folder || '默认'}] ${log.title || log.chat_id}</span>
+              <span>${timeStr}</span>
+            </div>
+            <div class="log-text">
+              动作: ${log.action} | 状态: <span class="${statusClass}">${log.status}</span>
+              ${log.detail ? ` (${log.detail})` : ''}
+            </div>
+          `;
+          display.appendChild(div);
+        });
+      } catch (e) {
+        console.error("加载日志出错: ", e);
+      }
+    }
+
+    // Initialize Page
+    loadAccounts();
+    setInterval(loadLogs, 3000); // Poll logs every 3 seconds
+    
+  </script>
+</body>
+</html>

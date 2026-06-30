@@ -1,0 +1,8 @@
+label: 20260622_023930_exact_local_temp_bak_before_restore
+created_by: Codex recovery collector
+source: E:\telegram_workspace\telegram_folder_sync_temp_bak_before_restore
+note: Exact local temp backup made before restore.
+app_source: E:\telegram_workspace\telegram_folder_sync_temp_bak_before_restore\frontend\src\App.tsx
+App.tsx: 552786 bytes, LastWriteTime=2026-06-22 02:45:40
+web_server.py: 337054 bytes, LastWriteTime=2026-06-22 01:02:51
+data/rosepay.db: 122880 bytes, LastWriteTime=2026-06-21 22:30:03

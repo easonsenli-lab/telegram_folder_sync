@@ -1,0 +1,69 @@
+/* Cleared default styles. Custom layout is configured in index.css and Tailwind. */
+
+.account-management-table-wrap {
+  scrollbar-gutter: stable;
+}
+
+.account-management-table {
+  min-width: 1260px;
+}
+
+.account-management-table th,
+.account-management-table td {
+  vertical-align: middle;
+}
+
+@media (max-width: 1680px) {
+  .account-management-table {
+    min-width: 1200px;
+  }
+
+  .account-management-table th,
+  .account-management-table td {
+    padding-left: 0.45rem !important;
+    padding-right: 0.45rem !important;
+  }
+
+  .account-owner-select {
+    width: 122px !important;
+  }
+
+  .account-action-button {
+    padding: 0.35rem 0.45rem !important;
+    font-size: 10px !important;
+  }
+
+  .account-delete-button {
+    width: 1.85rem !important;
+    height: 1.85rem !important;
+  }
+}
+
+@media (max-width: 1440px) {
+  .account-management-table {
+    min-width: 1120px;
+    font-size: 12px;
+  }
+
+  .account-management-table th {
+    font-size: 10px !important;
+  }
+
+  .account-management-table td {
+    padding-top: 0.55rem !important;
+    padding-bottom: 0.55rem !important;
+  }
+
+  .account-owner-select {
+    width: 108px !important;
+  }
+
+  .account-actions {
+    gap: 0.25rem !important;
+  }
+
+  .account-action-button {
+    padding: 0.3rem 0.38rem !important;
+    font-size: 10px !important;
+  }
+}

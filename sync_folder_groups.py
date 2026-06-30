@@ -5,6 +5,23 @@ import asyncio
 import csv
 import json
 import sqlite3
+
+# Enable high-concurrency WAL mode and busy timeout for all SQLite connections globally
+if not hasattr(sqlite3, "_patched_for_wal"):
+    _orig_connect = sqlite3.connect
+    def _patched_connect(database, *args, **kwargs):
+        kwargs.setdefault("timeout", 30.0)
+        conn = _orig_connect(database, *args, **kwargs)
+        if database != ":memory:":
+            try:
+                conn.execute("PRAGMA journal_mode = WAL")
+                conn.execute("PRAGMA synchronous = NORMAL")
+            except Exception:
+                pass
+        return conn
+    sqlite3.connect = _patched_connect
+    sqlite3._patched_for_wal = True
+
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -60,19 +77,19 @@ def load_config(path: Path) -> dict[str, Any]:
     required = ["auth_mode", "session_name", "folder_name", "output_csv", "output_db"]
     missing = [key for key in required if not config.get(key)]
     if missing:
-        raise SystemExit(f"配置缺少必填项：{', '.join(missing)}")
+        raise ValueError(f"缺少必要配置项：{', '.join(missing)}")
 
     auth_mode = config.get("auth_mode", "api_id_hash")
     if auth_mode not in {"api_id_hash", "builtin_telegram_desktop", "telegram_desktop_tdata"}:
-        raise SystemExit(
-            "auth_mode 无效。请使用 api_id_hash、builtin_telegram_desktop 或 telegram_desktop_tdata。"
+        raise ValueError(
+            "auth_mode 无效，支持 api_id_hash、builtin_telegram_desktop 或 telegram_desktop_tdata。"
         )
 
     if auth_mode == "api_id_hash" and config.get("api_hash") == "replace_with_your_api_hash":
-        raise SystemExit("请先编辑 config.json，填写 api_id 和 api_hash。")
+        raise ValueError("请先编辑 config.json，填入 api_id 和 api_hash。")
 
     if auth_mode == "telegram_desktop_tdata" and not config.get("tdata_path"):
-        raise SystemExit("telegram_desktop_tdata 登录模式需要设置 tdata_path。")
+        raise ValueError("telegram_desktop_tdata 模式需要 tdata_path。")
 
     return config
 
@@ -95,13 +112,14 @@ def proxy_type_names(config: dict[str, Any]) -> list[str]:
 
 def build_proxy(config: dict[str, Any], proxy_type: str | None = None) -> Any | None:
     proxy_config = config.get("proxy") or {}
+
     if not proxy_config.get("enabled"):
         return None
 
     try:
         import socks
     except ImportError as exc:
-        raise SystemExit("代理已启用，但缺少代理依赖。请先运行 00_检测环境并安装依赖.cmd。") from exc
+        raise ImportError("代理已启用，但缺少代理依赖。请先运行 00_检测环境并安装依赖.cmd。") from exc
 
     proxy_type = (proxy_type or str(proxy_config.get("type", "socks5"))).lower()
     type_map = {
@@ -110,16 +128,17 @@ def build_proxy(config: dict[str, Any], proxy_type: str | None = None) -> Any | 
         "http": socks.HTTP,
     }
     if proxy_type not in type_map:
-        raise SystemExit("proxy.type 无效。请使用 auto、socks5、socks4 或 http。")
+        raise ValueError("proxy.type 无效。请使用 auto、socks5、socks4 或 http。")
 
     host = str(proxy_config.get("host", "")).strip()
     port = int(proxy_config.get("port", 0))
     if not host or port <= 0:
-        raise SystemExit("代理已启用，但 proxy.host 或 proxy.port 无效。")
+        raise ValueError("代理已启用，但 proxy.host 或 proxy.port 无效。")
 
     username = str(proxy_config.get("username", "")).strip() or None
     password = str(proxy_config.get("password", "")).strip() or None
     return (type_map[proxy_type], host, port, True, username, password)
+
 
 
 def proxy_label(config: dict[str, Any], proxy_type: str | None = None) -> str:
@@ -178,7 +197,7 @@ async def choose_telegram_client_options(config: dict[str, Any], api_id: int, ap
             ],
         )
     )
-    raise SystemExit(2)
+    raise ConnectionError("Telegram connection failed through all proxy options: " + str(errors[:4]))
 
 
 def normalize_title(value: Any) -> str:
@@ -543,7 +562,7 @@ async def build_client(config: dict[str, Any], base_dir: Path) -> TelegramClient
         from opentele.td import TDesktop
         from opentele.tl import TelegramClient as OpenTeleTelegramClient
     except ImportError as exc:
-        raise SystemExit(
+        raise ImportError(
             "telegram_desktop_tdata 模式需要安装 opentele。"
             "在 Python 3.12 上可能还需要 Microsoft C++ Build Tools 编译 tgcrypto。"
             "如果想避开 my.telegram.org，请使用 auth_mode=builtin_telegram_desktop。"
@@ -551,11 +570,11 @@ async def build_client(config: dict[str, Any], base_dir: Path) -> TelegramClient
 
     tdata_path = resolve_path(base_dir, config["tdata_path"])
     if not tdata_path.exists():
-        raise SystemExit(f"找不到 tdata_path：{tdata_path}")
+        raise FileNotFoundError(f"找不到 tdata_path：{tdata_path}")
 
     tdesk = TDesktop(str(tdata_path))
     if not tdesk.isLoaded():
-        raise SystemExit(f"无法读取 Telegram Desktop tdata：{tdata_path}")
+        raise ValueError(f"无法读取 Telegram Desktop tdata：{tdata_path}")
 
     api = API.TelegramDesktop.Generate(system="windows", unique_id=str(session_path))
     return await OpenTeleTelegramClient.FromTDesktop(

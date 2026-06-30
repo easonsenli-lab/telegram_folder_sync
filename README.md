@@ -1,5 +1,7 @@
 # Telegram folder group sync
 
+> 接手当前 RosePay 后台开发时，请先阅读 `HANDOFF_FOR_ANTIGRAVITY.md`。本 README 包含较多早期单机脚本说明，不足以代表当前线上后台全貌。
+
 第一版只做一件事：读取 Telegram 账号里指定聊天文件夹，例如 `广告`，把里面的群组导出为 `groups.csv` 和 SQLite。
 
 它不会发送消息。

@@ -1,0 +1,12950 @@
+import os
+import re
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
+sys.stderr.reconfigure(encoding='utf-8')
+import html
+import json
+import time
+import hmac
+import hashlib
+import secrets
+import asyncio
+import threading
+import subprocess
+import datetime
+from collections import deque
+from contextlib import asynccontextmanager
+from functools import wraps
+from pathlib import Path
+from typing import Optional, List, Dict, Any, Tuple
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Body, Depends, Header, UploadFile, File, Form
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import requests
+from bs4 import BeautifulSoup
+
+# Ensure we can import from the root directory
+sys.path.append(str(Path(__file__).resolve().parent))
+
+from sync_folder_groups import (
+    build_client,
+    check_account_status,
+    normalize_title,
+)
+from account_manager import (
+    list_accounts,
+    account_config_path,
+    build_account_config,
+    save_json,
+    load_json,
+)
+from private_dm_events import append_private_dm_event, read_private_dm_events, register_private_dm_event_listener
+from telethon import TelegramClient, functions, types, errors, utils
+from telethon.errors import SessionPasswordNeededError, UserDeactivatedError
+
+ENABLE_REALTIME_PRIVATE_DM = False
+
+app = FastAPI(title="Telegram Control Panel API", version="1.0.0")
+
+# Initialize SQLite Database tables and run migrations
+from db import init_db
+init_db()
+
+def get_secret_key() -> str:
+    secret_file = Path("data/secret.key")
+    if secret_file.exists():
+        try:
+            return secret_file.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    key = secrets.token_hex(32)
+    try:
+        secret_file.parent.mkdir(parents=True, exist_ok=True)
+        secret_file.write_text(key, encoding="utf-8")
+    except Exception:
+        pass
+    return key
+
+SECRET_KEY = get_secret_key()
+
+# Headshot/Avatar Library folder setup
+AVATARS_DIR = Path("data/avatars")
+AVATARS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def generate_token(username: str, role: str) -> str:
+    payload = f"{username}:{role}:{int(time.time())}"
+    signature = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}:{signature}"
+
+def verify_token(token: str) -> Optional[dict]:
+    try:
+        parts = token.split(":")
+        if len(parts) != 4:
+            return None
+        username, role, timestamp_str, signature = parts
+        payload = f"{username}:{role}:{timestamp_str}"
+        expected_sig = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected_sig):
+            return None
+        # Expiry 24 hours
+        if time.time() - int(timestamp_str) > 86400:
+            return None
+        return {"username": username, "role": role}
+    except Exception:
+        return None
+
+async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="未登录或 Token 无效")
+    token = authorization.split(" ")[1]
+    user_payload = verify_token(token)
+    if not user_payload:
+        raise HTTPException(status_code=401, detail="会话已过期，请重新登录")
+        
+    from db import engine, AdminDb, Session, select
+    with Session(engine) as session:
+        db_user = session.exec(select(AdminDb).where(AdminDb.username == user_payload["username"])).first()
+        if not db_user:
+            raise HTTPException(status_code=401, detail="用户不存在")
+        return {
+            "username": db_user.username,
+            "role": db_user.role,
+            "company": db_user.company or "admin"
+        }
+
+async def require_admin(user: dict = Depends(get_current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="没有管理员权限，拒绝访问")
+    return user
+
+def check_account_company(account_id: str, user: dict):
+    from db import engine, AccountDb, AdminDb, Session, select
+    with Session(engine) as session:
+        db_acc = session.get(AccountDb, account_id)
+        if not db_acc:
+            raise HTTPException(status_code=404, detail="Account not found")
+        if user["role"] != "admin":
+            owner_company = ""
+            if db_acc.owner_username:
+                owner_user = session.exec(select(AdminDb).where(AdminDb.username == db_acc.owner_username)).first()
+                owner_company = owner_user.company or "admin" if owner_user else ""
+            if (
+                db_acc.owner_username != user["username"]
+                and db_acc.created_by != user["username"]
+                and db_acc.company != user["company"]
+                and owner_company != user["company"]
+            ):
+                raise HTTPException(status_code=403, detail="没有权限访问此账号")
+        return db_acc
+
+def check_account_company_scope(account_id: str, user: dict):
+    """Lightweight pre-check for runtime guards; endpoint-specific checks still run inside handlers."""
+    from db import engine, AccountDb, AdminDb, Session, select
+    with Session(engine) as session:
+        db_acc = session.get(AccountDb, account_id)
+        if not db_acc:
+            raise HTTPException(status_code=404, detail="Account not found")
+        if user["role"] == "admin" or user["username"] in ("eason", "admin") or user["company"] == "admin":
+            return db_acc
+        owner_company = ""
+        if db_acc.owner_username:
+            owner_user = session.exec(select(AdminDb).where(AdminDb.username == db_acc.owner_username)).first()
+            owner_company = owner_user.company or "admin" if owner_user else ""
+        if (
+            db_acc.owner_username != user["username"]
+            and db_acc.created_by != user["username"]
+            and db_acc.company != user["company"]
+            and owner_company != user["company"]
+        ):
+            raise HTTPException(status_code=403, detail="没有权限访问此账号")
+        return db_acc
+
+def query_allowed_accounts(session, user):
+    from db import AccountDb, AdminDb, select
+    from sqlmodel import or_
+    if user["role"] == "admin":
+        return select(AccountDb)
+    else:
+        same_company_users = session.exec(select(AdminDb.username).where(AdminDb.company == user["company"])).all()
+        return select(AccountDb).where(
+            or_(
+                AccountDb.owner_username == user["username"],
+                AccountDb.owner_username.in_(same_company_users),
+                AccountDb.created_by == user["username"],
+                AccountDb.company == user["company"],
+            )
+        )
+
+def query_accounts_for_view_scope(session, user, scope: str = "mine"):
+    from db import AccountDb, select
+    from sqlmodel import and_, or_
+
+    normalized_scope = (scope or "mine").strip().lower()
+    if normalized_scope not in {"mine", "all"}:
+        normalized_scope = "mine"
+
+    if normalized_scope == "all":
+        if user["role"] == "admin":
+            return select(AccountDb)
+        from db import AdminDb
+        same_company_users = session.exec(select(AdminDb.username).where(AdminDb.company == user["company"])).all()
+        return select(AccountDb).where(
+            or_(
+                AccountDb.company == user["company"],
+                AccountDb.owner_username == user["username"],
+                AccountDb.owner_username.in_(same_company_users),
+                and_(
+                    or_(AccountDb.owner_username == None, AccountDb.owner_username == ""),
+                    AccountDb.created_by == user["username"],
+                ),
+            )
+        )
+
+    # "Mine" means accounts explicitly assigned to the current user. For old
+    # records without owner_username, created_by is treated as the owner fallback.
+    return select(AccountDb).where(
+        or_(
+            AccountDb.owner_username == user["username"],
+            and_(
+                or_(AccountDb.owner_username == None, AccountDb.owner_username == ""),
+                AccountDb.created_by == user["username"],
+            ),
+        )
+    )
+
+def sync_db_and_files():
+    from db import engine, AccountDb, Session, select
+    from account_manager import account_config_path, save_json, ACCOUNTS_DIR, load_json
+    
+    ACCOUNTS_DIR.mkdir(exist_ok=True)
+    
+    with Session(engine) as session:
+        db_accounts = session.exec(select(AccountDb)).all()
+        db_account_ids = {acc.id for acc in db_accounts}
+        
+        for acc in db_accounts:
+            path = account_config_path(acc.id)
+            save_json(path, acc.to_dict())
+            
+        for json_file in ACCOUNTS_DIR.glob("*.json"):
+            account_id = json_file.stem
+            if account_id not in db_account_ids:
+                try:
+                    data = load_json(json_file)
+                    db_acc = AccountDb.from_dict(account_id, data)
+                    session.add(db_acc)
+                    session.commit()
+                    print(f"Synced account '{account_id}' from disk to DB.")
+                except Exception as e:
+                    print(f"Failed to sync manual account '{account_id}': {e}")
+
+sync_db_and_files()
+
+# Enable CORS for local development (restrict allowed origins for security)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.middleware("http")
+async def add_security_headers(request, call_next):
+    started_at = time.time()
+    response = await call_next(request)
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Server"] = "RosePay-Secure-Server"
+    elapsed_ms = int((time.time() - started_at) * 1000)
+    if elapsed_ms >= 500 or request.url.path in {"/api/accounts", "/api/accounts/private-unread-summary"} or "private-dialogs" in request.url.path:
+        print(f"[HTTP {elapsed_ms}ms] {request.method} {request.url.path}")
+    return response
+
+
+# Active Telethon clients in memory: {account_id: TelegramClient}
+active_clients: Dict[str, TelegramClient] = {}
+active_clients_last_accessed: Dict[str, float] = {}
+client_locks: Dict[str, asyncio.Lock] = {}
+account_operation_locks: Dict[str, asyncio.Lock] = {}
+active_account_operations: Dict[str, dict] = {}
+ALLOW_DIRECT_TELEGRAM_CONNECTIONS = os.environ.get("ROSEPAY_ALLOW_DIRECT_TELEGRAM", "").lower() in {"1", "true", "yes"}
+
+
+async def _disconnect_client_safely(account_id: str, client: TelegramClient):
+    if account_id not in client_locks:
+        client_locks[account_id] = asyncio.Lock()
+    async with client_locks[account_id]:
+        try:
+            await client.disconnect()
+        except Exception as exc:
+            print(f"Failed to disconnect client {account_id}: {exc}")
+
+
+def close_active_client_after_config_change(account_id: str):
+    """Drop a cached Telethon client after config changes without failing the API call."""
+    client = active_clients.pop(account_id, None)
+    registered_listeners.discard(account_id)
+    if not client:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_disconnect_client_safely(account_id, client))
+    except RuntimeError:
+        try:
+            asyncio.run(_disconnect_client_safely(account_id, client))
+        except Exception as exc:
+            print(f"Failed to schedule disconnect for client {account_id}: {exc}")
+
+
+def get_account_operation_lock(account_id: str) -> asyncio.Lock:
+    if account_id not in account_operation_locks:
+        account_operation_locks[account_id] = asyncio.Lock()
+    return account_operation_locks[account_id]
+
+
+def validate_telegram_connection_config(account_id: str, config: dict, *, ignore_proxy: bool = False):
+    """Block accidental direct Telegram connections from a flagged server IP."""
+    proxy_config = config.get("proxy") or {}
+    proxy_enabled = bool(proxy_config.get("enabled"))
+    proxy_host = str(proxy_config.get("host") or "").strip()
+    try:
+        proxy_port = int(proxy_config.get("port") or 0)
+    except Exception:
+        proxy_port = 0
+
+    if ignore_proxy and not ALLOW_DIRECT_TELEGRAM_CONNECTIONS:
+        raise HTTPException(
+            status_code=409,
+            detail="当前已禁止绕过代理直连 Telegram。请先为账号配置可用代理，或在确认安全后设置 ROSEPAY_ALLOW_DIRECT_TELEGRAM=1。",
+        )
+
+    if ALLOW_DIRECT_TELEGRAM_CONNECTIONS:
+        return
+
+    if not proxy_enabled or not proxy_host or proxy_port <= 0:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "账号未配置可用代理，已阻止连接 Telegram。"
+                "当前服务器 IP 疑似被 Telegram 风控，必须先在账号管理中配置并验证代理。"
+            ),
+        )
+
+
+def get_account_operation_block_reason(account_id: str, *, block_task_busy: bool = True) -> Optional[str]:
+    active_op = active_account_operations.get(account_id)
+    if active_op:
+        return f"账号正在执行操作: {active_op.get('label') or active_op.get('operation') or 'active'}"
+    if block_task_busy:
+        busy_status = get_account_busy_status(account_id)
+        if busy_status and busy_status != "idle":
+            return f"账号正在执行任务: {busy_status}"
+    return None
+
+
+@asynccontextmanager
+async def account_operation_guard(account_id: str, operation: str, *, label: str = "", block_task_busy: bool = True):
+    reason = get_account_operation_block_reason(account_id, block_task_busy=block_task_busy)
+    if reason:
+        raise HTTPException(status_code=409, detail=f"{reason}，请等待完成后再操作。")
+
+    lock = get_account_operation_lock(account_id)
+    if lock.locked():
+        raise HTTPException(status_code=409, detail="该账号正在被其他模块操作，请稍后再试。")
+
+    await lock.acquire()
+    active_account_operations[account_id] = {
+        "operation": operation,
+        "label": label or operation,
+        "started_at": time.time(),
+        "task_id": id(asyncio.current_task()) if asyncio.current_task() else None,
+    }
+    try:
+        set_account_status(
+            account_id,
+            {
+                "active_operation": operation,
+                "active_operation_label": label or operation,
+            },
+            source="account-operation-start",
+        )
+    except Exception:
+        pass
+
+    try:
+        yield
+    finally:
+        active_account_operations.pop(account_id, None)
+        try:
+            set_account_status(
+                account_id,
+                {
+                    "active_operation": None,
+                    "active_operation_label": None,
+                },
+                source="account-operation-finish",
+            )
+        except Exception:
+            pass
+        lock.release()
+
+
+def account_api_operation(operation: str, *, label: str = "", block_task_busy: bool = True):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            account_id = kwargs.get("account_id")
+            if not account_id:
+                return await func(*args, **kwargs)
+            user = kwargs.get("user") or kwargs.get("admin_user")
+            if user:
+                check_account_company_scope(str(account_id), user)
+            async with account_operation_guard(str(account_id), operation, label=label or operation, block_task_busy=block_task_busy):
+                return await func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+SPAMBOT_CACHE_FILE = Path("data/spambot_cache.json")
+
+def load_spambot_cache() -> Dict[str, dict]:
+    if SPAMBOT_CACHE_FILE.exists():
+        try:
+            return load_json(SPAMBOT_CACHE_FILE)
+        except Exception:
+            pass
+    return {}
+
+def save_spambot_cache(cache: Dict[str, dict]):
+    try:
+        SPAMBOT_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        save_json(SPAMBOT_CACHE_FILE, cache)
+    except Exception as e:
+        print(f"Failed to save spambot cache: {e}")
+
+spambot_cache: Dict[str, dict] = load_spambot_cache()
+account_status_store: Dict[str, dict] = {}
+account_status_subscribers: set[asyncio.Queue] = set()
+private_dm_subscribers: set[asyncio.Queue] = set()
+account_task_registry: Dict[str, Dict[str, dict]] = {}
+TASK_BUSY_PRIORITY = {"join": 10, "campaign": 20, "scraper": 30, "expansion": 40}
+private_unread_cache: Dict[str, dict] = {}
+private_unread_refreshing: set[str] = set()
+PRIVATE_UNREAD_CACHE_TTL_SECONDS = 8
+PRIVATE_DM_ACK_FILE = Path("data/private_dm_event_ack.json")
+pending_private_sends: Dict[str, deque] = {}
+private_send_queue_locks: Dict[str, asyncio.Lock] = {}
+auto_private_listener_accounts: set[str] = set()
+auto_private_listener_cooldowns: Dict[str, float] = {}
+AUTO_PRIVATE_LISTENER_STARTUP_DELAY_SECONDS = 8
+AUTO_PRIVATE_LISTENER_INTERVAL_SECONDS = 60
+AUTO_PRIVATE_LISTENER_CONNECT_GAP_SECONDS = 4
+AUTO_PRIVATE_LISTENER_FAILURE_COOLDOWN_SECONDS = 300
+
+
+def load_private_dm_ack() -> Dict[str, float]:
+    if not PRIVATE_DM_ACK_FILE.exists():
+        return {}
+    try:
+        raw = load_json(PRIVATE_DM_ACK_FILE)
+        return {str(k): float(v or 0) for k, v in raw.items()}
+    except Exception:
+        return {}
+
+
+def save_private_dm_ack(data: Dict[str, float]) -> None:
+    try:
+        PRIVATE_DM_ACK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        save_json(PRIVATE_DM_ACK_FILE, data)
+    except Exception as exc:
+        print(f"Failed to save private DM ack file: {exc}")
+
+
+private_dm_event_ack: Dict[str, float] = load_private_dm_ack()
+
+
+def private_dm_event_key(event: dict) -> str:
+    account_id = str(event.get("account_id") or "")
+    sender_id = str(event.get("sender_id") or "")
+    message_id = str(event.get("message_id") or "")
+    if account_id and sender_id and message_id and message_id != "0":
+        return f"{account_id}:{sender_id}:{message_id}"
+    return f"{account_id}:{sender_id}:{event.get('timestamp') or event.get('created_at') or ''}:{event.get('text') or ''}"
+
+
+def merge_private_dm_event_into_cache(event: dict) -> None:
+    account_id = str(event.get("account_id") or "")
+    sender_id = str(event.get("sender_id") or "")
+    if not account_id:
+        return
+    cached = private_unread_cache.get(account_id) or {
+        "unread_dialogs": 0,
+        "unread_messages": 0,
+        "error": None,
+        "updated_at": time.time(),
+    }
+    recent_senders = set(cached.get("_event_sender_ids") or [])
+    already_seen = private_dm_event_key(event) in set(cached.get("_event_keys") or [])
+    event_keys = list(cached.get("_event_keys") or [])
+    if not already_seen:
+        event_keys.append(private_dm_event_key(event))
+        event_keys = event_keys[-200:]
+        cached["unread_messages"] = int(cached.get("unread_messages") or 0) + 1
+        if sender_id and sender_id not in recent_senders:
+            recent_senders.add(sender_id)
+            cached["unread_dialogs"] = int(cached.get("unread_dialogs") or 0) + 1
+    cached["_event_sender_ids"] = list(recent_senders)[-200:]
+    cached["_event_keys"] = event_keys
+    cached["external_unread_messages"] = int(cached.get("external_unread_messages") or cached.get("unread_messages") or 0)
+    cached["external_unread_dialogs"] = int(cached.get("external_unread_dialogs") or cached.get("unread_dialogs") or 0)
+    cached["last_private_event"] = event
+    cached["updated_at"] = time.time()
+    cached["loading"] = False
+    cached["stale"] = False
+    private_unread_cache[account_id] = cached
+
+
+def publish_private_dm_event(event: dict) -> None:
+    if bool(event.get("out", False)) or not bool(event.get("notify", False)):
+        return
+    merge_private_dm_event_into_cache(event)
+    payload = json.dumps({"type": "private_dm", "event": event}, ensure_ascii=False)
+    for queue in list(private_dm_subscribers):
+        try:
+            queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            try:
+                queue.get_nowait()
+                queue.put_nowait(payload)
+            except Exception:
+                pass
+
+
+def normalize_account_status_patch(account_id: str, patch: dict) -> dict:
+    normalized = dict(patch)
+    live_client = active_clients.get(account_id) if "active_clients" in globals() else None
+    if live_client is not None:
+        try:
+            normalized["is_connected"] = bool(live_client.is_connected())
+        except Exception:
+            pass
+    if "is_connected" in normalized:
+        normalized["connection_status"] = "connected" if normalized.get("is_connected") else "disconnected"
+    elif "connection_status" not in normalized:
+        normalized["connection_status"] = "unknown"
+
+    if normalized.get("is_deactivated"):
+        normalized["auth_status"] = "deactivated"
+    elif "is_authorized" in normalized:
+        normalized["auth_status"] = "authorized" if normalized.get("is_authorized") else "unauthorized"
+    elif "auth_status" not in normalized:
+        normalized["auth_status"] = "unknown"
+
+    try:
+        busy_status = get_account_busy_status(account_id)
+    except Exception:
+        busy_status = normalized.get("busy_status", "idle")
+    normalized["busy_status"] = busy_status
+    normalized["is_busy"] = busy_status != "idle"
+    normalized["task_status"] = busy_status
+    active_operation = active_account_operations.get(account_id)
+    if active_operation:
+        normalized["active_operation"] = active_operation.get("operation")
+        normalized["active_operation_label"] = active_operation.get("label")
+    elif normalized.get("active_operation") is None:
+        normalized["active_operation"] = None
+        normalized["active_operation_label"] = None
+
+    try:
+        from db import engine, AccountDb, Session
+        with Session(engine) as session:
+            db_account = session.get(AccountDb, account_id)
+            if db_account:
+                normalized["is_available"] = db_account.is_available
+                normalized["availability_status"] = "available" if db_account.is_available else "occupied"
+                normalized["bot_setup_status"] = db_account.bot_setup_status or normalized.get("bot_setup_status", "not_started")
+    except Exception:
+        if "is_available" in normalized:
+            normalized["availability_status"] = "available" if normalized.get("is_available") else "occupied"
+
+    normalized["last_checked_at"] = normalized.get("last_checked_at") or time.time()
+    return normalized
+
+
+def publish_account_status(account_id: str, patch: dict):
+    if not account_status_subscribers:
+        return
+    payload = json.dumps({"type": "account_status", "account_id": account_id, "patch": patch}, ensure_ascii=False)
+    stale_queues = []
+    for queue in list(account_status_subscribers):
+        try:
+            queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            stale_queues.append(queue)
+    for queue in stale_queues:
+        account_status_subscribers.discard(queue)
+
+
+def set_account_status(account_id: str, patch: dict, source: str = "runtime") -> dict:
+    current = account_status_store.get(account_id, {}).copy()
+    current.update(patch)
+    current["source"] = source
+    current = normalize_account_status_patch(account_id, current)
+    account_status_store[account_id] = current
+    try:
+        publish_account_status(account_id, current)
+    except Exception as exc:
+        print(f"Failed to publish account status for {account_id}: {exc}")
+    return current
+
+
+def get_cached_auth_state(account_id: str) -> Tuple[bool, str]:
+    status = account_status_store.get(account_id, {}) or {}
+    cached_authorized = bool(status.get("is_authorized") or status.get("auth_status") == "authorized")
+    cached_me = status.get("me") or ("已连接" if cached_authorized else "状态未知")
+    return cached_authorized, cached_me
+
+
+def set_login_status_check_failed(account_id: str, message: str, *, source: str, is_connected: Optional[bool] = None) -> dict:
+    cached_authorized, cached_me = get_cached_auth_state(account_id)
+    patch = {
+        "is_authorized": cached_authorized,
+        "me": cached_me,
+        "error": message,
+        "last_error": message,
+        "status_check_failed": True,
+    }
+    if is_connected is not None:
+        patch["is_connected"] = is_connected
+    return set_account_status(account_id, patch, source=source)
+
+
+def get_registered_account_task(account_id: str) -> Optional[dict]:
+    tasks = account_task_registry.get(account_id) or {}
+    active_items = [item for item in tasks.values() if item.get("status") == "running"]
+    if not active_items:
+        return None
+    return sorted(active_items, key=lambda item: TASK_BUSY_PRIORITY.get(item.get("kind"), 99))[0]
+
+
+def publish_task_status_for_accounts(account_ids: List[str], source: str = "task-registry"):
+    for account_id in set(account_ids or []):
+        try:
+            busy_status = get_account_busy_status(account_id)
+            set_account_status(
+                account_id,
+                {
+                    "busy_status": busy_status,
+                    "is_busy": busy_status != "idle",
+                    "task_status": busy_status,
+                },
+                source=source,
+            )
+        except Exception as exc:
+            print(f"Failed to refresh task status for account {account_id}: {exc}")
+
+
+def register_account_task_usage(kind: str, task_id: str, account_ids: List[str], meta: Optional[dict] = None):
+    now = time.time()
+    for account_id in set(account_ids or []):
+        account_task_registry.setdefault(account_id, {})[task_id] = {
+            "kind": kind,
+            "task_id": task_id,
+            "status": "running",
+            "started_at": now,
+            "meta": meta or {},
+        }
+    publish_task_status_for_accounts(account_ids, source=f"{kind}-task-start")
+
+
+def release_account_task_usage(task_id: str, account_ids: Optional[List[str]] = None, source: str = "task-release"):
+    affected = set(account_ids or [])
+    if account_ids is None:
+        for account_id, tasks in list(account_task_registry.items()):
+            if task_id in tasks:
+                affected.add(account_id)
+    for account_id in list(affected):
+        tasks = account_task_registry.get(account_id)
+        if not tasks:
+            continue
+        tasks.pop(task_id, None)
+        if not tasks:
+            account_task_registry.pop(account_id, None)
+    publish_task_status_for_accounts(list(affected), source=source)
+
+# Active login states: {account_id: {"phone": str, "phone_code_hash": str}}
+login_states: Dict[str, Dict[str, str]] = {}
+
+# Active campaign subprocesses: {account_id: subprocess.Popen}
+active_processes: Dict[str, subprocess.Popen] = {}
+campaign_process_cache: Dict[str, Any] = {"expires_at": 0.0, "by_account": {}}
+
+
+def scan_campaign_processes_cached(ttl_seconds: float = 5.0) -> Dict[str, int]:
+    now = time.time()
+    cached = campaign_process_cache.get("by_account") or {}
+    if float(campaign_process_cache.get("expires_at", 0) or 0) > now:
+        return cached
+
+    by_account: Dict[str, int] = {}
+    try:
+        if sys.platform == "win32":
+            cmd = [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"name = 'python.exe'\" | Select-Object ProcessId, CommandLine | ConvertTo-Json",
+            ]
+            output = subprocess.check_output(cmd, text=True, errors="ignore", timeout=3)
+            if output.strip():
+                data = json.loads(output)
+                if isinstance(data, dict):
+                    data = [data]
+                for proc in data:
+                    cmdline = proc.get("CommandLine") or ""
+                    if "ad_sender.py" not in cmdline or "--account" not in cmdline:
+                        continue
+                    match = re.search(r"--account\s+([^\s\"']+)", cmdline)
+                    if match:
+                        by_account[match.group(1)] = int(proc.get("ProcessId") or 0)
+        else:
+            output = subprocess.check_output(["ps", "-eo", "pid,args"], text=True, errors="ignore", timeout=3)
+            for line in output.strip().split("\n"):
+                parts = line.strip().split(None, 1)
+                if len(parts) != 2:
+                    continue
+                pid_str, cmdline = parts
+                if "ad_sender.py" not in cmdline or "--account" not in cmdline:
+                    continue
+                match = re.search(r"--account\s+([^\s\"']+)", cmdline)
+                if match:
+                    by_account[match.group(1)] = int(pid_str)
+    except Exception:
+        by_account = cached
+
+    campaign_process_cache["by_account"] = by_account
+    campaign_process_cache["expires_at"] = now + ttl_seconds
+    return by_account
+
+def find_campaign_process(account_id: str) -> Optional[int]:
+    return scan_campaign_processes_cached().get(str(account_id))
+
+
+OPS_NOTIFY_DEDUP_FILE = Path("data/ops_notify_dedup.json")
+
+
+def load_env_file_values(path: Path) -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    if not path.exists():
+        return values
+    try:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip().strip('"').strip("'")
+    except Exception as exc:
+        print(f"[OpsNotify] Failed to read env file {path}: {exc}")
+    return values
+
+
+def ai_bot_workspace() -> Path:
+    return Path(os.getenv("ROSEPAY_AI_BOT_WORKSPACE", "E:/telegram_bot_workspace"))
+
+
+def get_ops_notify_bot_token() -> str:
+    token = os.getenv("ROSEPAY_OPS_BOT_TOKEN", "").strip() or os.getenv("BOT_TOKEN", "").strip()
+    if token:
+        return token
+    env_values = load_env_file_values(ai_bot_workspace() / ".env")
+    return env_values.get("BOT_TOKEN", "").strip()
+
+
+def parse_chat_id_list(raw: Any) -> List[int]:
+    ids: List[int] = []
+    if isinstance(raw, str):
+        parts = re.split(r"[,;\s]+", raw)
+    elif isinstance(raw, list):
+        parts = raw
+    else:
+        parts = []
+    for item in parts:
+        try:
+            text = str(item).strip()
+            if text:
+                ids.append(int(text))
+        except Exception:
+            continue
+    return list(dict.fromkeys(ids))
+
+
+def get_ops_notify_chat_ids() -> List[int]:
+    env_values = load_env_file_values(ai_bot_workspace() / ".env")
+    chat_ids = parse_chat_id_list(os.getenv("ROSEPAY_OPS_NOTIFY_CHAT_IDS", ""))
+    chat_ids += parse_chat_id_list(env_values.get("ROSEPAY_OPS_NOTIFY_CHAT_IDS", ""))
+    chat_ids += parse_chat_id_list(env_values.get("OPS_NOTIFY_CHAT_IDS", ""))
+    notify_path = ai_bot_workspace() / "notify_config.json"
+    try:
+        config = load_json(notify_path)
+        chat_ids += parse_chat_id_list(config.get("ops_notify_chat_ids", []))
+        notify_chat_id = config.get("notify_chat_id")
+        if notify_chat_id:
+            chat_ids += parse_chat_id_list([notify_chat_id])
+    except Exception as exc:
+        print(f"[OpsNotify] Failed to read AI bot notify config: {exc}")
+    return list(dict.fromkeys(chat_ids))
+
+
+def ops_events_path() -> Path:
+    return ai_bot_workspace() / "data" / "ops_events.json"
+
+
+def ops_users_path() -> Path:
+    return ai_bot_workspace() / "data" / "ops_users.json"
+
+
+def html_line(label: str, value: Any) -> str:
+    return f"<b>{html.escape(label)}:</b> {html.escape(str(value if value is not None else ''))}"
+
+
+def get_user_notify_label(username: str) -> str:
+    username = str(username or "").strip()
+    if not username:
+        return "未设置"
+    try:
+        from db import engine, AdminDb, Session, select
+        with Session(engine) as session:
+            admin = session.exec(select(AdminDb).where(AdminDb.username == username)).first()
+            contact = (getattr(admin, "telegram_contact", "") or "").strip() if admin else ""
+            if contact:
+                return f"{username} ({contact})"
+    except Exception:
+        pass
+    return username
+
+
+def get_user_telegram_contact(username: str) -> str:
+    username = str(username or "").strip()
+    if not username:
+        return ""
+    try:
+        from db import engine, AdminDb, Session, select
+        with Session(engine) as session:
+            admin = session.exec(select(AdminDb).where(AdminDb.username == username)).first()
+            return (getattr(admin, "telegram_contact", "") or "").strip() if admin else ""
+    except Exception:
+        return ""
+
+
+def get_ops_target_mention(username: str) -> str:
+    contact = get_user_telegram_contact(username)
+    return contact if contact.startswith("@") else f"@{username}"
+
+
+def get_registered_ops_user_id(username: str) -> Optional[int]:
+    contact = get_user_telegram_contact(username).strip()
+    candidates = []
+    if contact:
+        candidates.extend([contact.lower(), contact.lstrip("@").lower()])
+    username = str(username or "").strip()
+    if username:
+        candidates.extend([username.lower(), f"@{username.lower()}"])
+    try:
+        path = ops_users_path()
+        if not path.exists():
+            return None
+        data = load_json(path)
+        users = data.get("users", {}) if isinstance(data, dict) else {}
+        for key in candidates:
+            item = users.get(key)
+            if not item:
+                continue
+            user_id = int(item.get("user_id") or 0)
+            if user_id:
+                return user_id
+    except Exception as exc:
+        print(f"[OpsNotify] Failed to read registered bot users: {exc}")
+    try:
+        path = ops_events_path()
+        if not path.exists():
+            return None
+        data = load_json(path)
+        events = data.get("events", {}) if isinstance(data, dict) else {}
+        matches = []
+        for event in events.values():
+            if str(event.get("owner_username") or "").strip().lower() != username.lower():
+                continue
+            registered_user_id = int(event.get("registered_user_id") or 0)
+            if not registered_user_id:
+                continue
+            matches.append((float(event.get("created_at", 0) or 0), registered_user_id))
+        if matches:
+            matches.sort(reverse=True)
+            return matches[0][1]
+    except Exception as exc:
+        print(f"[OpsNotify] Failed to read registered ops events: {exc}")
+    return None
+
+
+def get_account_notify_label(account_id: str) -> str:
+    try:
+        from db import engine, AccountDb, Session
+        with Session(engine) as session:
+            acc = session.get(AccountDb, str(account_id))
+            if acc:
+                name = acc.account_name or str(account_id)
+                owner = acc.owner_username or acc.created_by or ""
+                return f"{name} / +{acc.id} / 归属 {get_user_notify_label(owner)}"
+    except Exception:
+        pass
+    return f"+{account_id}"
+
+
+def ops_event_time() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def should_send_ops_event(key: str, cooldown_seconds: int = 300) -> bool:
+    if not key:
+        return True
+    try:
+        data = load_json(OPS_NOTIFY_DEDUP_FILE) if OPS_NOTIFY_DEDUP_FILE.exists() else {}
+        now = time.time()
+        last = float(data.get(key, 0) or 0)
+        if now - last < cooldown_seconds:
+            return False
+        data[key] = now
+        OPS_NOTIFY_DEDUP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        save_json(OPS_NOTIFY_DEDUP_FILE, data)
+    except Exception as exc:
+        print(f"[OpsNotify] Dedup failed: {exc}")
+    return True
+
+
+def send_ops_bot_notification(text: str, dedup_key: str = "", cooldown_seconds: int = 0) -> None:
+    if dedup_key and cooldown_seconds > 0 and not should_send_ops_event(dedup_key, cooldown_seconds):
+        return
+    token = get_ops_notify_bot_token()
+    chat_ids = get_ops_notify_chat_ids()
+    if not token or not chat_ids:
+        print("[OpsNotify] Skip: missing AI bot token or notify chat id. Use /set_notify_group in the AI bot group.")
+        return
+
+    def worker():
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        for chat_id in chat_ids:
+            try:
+                resp = requests.post(
+                    url,
+                    json={
+                        "chat_id": chat_id,
+                        "text": text,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=8,
+                )
+                if not resp.ok:
+                    print(f"[OpsNotify] sendMessage failed chat={chat_id}: {resp.status_code} {resp.text[:200]}")
+            except Exception as exc:
+                print(f"[OpsNotify] sendMessage exception chat={chat_id}: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def save_ops_event(event: dict) -> str:
+    event_id = event.get("id") or secrets.token_hex(8)
+    event = {**event, "id": event_id, "created_at": time.time()}
+    path = ops_events_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = load_json(path) if path.exists() else {"events": {}}
+        data.setdefault("events", {})[event_id] = event
+        # Keep the file bounded.
+        events = data.get("events", {})
+        if len(events) > 500:
+            sorted_items = sorted(events.items(), key=lambda kv: float(kv[1].get("created_at", 0) or 0))
+            data["events"] = dict(sorted_items[-500:])
+        save_json(path, data)
+    except Exception as exc:
+        print(f"[OpsNotify] Failed to save ops event: {exc}")
+    return event_id
+
+
+def format_ops_event_detail_html(event: dict) -> str:
+    summary = event.get("summary") or {}
+    event_type = event.get("type")
+    title = "📦 <b>加群任务详情</b>" if event_type == "join" else "📣 <b>广告轰炸任务详情</b>"
+    lines = [
+        title,
+        "",
+        "👤 <b>任务信息</b>",
+        f"• <b>任务ID:</b> <code>{html.escape(str(event.get('task_id') or ''))}</code>",
+        f"• <b>状态:</b> {html.escape(str(event.get('status') or ''))}",
+        f"• <b>归属用户:</b> {html.escape(get_user_notify_label(event.get('owner_username') or ''))}",
+        f"• <b>公司:</b> {html.escape(str(event.get('company') or ''))}",
+    ]
+    if event_type == "join":
+        lines.extend([
+            "",
+            "📊 <b>执行范围</b>",
+            f"• <b>账号个数:</b> {html.escape(str(summary.get('account_count', 0)))}",
+            f"• <b>目标群组:</b> {html.escape(str(summary.get('target_groups', 0)))}",
+            f"• <b>排重个数:</b> {html.escape(str(summary.get('dedup_skipped', 0)))}",
+            f"• <b>排重后待处理:</b> {html.escape(str(summary.get('todo_total', summary.get('total', 0))))}",
+            "",
+            "✅ <b>结果统计</b>",
+            f"• <b>总处理:</b> {html.escape(str(summary.get('total', 0)))}",
+            f"• <b>成功/已在群:</b> {html.escape(str(summary.get('success', 0)))}",
+            f"• <b>失败:</b> {html.escape(str(summary.get('failed', 0)))}",
+            f"• <b>失效群组:</b> {html.escape(str(summary.get('invalid', 0)))}",
+            f"• <b>超时:</b> {html.escape(str(summary.get('timeout', 0)))}",
+        ])
+        invalid_groups = event.get("invalid_groups") or []
+        if invalid_groups:
+            lines.extend(["", "🗑 <b>失效群组预览:</b>"])
+            for item in invalid_groups[:20]:
+                title = item.get("title") or item.get("link") or item.get("id") or ""
+                lines.append(f"• {html.escape(str(title))} ({html.escape(str(item.get('id') or ''))})")
+            if len(invalid_groups) > 20:
+                lines.append(f"• ... +{len(invalid_groups) - 20}")
+    elif event_type == "campaign":
+        lines.extend([
+            "",
+            "📊 <b>执行范围</b>",
+            f"• <b>轰炸轮数:</b> {html.escape(str(summary.get('rounds', 0)))}",
+            f"• <b>目标群数:</b> {html.escape(str(summary.get('groups', 0)))}",
+            f"• <b>发送记录:</b> {html.escape(str(summary.get('log_rows', 0)))}",
+            "",
+            "✅ <b>结果统计</b>",
+            f"• <b>成功:</b> {html.escape(str(summary.get('success', 0)))}",
+            f"• <b>失败:</b> {html.escape(str(summary.get('failed', 0)))}",
+            f"• <b>每轮平均成功率:</b> {html.escape(str(summary.get('avg_success_rate', 0)))}%",
+            f"• <b>每轮平均失败率:</b> {html.escape(str(summary.get('avg_failed_rate', 0)))}%",
+        ])
+    account_labels = event.get("account_labels") or []
+    if account_labels:
+        lines.extend(["", "📱 <b>执行账号</b>"])
+        for label in account_labels[:10]:
+            lines.append(f"• {html.escape(str(label))}")
+        if len(account_labels) > 10:
+            lines.append(f"• ... +{len(account_labels) - 10}")
+    lines.extend(["", html_line("时间", ops_event_time())])
+    return "\n".join(lines)
+
+
+def get_ops_bot_username(token: str) -> str:
+    try:
+        resp = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=8)
+        if not resp.ok:
+            print(f"[OpsNotify] getMe failed: {resp.status_code} {resp.text[:200]}")
+            return ""
+        data = resp.json()
+        return str((data.get("result") or {}).get("username") or "").strip()
+    except Exception as exc:
+        print(f"[OpsNotify] getMe exception: {exc}")
+        return ""
+
+
+def format_ops_group_entry_html(event: dict) -> str:
+    event_type = event.get("type")
+    task_label = "加群任务" if event_type == "join" else "广告轰炸任务"
+    owner_username = str(event.get("owner_username") or "")
+    target_mention = get_ops_target_mention(owner_username)
+    summary = event.get("summary") or {}
+    lines = [
+        "📬 <b>后台任务已完成</b>",
+        f"{html.escape(target_mention)} 你在后台有一个任务结束了。",
+        html_line("任务类型", task_label),
+        html_line("状态", event.get("status") or ""),
+    ]
+    if event_type == "join":
+        lines.extend([
+            html_line("账号个数", summary.get("account_count", 0)),
+            html_line("目标群组", summary.get("target_groups", 0)),
+            html_line("排重个数", summary.get("dedup_skipped", 0)),
+            html_line("成功/已在群", summary.get("success", 0)),
+            html_line("失败", summary.get("failed", 0)),
+            html_line("失效群组", summary.get("invalid", 0)),
+        ])
+    elif event_type == "campaign":
+        lines.extend([
+            html_line("轰炸轮数", summary.get("rounds", 0)),
+            html_line("目标群数", summary.get("groups", 0)),
+            html_line("成功", summary.get("success", 0)),
+            html_line("失败", summary.get("failed", 0)),
+        ])
+    lines.extend(["", "👇 点击下方按钮打开 bot 查看日志。"])
+    return "\n".join(lines)
+
+
+def send_ops_bot_notification_with_buttons(text: str, event: dict, buttons: List[List[dict]]) -> None:
+    event_id = save_ops_event(event)
+    token = get_ops_notify_bot_token()
+    chat_ids = get_ops_notify_chat_ids()
+    if not token or not chat_ids:
+        print("[OpsNotify] Skip button notification: missing AI bot token or notify chat id.")
+        return
+    reply_markup = {
+        "inline_keyboard": [
+            [
+                {**button, "callback_data": button["callback_data"].format(event_id=event_id)}
+                for button in row
+            ]
+            for row in buttons
+        ]
+    }
+    direct_user_id = get_registered_ops_user_id(str(event.get("owner_username") or ""))
+    direct_buttons = [
+        [
+            {**button, "callback_data": button["callback_data"].format(event_id=event_id)}
+            for button in row
+            if not str(button.get("callback_data", "")).startswith("opslog:")
+        ]
+        for row in buttons
+    ]
+    direct_buttons = [row for row in direct_buttons if row]
+
+    def worker():
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        if direct_user_id:
+            payload = {
+                "chat_id": direct_user_id,
+                "text": format_ops_event_detail_html(event),
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+            if direct_buttons:
+                payload["reply_markup"] = {"inline_keyboard": direct_buttons}
+            try:
+                resp = requests.post(url, json=payload, timeout=8)
+                if resp.ok:
+                    return
+                print(f"[OpsNotify] direct send failed user={direct_user_id}: {resp.status_code} {resp.text[:200]}")
+            except Exception as exc:
+                print(f"[OpsNotify] direct send exception user={direct_user_id}: {exc}")
+        bot_username = get_ops_bot_username(token)
+        group_reply_markup = reply_markup
+        group_text = text
+        if bot_username:
+            group_text = format_ops_group_entry_html(event)
+            group_reply_markup = {
+                "inline_keyboard": [[
+                    {
+                        "text": "打开 bot 查看日志",
+                        "url": f"https://t.me/{bot_username}?start=opslog_{event_id}",
+                    }
+                ]]
+            }
+        for chat_id in chat_ids:
+            try:
+                resp = requests.post(
+                    url,
+                    json={
+                        "chat_id": chat_id,
+                        "text": group_text,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
+                        "reply_markup": group_reply_markup,
+                    },
+                    timeout=8,
+                )
+                if not resp.ok:
+                    print(f"[OpsNotify] sendMessage buttons failed chat={chat_id}: {resp.status_code} {resp.text[:200]}")
+            except Exception as exc:
+                print(f"[OpsNotify] sendMessage buttons exception chat={chat_id}: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# Scraper default page ID
+DEFAULT_SCRAPER_PAGE_ID = "aca5195e-d583-410a-9781-d51351c30083"
+
+class AccountCreateRequest(BaseModel):
+    name: str
+
+class ProxyConfig(BaseModel):
+    enabled: bool
+    type: str
+    host: str
+    port: int
+    username: str = ""
+    password: str = ""
+
+class AccountConfigRequest(BaseModel):
+    account_name: str
+    folder_name: str
+    proxy: ProxyConfig
+    owner_username: Optional[str] = None
+
+class LoginStartRequest(BaseModel):
+    account_id: str
+    phone: str
+    page_id: Optional[str] = None
+
+class LoginSubmitRequest(BaseModel):
+    account_id: str
+    code: str
+    pass2fa: Optional[str] = None
+
+class QuickImportRequest(BaseModel):
+    import_string: str
+
+class LocalCredentialsRequest(BaseModel):
+    pass2fa: Optional[str] = None
+    page_id: Optional[str] = None
+
+class CampaignStartRequest(BaseModel):
+    account_id: str
+    folder_name: str
+    message_text: str
+    task_interval_minutes: int
+    group_interval_seconds: int
+    is_strategy: Optional[bool] = False
+
+class CampaignGroupInfo(BaseModel):
+    chat_id: int
+    title: str
+    username: Optional[str] = None
+    group_type: Optional[str] = None
+
+class GroupCategoryUpdateRequest(BaseModel):
+    id: str
+    category: str
+
+class MessageCampaignTaskRequest(BaseModel):
+    account_id: str
+    account_ids: Optional[List[str]] = None
+    max_cycles: int  # 0 = infinite
+    round_interval_minutes: int
+    group_interval_seconds: int
+    is_safety: bool
+    multi_account_safety_enabled: bool = False
+    strategy_enabled: bool = False
+    message: str
+    target_groups: List[CampaignGroupInfo]
+
+class ProfileNameRequest(BaseModel):
+    first_name: str
+    last_name: Optional[str] = ""
+    about: Optional[str] = None
+
+class ProfileAboutRequest(BaseModel):
+    about: str
+
+class ProfileUsernameRequest(BaseModel):
+    username: str
+
+class KickDeviceRequest(BaseModel):
+    hash: str
+
+class PrivateMessageSendRequest(BaseModel):
+    message: str
+
+class PrivateListenerStartRequest(BaseModel):
+    account_ids: Optional[List[str]] = None
+
+class BatchUpdateProfileRequest(BaseModel):
+    account_ids: List[str]
+    last_name: Optional[str] = ""
+    virtual_modify: Optional[bool] = True
+    custom_first_name: Optional[str] = ""
+    custom_username_prefix: Optional[str] = ""
+    about: Optional[str] = None
+    only_about: Optional[bool] = False
+
+class Update2faRequest(BaseModel):
+    current_password: Optional[str] = ""
+    new_password: str
+    hint: Optional[str] = ""
+
+class BatchUpdate2faRequest(BaseModel):
+    account_ids: List[str]
+    current_password: Optional[str] = ""
+    new_password_mode: str  # "same" or "auto"
+    custom_new_password: Optional[str] = ""
+    hint: Optional[str] = ""
+
+class CreateFolderRequest(BaseModel):
+    title: str
+    categories: List[str]
+
+class GroupModel(BaseModel):
+    id: str
+    title: str
+    username: str
+    type: str
+    enabled: bool
+    memberCount: int
+    category: str
+    price: float = 0.0
+    quality_score: int = 0
+    relevance_score: int = 0
+    activity_score: int = 0
+    engagement_score: int = 0
+
+class GroupToggleRequest(BaseModel):
+    id: str
+    enabled: bool
+
+class GroupResolveRequest(BaseModel):
+    link: str
+    category: str
+    price: Optional[float] = 0.0
+
+class BatchDeleteRequest(BaseModel):
+    ids: List[str]
+
+class BatchCategoryRequest(BaseModel):
+    ids: List[str]
+    category: str
+
+class GroupPriceUpdateRequest(BaseModel):
+    id: str
+    price: float
+
+class GroupCategoryModel(BaseModel):
+    id: Optional[int] = None
+    name: str
+    company: str
+
+class AddCategoryRequest(BaseModel):
+    name: str
+
+class RenameCategoryRequest(BaseModel):
+    old_name: str
+    new_name: str
+
+class BotStepRequest(BaseModel):
+    input_text: str
+
+
+
+# InMemory storage for parsed login codes: {account_id: [{"code": str, "timestamp": float, "text": str}]}
+captured_login_codes: Dict[str, List[dict]] = {}
+official_messages_store: Dict[str, List[dict]] = {}
+login_connection_logs: Dict[str, List[str]] = {}
+registered_listeners = set()
+DM_FOLDER_NAME = "DM"
+dm_folder_peer_cache: Dict[str, set[int]] = {}
+
+def add_login_log(account_id: str, message: str):
+    import datetime
+    try:
+        time_str = datetime.datetime.now().strftime("%H:%M:%S")
+        log_line = f"[{time_str}] {message}"
+        if account_id not in login_connection_logs:
+            login_connection_logs[account_id] = []
+        login_connection_logs[account_id].append(log_line)
+        login_connection_logs[account_id] = login_connection_logs[account_id][-20:]
+        print(f"[{account_id}] LOG: {message}")
+    except Exception as e:
+        print(f"Failed to add log: {e}")
+
+def register_login_code_listener(account_id: str, client: TelegramClient):
+    from telethon import events
+    
+    # Check if already registered
+    for handler, event in client.list_event_handlers():
+        if getattr(handler, "__name__", "") == "login_code_message_handler":
+            return
+
+    @client.on(events.NewMessage(incoming=True))
+    async def login_code_message_handler(event):
+        try:
+            sender_id = event.sender_id
+            is_official = (sender_id == 777000)
+            if not is_official and event.message.peer_id:
+                is_official = (getattr(event.message.peer_id, "user_id", None) == 777000)
+            
+            if not is_official:
+                try:
+                    sender = await event.get_sender()
+                    if getattr(sender, "id", None) == 777000:
+                        is_official = True
+                except Exception:
+                    pass
+            
+            if is_official:
+                text = event.message.message
+                if not text:
+                    return
+                
+                add_login_log(account_id, "监听到新的官方通知消息！")
+                
+                import datetime
+                msg_date = event.message.date
+                if isinstance(msg_date, datetime.datetime):
+                    timestamp = msg_date.timestamp()
+                else:
+                    timestamp = time.time()
+                    
+                if account_id not in official_messages_store:
+                    official_messages_store[account_id] = []
+                    
+                # Avoid duplicates
+                exists = any(m["text"] == text and abs(m["timestamp"] - timestamp) < 5 for m in official_messages_store[account_id])
+                if not exists:
+                    official_messages_store[account_id].append({
+                        "text": text,
+                        "timestamp": timestamp
+                    })
+                    official_messages_store[account_id] = sorted(
+                        official_messages_store[account_id],
+                        key=lambda x: x["timestamp"],
+                        reverse=True
+                    )[:5]
+                
+                # Match "Login code: 45001" or other patterns
+                match = re.search(r"Login code\s*:?\s*(\d+)", text, re.IGNORECASE)
+                if not match:
+                    match = re.search(r"(?:code|验证码)[:：\s]+(\d+)", text, re.IGNORECASE)
+                if not match:
+                    match = re.search(r"\b(\d{5,6})\b", text)
+                    
+                if match:
+                    code = match.group(1)
+                    if account_id not in captured_login_codes:
+                        captured_login_codes[account_id] = []
+                    
+                    exists_code = any(c["code"] == code and abs(c["timestamp"] - timestamp) < 10 for c in captured_login_codes[account_id])
+                    if not exists_code:
+                        captured_login_codes[account_id].append({
+                            "code": code,
+                            "timestamp": timestamp,
+                            "text": text
+                        })
+                        # Keep last 10 codes
+                        captured_login_codes[account_id] = captured_login_codes[account_id][-10:]
+                        try:
+                            print(f"[{account_id}] Captured official login code: {code}")
+                        except Exception:
+                            pass
+
+            if is_official:
+                return
+
+            if not getattr(event, "is_private", False):
+                return
+
+            try:
+                sender = await event.get_sender()
+            except Exception:
+                sender = None
+
+            if not isinstance(sender, types.User):
+                return
+            if bool(getattr(sender, "bot", False)):
+                return
+
+            sender_id_int = int(getattr(sender, "id", 0) or 0)
+            if sender_id_int <= 0:
+                return
+
+            try:
+                msg = getattr(event, "message", None)
+                msg_date = getattr(msg, "date", None)
+                private_event = {
+                    "account_id": str(account_id),
+                    "account_label": str(account_id),
+                    "source": "web_server",
+                    "sender_id": sender_id_int,
+                    "sender_name": private_user_display_name(sender),
+                    "sender_username": f"@{sender.username}" if getattr(sender, "username", None) else "",
+                    "sender_is_bot": bool(getattr(sender, "bot", False)),
+                    "message_id": int(getattr(msg, "id", 0) or 0),
+                    "text": message_preview_text(msg),
+                    "out": False,
+                    "notify": True,
+                    "timestamp": msg_date.timestamp() if msg_date else time.time(),
+                    "created_at": time.time(),
+                }
+                append_private_dm_event(private_event)
+                publish_private_dm_event(private_event)
+                
+                # --- 自动首问欢迎语回复逻辑（穿透 Telegram 官方云端历史判定） ---
+                try:
+                    is_first_chat = False
+                    cache_key = f"{account_id}:{sender_id_int}"
+                    from private_dm_events import first_chat_notified_set
+                    if cache_key not in first_chat_notified_set:
+                        # 实时拉取 Telegram 云端历史消息（限制2条）
+                        history_msgs = await client.get_messages(sender, limit=2)
+                        cloud_count = len(history_msgs) if history_msgs else 0
+                        print(f"[Welcome Check] Active Account {account_id} -> Sender {sender_id_int}: Cloud message history count is {cloud_count}")
+                        if cloud_count <= 1:
+                            is_first_chat = True
+                    
+                    if is_first_chat:
+                        print(f"[Welcome Check] Sender {sender_id_int} is verified as FIRST-TIME chat. Preparing to send welcome text.")
+                        first_chat_notified_set.add(cache_key)
+                        
+                        welcome_text = ""
+                        try:
+                            import sqlite3
+                            import random
+                            from db import DB_PATH
+                            with sqlite3.connect(str(DB_PATH)) as conn:
+                                cursor = conn.cursor()
+                                # 读取当前 bot 对应激活的自动回复模板
+                                cursor.execute("SELECT reply_text FROM bot_auto_replies WHERE bot_type = 'ai_bot' AND is_enabled = 1;")
+                                rows = cursor.fetchall()
+                                if rows:
+                                    welcome_text = random.choice(rows)[0]
+                                    print(f"[Welcome] Selected random welcome template from {len(rows)} enabled options.")
+                        except Exception as db_err:
+                            print(f"[Welcome] Failed to query welcome templates from database: {db_err}")
+                            
+                        if not welcome_text:
+                            welcome_text = (
+                                "🌹 <b>Hello! Welcome to RosePay!</b>\n\n"
+                                "Please join our group first: https://t.me/RosePayChatGroup\n\n"
+                                "⚠️ <b>Anti-Scam & Security Notice</b>:\n"
+                                "RosePay customer support and administrators will <b>NEVER private message (DM) you first</b>. "
+                                "Anyone who DMs you first is a scammer. Please verify carefully to protect your assets!\n\n"
+                                "💬 Please state your specific business needs here. Our support team will get back to you shortly. "
+                                "Have a great day!"
+                            )
+                        await client.send_message(sender, welcome_text, parse_mode="HTML")
+                        print(f"[Welcome] Auto sent first-chat welcome message to {sender_id_int} from account {account_id}.")
+                except Exception as welcome_err:
+                    print(f"[Welcome] Failed to send welcome message: {welcome_err}")
+            except Exception:
+                pass
+
+            cache = dm_folder_peer_cache.setdefault(account_id, set())
+            if sender_id_int not in cache:
+                await add_peer_to_folder(client, sender, DM_FOLDER_NAME)
+                cache.add(sender_id_int)
+                print(f"[{account_id}] Added private dialog {sender_id_int} to {DM_FOLDER_NAME} folder.")
+
+        except Exception as e:
+            print(f"Error handling login code listener for {account_id}: {e}")
+
+def mark_account_runtime_status(account_id: str, *, is_connected: bool, is_authorized: Optional[bool] = None, me: Optional[str] = None):
+    """Keep account-management runtime state aligned with actual Telethon activity."""
+    patch = {"is_connected": is_connected}
+    if is_connected:
+        patch["error"] = None
+        patch["last_error"] = None
+    cached = spambot_cache.get(account_id)
+    if is_authorized is not None:
+        patch["is_authorized"] = is_authorized
+    if me is not None:
+        patch["me"] = me
+    else:
+        patch["me"] = "已连接" if is_connected else "未登录"
+    if cached:
+        patch.setdefault("spambot_status", cached.get("status", "unknown"))
+        patch.setdefault("spambot_details", cached.get("details", ""))
+        patch.setdefault("spambot_time", cached.get("timestamp", None))
+    set_account_status(account_id, patch, source="runtime")
+
+async def get_client(account_id: str, ignore_proxy: bool = False) -> TelegramClient:
+    """Gets or initializes the Telethon client for an account."""
+    active_operation = active_account_operations.get(account_id)
+    current_task_id = id(asyncio.current_task()) if asyncio.current_task() else None
+    if active_operation and active_operation.get("task_id") != current_task_id:
+        raise HTTPException(
+            status_code=409,
+            detail=f"该账号正在执行操作: {active_operation.get('label') or active_operation.get('operation') or 'active'}，请稍后再试。"
+        )
+
+    is_campaign_running = account_id in active_processes and active_processes[account_id].poll() is None
+    if not is_campaign_running:
+        is_campaign_running = find_campaign_process(account_id) is not None
+    if is_campaign_running:
+        raise HTTPException(
+            status_code=400,
+            detail="该账号正在后台运行群发广告任务。为了防止电报 Session 数据库冲突锁死，请先暂停广告任务后再进行此操作。"
+        )
+
+    if account_id not in client_locks:
+        client_locks[account_id] = asyncio.Lock()
+        
+    async with client_locks[account_id]:
+        active_clients_last_accessed[account_id] = time.time()
+        if account_id in active_clients:
+            client = active_clients[account_id]
+            cached_ignore = getattr(client, "_is_proxy_ignored", False)
+            if cached_ignore != ignore_proxy:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                active_clients.pop(account_id, None)
+            else:
+                if not client.is_connected():
+                    await client.connect()
+                mark_account_runtime_status(account_id, is_connected=True)
+                if account_id not in registered_listeners:
+                    try:
+                        register_login_code_listener(account_id, client)
+                        registered_listeners.add(account_id)
+                    except Exception as e:
+                        print(f"Failed to register login code listener: {e}")
+                return client
+
+        config_path = account_config_path(account_id)
+        if not config_path.exists():
+            raise HTTPException(status_code=404, detail="Account config file not found")
+
+        config = load_json(config_path)
+        base_dir = config_path.parent.parent
+
+        if ignore_proxy:
+            config = config.copy()
+            if "proxy" in config and isinstance(config["proxy"], dict):
+                config["proxy"] = config["proxy"].copy()
+                config["proxy"]["enabled"] = False
+
+        validate_telegram_connection_config(account_id, config, ignore_proxy=ignore_proxy)
+
+        # Use the builder from sync_folder_groups
+        client = await build_client(config, base_dir)
+        client._is_proxy_ignored = ignore_proxy
+        await client.connect()
+        active_clients[account_id] = client
+        mark_account_runtime_status(account_id, is_connected=True)
+        
+        if account_id not in registered_listeners:
+            try:
+                register_login_code_listener(account_id, client)
+                registered_listeners.add(account_id)
+            except Exception as e:
+                print(f"Failed to register login code listener: {e}")
+                
+        return client
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class SetupAdminRequest(BaseModel):
+    username: str
+    password: str
+    company: Optional[str] = "admin"
+
+class CompanyCreateRequest(BaseModel):
+    name: str
+
+class CompanyUpdateRequest(BaseModel):
+    name: str
+
+class UserCreateRequest(BaseModel):
+    username: str
+    password: str
+    role: str # admin or user
+    company: Optional[str] = "admin"
+    telegram_contact: Optional[str] = ""
+    forum_chat_id: Optional[str] = None
+
+def normalize_telegram_contact(value: Optional[str]) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    match = re.fullmatch(r"@([A-Za-z0-9_]{5,32})", raw)
+    if not match:
+        match = re.fullmatch(r"https://(?:t\.me|telegram\.me)/([A-Za-z0-9_]{5,32})/?", raw, re.IGNORECASE)
+    if not match:
+        raise HTTPException(status_code=400, detail="电报ID格式错误，请输入 @username 或 https://t.me/username")
+    return f"@{match.group(1)}"
+
+def sync_translation_bot_config():
+    import json
+    import os
+    import sqlite3
+    
+    json_path = "/opt/rosepay-translate-bot/data/translate_access.json"
+    if not os.path.exists(json_path):
+        return
+        
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            old_data = json.load(f)
+            
+        old_allowed_chats = [cid for cid in old_data.get("allowed_chat_ids", [])]
+        old_owner_ids = [oid for oid in old_data.get("owner_chat_ids", []) if oid < 0]
+        
+        from db import DB_PATH
+        conn = sqlite3.connect(str(DB_PATH))
+        cursor = conn.cursor()
+        cursor.execute("SELECT telegram_chat_id, role FROM bot_authorized_users WHERE bot_type = 'translate_bot' AND is_active = 1;")
+        rows = cursor.fetchall()
+        conn.close()
+        
+        new_allowed_users = []
+        new_owner_users = []
+        
+        for chat_id_str, role in rows:
+            try:
+                cid = int(chat_id_str)
+                if cid > 0:
+                    if role == "admin":
+                        new_owner_users.append(cid)
+                    else:
+                        new_allowed_users.append(cid)
+            except ValueError:
+                pass
+                
+        final_owners = sorted(list(set(old_owner_ids + new_owner_users + [8302461675])))
+        final_allowed = sorted(list(set(new_allowed_users)))
+        
+        new_data = {
+            "allowed_usernames": [],
+            "allowed_user_ids": final_allowed,
+            "allowed_chat_ids": old_allowed_chats,
+            "owner_chat_ids": final_owners
+        }
+        
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(new_data, f, indent=2)
+            
+        os.system("systemctl restart rosepay-translate-bot.service")
+    except Exception as exc:
+        print("sync_translation_bot_config failed:", exc)
+
+# --- BOT AUTHORIZATIONS & DEEPSEEK MONITOR APIs ---
+from pydantic import BaseModel
+from typing import Optional
+
+class BotAuthPayload(BaseModel):
+    telegram_chat_id: str
+    bot_type: str
+    telegram_username: Optional[str] = None
+    role: str = "employee"
+    owner_username: Optional[str] = None
+    is_active: int = 1
+
+@app.get("/api/bot/authorizations")
+def get_bot_authorizations(user: dict = Depends(get_current_user)):
+    from db import BotAuthorizedUserDb, engine
+    from sqlmodel import Session, select
+    with Session(engine) as session:
+        stmt = select(BotAuthorizedUserDb)
+        rows = session.exec(stmt).all()
+        result = []
+        for r in rows:
+            display_name = ""
+            role_label = r.role
+            owner_label = r.owner_username or ""
+            acc_status = "unknown"
+            is_system_linked = False
+            
+            # 优先关联查询 accounts 托管表获取具体账号名称（如 RosePay Frank）与状态
+            cursor = session.connection().connection.cursor()
+            cursor.execute("SELECT account_name, is_available, owner_username FROM accounts WHERE id = ?", (r.telegram_chat_id,))
+            acc_row = cursor.fetchone()
+            if acc_row:
+                acc_name, is_available, owner = acc_row
+                acc_status = "online" if is_available else "offline"
+                display_name = acc_name
+                role_label = "external"
+                is_system_linked = True
+                if not owner_label:
+                    owner_label = owner or ""
+            else:
+                # 关联查询 admins 表获取系统账号绑定关系
+                cursor.execute("SELECT username, role, telegram_contact FROM admins WHERE telegram_chat_id = ?", (r.telegram_chat_id,))
+                admin_row = cursor.fetchone()
+                if admin_row:
+                    admin_username, admin_role, admin_contact = admin_row
+                    display_name = admin_contact if admin_contact else f"@{admin_username}"
+                    if admin_username == "eason" or admin_role == "admin":
+                        role_label = "admin"
+                    else:
+                        role_label = "employee"
+                    is_system_linked = True
+            
+            # 兜底：如果都没有关联上，则使用创建时记录的用户名，但标记 system_linked = False
+            if not display_name or display_name.strip() == "":
+                display_name = r.telegram_username or ""
+                
+            result.append({
+                "telegram_chat_id": r.telegram_chat_id,
+                "bot_type": r.bot_type,
+                "telegram_username": display_name,
+                "role": role_label,
+                "owner_username": owner_label,
+                "approved_at": r.approved_at,
+                "approved_by": r.approved_by,
+                "is_active": r.is_active,
+                "account_status": acc_status,
+                "is_system_linked": is_system_linked
+            })
+        return result
+
+
+@app.post("/api/bot/authorizations")
+def create_or_update_bot_authorization(payload: BotAuthPayload, user: dict = Depends(get_current_user)):
+    from db import BotAuthorizedUserDb, engine
+    from sqlmodel import Session
+    with Session(engine) as session:
+        db_auth = session.get(BotAuthorizedUserDb, (payload.telegram_chat_id, payload.bot_type))
+        if db_auth:
+            db_auth.telegram_username = payload.telegram_username
+            db_auth.role = payload.role
+            db_auth.owner_username = payload.owner_username
+            db_auth.is_active = payload.is_active
+        else:
+            import datetime
+            db_auth = BotAuthorizedUserDb(
+                telegram_chat_id=payload.telegram_chat_id,
+                bot_type=payload.bot_type,
+                telegram_username=payload.telegram_username,
+                role=payload.role,
+                owner_username=payload.owner_username,
+                approved_at=datetime.datetime.now().isoformat(),
+                approved_by="console_admin",
+                is_active=payload.is_active
+            )
+        session.add(db_auth)
+        session.commit()
+        if payload.bot_type == 'translate_bot':
+            try:
+                sync_translation_bot_config()
+            except Exception as ex:
+                pass
+        return {"status": "success", "message": "Bot 授权信息更新成功"}
+
+@app.delete("/api/bot/authorizations/{telegram_chat_id}/{bot_type}")
+def delete_bot_authorization(telegram_chat_id: str, bot_type: str, user: dict = Depends(get_current_user)):
+    from db import BotAuthorizedUserDb, engine
+    from sqlmodel import Session
+    with Session(engine) as session:
+        db_auth = session.get(BotAuthorizedUserDb, (telegram_chat_id, bot_type))
+        if db_auth:
+            session.delete(db_auth)
+            session.commit()
+            if bot_type == 'translate_bot':
+                try:
+                    sync_translation_bot_config()
+                except Exception as ex:
+                    pass
+            return {"status": "success", "message": "已成功解除授权"}
+        return {"status": "error", "message": "未找到对应的授权记录"}
+
+@app.get("/api/bot/deepseek-balance")
+def get_deepseek_balance(user: dict = Depends(get_current_user)):
+    import urllib.request
+    import json
+    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
+        env_paths = [
+            Path(__file__).resolve().parent / ".env",
+            Path("/opt/rosepay-telegram-bot/.env"),
+            Path("/opt/rosepay-translate-bot/.env"),
+            Path("E:/telegram_translate_bot_workspace/.env")
+        ]
+        for p in env_paths:
+            if p.exists():
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        for line in f:
+                            if "DEEPSEEK_API_KEY" in line:
+                                parts = line.split("=", 1)
+                                if len(parts) > 1:
+                                    api_key = parts[1].strip().strip('"').strip("'")
+                                    break
+                except Exception:
+                    pass
+            if api_key:
+                break
+
+    if not api_key:
+        return {"error": "未配置 DEEPSEEK_API_KEY 环境变量，无法查询余额"}
+
+    try:
+        req = urllib.request.Request(
+            "https://api.deepseek.com/user/balance",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            res_data = response.read().decode("utf-8")
+            return json.loads(res_data)
+    except Exception as exc:
+        return {"error": f"连接 DeepSeek 官方或接口返回异常: {exc}"}
+
+
+@app.get("/api/config/global-active-proxies")
+def get_global_active_proxies(user: dict = Depends(get_current_user)):
+    """Returns a global map of active proxy IPs to prevent allocation conflicts across companies."""
+    from db import engine, AccountDb, Session, select
+    with Session(engine) as session:
+        accounts = session.exec(select(AccountDb).where(AccountDb.proxy_enabled == 1)).all()
+        mapping = {}
+        for acc in accounts:
+            if acc.proxy_host:
+                label = f"{acc.account_name or acc.id}"
+                if acc.company and acc.company != "admin":
+                    label += f" ({acc.company})"
+                mapping[acc.proxy_host] = label
+        return mapping
+
+@app.get("/api/config/default-proxy")
+def get_default_proxy():
+    """Gets default proxy settings from config.json if available."""
+    template_path = Path("config.json")
+    if template_path.exists():
+        try:
+            config = load_json(template_path)
+            proxy = config.get("proxy", {})
+            return {
+                "enabled": proxy.get("enabled", True),
+                "type": proxy.get("type", "http"),
+                "host": proxy.get("host", "127.0.0.1"),
+                "port": proxy.get("port", 8800),
+                "username": proxy.get("username", ""),
+                "password": proxy.get("password", "")
+            }
+        except Exception:
+            pass
+    return {
+        "enabled": True,
+        "type": "http",
+        "host": "127.0.0.1",
+        "port": 8800,
+        "username": "",
+        "password": ""
+    }
+
+# --- AUTHENTICATION APIs ---
+
+@app.get("/api/auth/status")
+def get_auth_status():
+    from db import engine, AdminDb, Session, select
+    with Session(engine) as session:
+        stmt = select(AdminDb)
+        has_admin = session.exec(stmt).first() is not None
+    return {"initialized": has_admin}
+
+@app.post("/api/auth/setup-admin")
+def setup_first_admin(req: SetupAdminRequest):
+    from db import engine, AdminDb, Session, select, hash_password
+    from datetime import datetime, timezone
+    with Session(engine) as session:
+        stmt = select(AdminDb)
+        if session.exec(stmt).first() is not None:
+            raise HTTPException(status_code=400, detail="管理员已配置，不允许重复初始化")
+        
+        username = req.username.strip()
+        password = req.password
+        if not username or len(password) < 6:
+            raise HTTPException(status_code=400, detail="用户名不能为空，密码长度必须不小于 6 位")
+            
+        pwd_hash, salt = hash_password(password)
+        admin_user = AdminDb(
+            username=username,
+            password_hash=pwd_hash,
+            salt=salt,
+            role="admin",
+            company=req.company.strip() if req.company else "admin",
+            created_at=datetime.now(timezone.utc).isoformat()
+        )
+        session.add(admin_user)
+        session.commit()
+    return {"status": "success", "message": "管理员配置成功"}
+
+@app.post("/api/auth/login")
+def login(req: LoginRequest):
+    from db import engine, AdminDb, RolePermissionDb, Session, select, verify_password
+    username = req.username.strip()
+    password = req.password
+    
+    with Session(engine) as session:
+        stmt = select(AdminDb).where(AdminDb.username == username)
+        user = session.exec(stmt).first()
+        if not user:
+            raise HTTPException(status_code=401, detail="用户名或密码错误")
+            
+        if not verify_password(password, user.salt, user.password_hash):
+            raise HTTPException(status_code=401, detail="用户名或密码错误")
+            
+        # Get allowed tabs
+        perm = session.get(RolePermissionDb, user.role)
+        allowed = [x.strip() for x in perm.allowed_tabs.split(",") if x.strip()] if perm else []
+        if user.role == "admin":
+            if "bot_auth" not in allowed:
+                allowed.append("bot_auth")
+            if "bots" not in allowed:
+                allowed.append("bots")
+        
+        token = generate_token(user.username, user.role)
+        return {
+            "status": "success",
+            "token": token,
+            "username": user.username,
+            "role": user.role,
+            "company": user.company or "admin",
+            "allowed_tabs": allowed
+        }
+
+@app.get("/api/auth/current")
+def get_current_logged_in_user(user: dict = Depends(get_current_user)):
+    from db import engine, RolePermissionDb, Session
+    with Session(engine) as session:
+        perm = session.get(RolePermissionDb, user["role"])
+        allowed = [x.strip() for x in perm.allowed_tabs.split(",") if x.strip()] if perm else []
+        if user["role"] == "admin":
+            if "bot_auth" not in allowed:
+                allowed.append("bot_auth")
+            if "bots" not in allowed:
+                allowed.append("bots")
+    return {
+        "username": user["username"],
+        "role": user["role"],
+        "company": user["company"],
+        "allowed_tabs": allowed
+    }
+
+class VerifyPasswordRequest(BaseModel):
+    password: str
+
+@app.post("/api/auth/verify-password")
+def verify_admin_password(req: VerifyPasswordRequest, user: dict = Depends(get_current_user)):
+    """Verifies the currently logged-in user's password."""
+    from db import engine, AdminDb, Session, select, verify_password
+    with Session(engine) as session:
+        db_user = session.exec(select(AdminDb).where(AdminDb.username == user["username"])).first()
+        if not db_user:
+            return {"valid": False}
+        is_valid = verify_password(req.password, db_user.salt, db_user.password_hash)
+        return {"valid": is_valid}
+
+# --- COMPANY MANAGEMENT APIs ---
+
+@app.get("/api/admin/companies")
+def get_admin_companies(user: dict = Depends(get_current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="拒绝访问")
+    from db import engine, CompanyDb, Session, select
+    with Session(engine) as session:
+        stmt = select(CompanyDb).order_by(CompanyDb.name.asc())
+        results = session.exec(stmt).all()
+        return [{"id": c.id, "name": c.name, "created_at": c.created_at} for c in results]
+
+@app.post("/api/admin/companies")
+def create_admin_company(req: CompanyCreateRequest, user: dict = Depends(get_current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="拒绝访问")
+    from db import engine, CompanyDb, Session, select
+    from datetime import datetime, timezone
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="公司名称不能为空")
+    
+    with Session(engine) as session:
+        dup = session.exec(select(CompanyDb).where(CompanyDb.name == name)).first()
+        if dup:
+            raise HTTPException(status_code=400, detail="公司名称已存在")
+        
+        new_company = CompanyDb(
+            name=name,
+            created_at=datetime.now(timezone.utc).isoformat()
+        )
+        session.add(new_company)
+        session.commit()
+    return {"status": "success", "message": "添加公司成功"}
+
+@app.put("/api/admin/companies/{company_id}")
+def update_admin_company(company_id: int, req: CompanyUpdateRequest, user: dict = Depends(get_current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="拒绝访问")
+    from db import engine, CompanyDb, Session, select
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="公司名称不能为空")
+        
+    with Session(engine) as session:
+        company = session.get(CompanyDb, company_id)
+        if not company:
+            raise HTTPException(status_code=404, detail="公司不存在")
+        
+        if company.name == "admin":
+            raise HTTPException(status_code=400, detail="不能修改admin")
+            
+        dup = session.exec(select(CompanyDb).where(CompanyDb.name == name).where(CompanyDb.id != company_id)).first()
+        if dup:
+            raise HTTPException(status_code=400, detail="公司名称已存在")
+            
+        company.name = name
+        session.add(company)
+        session.commit()
+    return {"status": "success", "message": "修改公司成功"}
+
+@app.delete("/api/admin/companies/{company_id}")
+def delete_admin_company(company_id: int, user: dict = Depends(get_current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="拒绝访问")
+    from db import engine, CompanyDb, AdminDb, AccountDb, Session, select
+    with Session(engine) as session:
+        company = session.get(CompanyDb, company_id)
+        if not company:
+            raise HTTPException(status_code=404, detail="公司不存在")
+            
+        if company.name == "admin":
+            raise HTTPException(status_code=400, detail="不能删除admin")
+            
+        # Check if any admin/user belongs to this company
+        user_dup = session.exec(select(AdminDb).where(AdminDb.company == company.name)).first()
+        if user_dup:
+            raise HTTPException(status_code=400, detail="该公司下有系统用户，无法删除")
+            
+        # Check if any accounts belong to this company
+        account_dup = session.exec(select(AccountDb).where(AccountDb.company == company.name)).first()
+        if account_dup:
+            raise HTTPException(status_code=400, detail="该公司下有 Telegram 账号，无法删除")
+            
+        session.delete(company)
+        session.commit()
+    return {"status": "success", "message": "删除公司成功"}
+
+# --- ADMIN MANAGEMENT APIs ---
+
+@app.get("/api/admin/users")
+def get_admin_users(user: dict = Depends(get_current_user)):
+    from db import engine, AdminDb, Session, select
+    with Session(engine) as session:
+        if user["role"] == "admin":
+            stmt = select(AdminDb)
+        else:
+            stmt = select(AdminDb).where(AdminDb.company == user["company"])
+        results = session.exec(stmt).all()
+        return [{
+            "id": u.id,
+            "username": u.username,
+            "role": u.role,
+            "company": u.company or "admin",
+            "telegram_contact": getattr(u, "telegram_contact", "") or "",
+            "forum_chat_id": getattr(u, "forum_chat_id", "") or "",
+            "created_at": u.created_at
+        } for u in results]
+
+@app.post("/api/admin/users")
+def create_admin_user(req: UserCreateRequest, user: dict = Depends(get_current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="拒绝访问")
+    from db import engine, AdminDb, Session, select, hash_password
+    from datetime import datetime, timezone
+    username = req.username.strip()
+    password = req.password
+    if req.role not in {"admin", "user"}:
+        raise HTTPException(status_code=400, detail="角色必须是 admin 或 user")
+    if not username or len(password) < 6:
+        raise HTTPException(status_code=400, detail="用户名不能为空，密码长度必须不小于 6 位")
+    telegram_contact = normalize_telegram_contact(req.telegram_contact)
+        
+    company_name = req.company.strip() if req.company else ""
+    if username not in ("eason", "admin") and not company_name:
+        raise HTTPException(status_code=400, detail="除了 eason 用户外，其他用户必须绑定公司")
+        
+    forum_chat_id = req.forum_chat_id.strip() if req.forum_chat_id else ""
+        
+    with Session(engine) as session:
+        from db import CompanyDb
+        if company_name:
+            company_exists = session.exec(select(CompanyDb).where(CompanyDb.name == company_name)).first()
+            if not company_exists:
+                raise HTTPException(status_code=400, detail=f"绑定的公司 '{company_name}' 不存在")
+            
+        dup = session.exec(select(AdminDb).where(AdminDb.username == username)).first()
+        if dup:
+            raise HTTPException(status_code=400, detail="用户名已存在")
+            
+        if telegram_contact:
+            dup_contact = session.exec(select(AdminDb).where(AdminDb.telegram_contact == telegram_contact)).first()
+            if dup_contact:
+                raise HTTPException(status_code=400, detail="该电报用户名已被系统内其他用户绑定")
+                
+        if forum_chat_id:
+            dup_forum = session.exec(select(AdminDb).where(AdminDb.forum_chat_id == forum_chat_id)).first()
+            if dup_forum:
+                raise HTTPException(status_code=400, detail="该超级群 ID 已被系统内其他用户占用")
+            
+        pwd_hash, salt = hash_password(password)
+        new_user = AdminDb(
+            username=username,
+            password_hash=pwd_hash,
+            salt=salt,
+            role=req.role,
+            company=company_name,
+            telegram_contact=telegram_contact,
+            forum_chat_id=forum_chat_id,
+            created_at=datetime.now(timezone.utc).isoformat()
+        )
+        session.add(new_user)
+        session.commit()
+        
+        # 自动激活暂存账号所有权
+        if telegram_contact:
+            clean_contact = telegram_contact.strip().lstrip("@").lower()
+            from db import AccountDb
+            pending_tag = f"pending_tg_username:{clean_contact}"
+            stmt_update = select(AccountDb).where(AccountDb.owner_username == pending_tag)
+            pending_accs = session.exec(stmt_update).all()
+            for acc in pending_accs:
+                acc.owner_username = username
+                session.add(acc)
+            session.commit()
+            
+    return {"status": "success", "message": "添加用户成功"}
+
+class UserUpdateRequest(BaseModel):
+    role: str
+    company: str
+    password: Optional[str] = None
+    telegram_contact: Optional[str] = ""
+    forum_chat_id: Optional[str] = None
+
+@app.put("/api/admin/users/{user_id}")
+def update_admin_user(user_id: int, req: UserUpdateRequest, user: dict = Depends(get_current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="拒绝访问")
+    from db import engine, AdminDb, Session, select, hash_password
+    
+    role = req.role.strip()
+    company_name = req.company.strip() if req.company else ""
+    telegram_contact = normalize_telegram_contact(req.telegram_contact)
+    forum_chat_id = req.forum_chat_id.strip() if req.forum_chat_id else ""
+    
+    if role not in {"admin", "user"}:
+        raise HTTPException(status_code=400, detail="角色必须是 admin 或 user")
+        
+    with Session(engine) as session:
+        target_user = session.get(AdminDb, user_id)
+        if not target_user:
+            raise HTTPException(status_code=404, detail="用户不存在")
+            
+        username = target_user.username
+        if username not in ("eason", "admin") and not company_name:
+            raise HTTPException(status_code=400, detail="除了 eason 用户外，其他用户必须绑定公司")
+            
+        if telegram_contact:
+            dup_contact = session.exec(
+                select(AdminDb).where(AdminDb.telegram_contact == telegram_contact).where(AdminDb.id != user_id)
+            ).first()
+            if dup_contact:
+                raise HTTPException(status_code=400, detail="该电报用户名已被系统内其他用户绑定")
+                
+        if forum_chat_id:
+            dup_forum = session.exec(
+                select(AdminDb).where(AdminDb.forum_chat_id == forum_chat_id).where(AdminDb.id != user_id)
+            ).first()
+            if dup_forum:
+                raise HTTPException(status_code=400, detail="该超级群 ID 已被系统内其他用户占用")
+            
+        if company_name:
+            from db import CompanyDb
+            company_exists = session.exec(select(CompanyDb).where(CompanyDb.name == company_name)).first()
+            if not company_exists:
+                raise HTTPException(status_code=400, detail=f"绑定的公司 '{company_name}' 不存在")
+                
+        target_user.role = role
+        target_user.company = company_name
+        if getattr(target_user, "telegram_contact", "") != telegram_contact:
+            target_user.telegram_chat_id = None
+        target_user.telegram_contact = telegram_contact
+        target_user.forum_chat_id = forum_chat_id
+        
+        if req.password:
+            password = req.password.strip()
+            if len(password) < 6:
+                raise HTTPException(status_code=400, detail="密码长度必须不小于 6 位")
+            pwd_hash, salt = hash_password(password)
+            target_user.password_hash = pwd_hash
+            target_user.salt = salt
+            
+        session.add(target_user)
+        session.commit()
+        
+        # 自动激活暂存账号所有权
+        if telegram_contact:
+            clean_contact = telegram_contact.strip().lstrip("@").lower()
+            from db import AccountDb
+            pending_tag = f"pending_tg_username:{clean_contact}"
+            stmt_update = select(AccountDb).where(AccountDb.owner_username == pending_tag)
+            pending_accs = session.exec(stmt_update).all()
+            for acc in pending_accs:
+                acc.owner_username = username
+                session.add(acc)
+            session.commit()
+            
+    return {"status": "success", "message": "修改用户成功"}
+
+@app.delete("/api/admin/users/{user_id}")
+def delete_admin_user(user_id: int, user: dict = Depends(get_current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="拒绝访问")
+    from db import engine, AdminDb, Session
+    with Session(engine) as session:
+        u = session.get(AdminDb, user_id)
+        if not u:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        if u.username == user["username"]:
+            raise HTTPException(status_code=400, detail="不允许删除当前登录账号")
+            
+        session.delete(u)
+        session.commit()
+    return {"status": "success", "message": "删除用户成功"}
+
+class ChangeUserPasswordRequest(BaseModel):
+    old_password: Optional[str] = ""
+    password: str
+
+@app.post("/api/admin/users/{user_id}/password")
+def change_user_password(user_id: int, req: ChangeUserPasswordRequest, user: dict = Depends(get_current_user)):
+    from db import engine, AdminDb, RolePermissionDb, Session, select, hash_password, verify_password
+    with Session(engine) as session:
+        target_user = session.get(AdminDb, user_id)
+        if not target_user:
+            raise HTTPException(status_code=404, detail="目标用户不存在")
+            
+        is_self = user["id"] == target_user.id or user["username"] == target_user.username
+        is_super = user["username"] in ("eason", "admin")
+        
+        has_permission = False
+        if is_self or is_super:
+            has_permission = True
+        else:
+            if user["role"] == "admin":
+                role_perm = session.get(RolePermissionDb, "admin")
+                if role_perm:
+                    allowed = [x.strip() for x in role_perm.allowed_tabs.split(",") if x.strip()]
+                    if "change_password" in allowed:
+                        has_permission = True
+                    
+        if not has_permission:
+            raise HTTPException(status_code=403, detail="没有修改他人密码的权限")
+            
+        new_pwd = req.password.strip()
+        if len(new_pwd) < 6:
+            raise HTTPException(status_code=400, detail="新密码长度不能小于6位")
+            
+        # Check if new password is identical to current password
+        if verify_password(new_pwd, target_user.salt, target_user.password_hash):
+            raise HTTPException(status_code=400, detail="新密码不能与原密码相同")
+            
+        # Verify old password if modifying own password
+        if is_self:
+            old_pwd = req.old_password
+            if not old_pwd:
+                raise HTTPException(status_code=400, detail="修改个人密码必须输入原密码")
+            if not verify_password(old_pwd, target_user.salt, target_user.password_hash):
+                raise HTTPException(status_code=401, detail="原密码输入错误")
+            
+        pwd_hash, salt = hash_password(new_pwd)
+        target_user.password_hash = pwd_hash
+        target_user.salt = salt
+        session.add(target_user)
+        session.commit()
+        
+    return {"status": "success", "message": "密码修改成功"}
+
+class RolePermissionRequest(BaseModel):
+    role: str
+    allowed_tabs: List[str]
+
+@app.get("/api/admin/permissions")
+def get_role_permissions(user: dict = Depends(get_current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="拒绝访问")
+    from db import engine, RolePermissionDb, Session, select
+    with Session(engine) as session:
+        stmt = select(RolePermissionDb)
+        results = session.exec(stmt).all()
+        return [
+            {
+                "role": p.role,
+                "allowed_tabs": [x.strip() for x in p.allowed_tabs.split(",") if x.strip()]
+            }
+            for p in results
+        ]
+
+@app.post("/api/admin/permissions")
+def update_role_permissions(req: RolePermissionRequest, user: dict = Depends(get_current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="拒绝访问")
+    
+    role = req.role.strip()
+    allowed_list = [x.strip() for x in req.allowed_tabs if x.strip()]
+    
+    # Safety Check: Prevent admins from accidentally disabling 'users' or 'permissions' for themselves
+    if role == "admin":
+        if "users" not in allowed_list:
+            allowed_list.append("users")
+        if "permissions" not in allowed_list:
+            allowed_list.append("permissions")
+        if "bot_auth" not in allowed_list:
+            allowed_list.append("bot_auth")
+        if "bots" not in allowed_list:
+            allowed_list.append("bots")
+            
+    allowed_tabs_str = ",".join(allowed_list)
+    
+    from db import engine, RolePermissionDb, Session
+    with Session(engine) as session:
+        perm = session.get(RolePermissionDb, role)
+        if not perm:
+            perm = RolePermissionDb(role=role, allowed_tabs=allowed_tabs_str)
+        else:
+            perm.allowed_tabs = allowed_tabs_str
+        session.add(perm)
+        session.commit()
+        
+    return {"status": "success", "message": f"角色 {role} 的权限已更新"}
+
+# --- FRONTEND ROUTE ---
+
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
+# Serve static assets (Vite React app assets) from frontend/dist/assets
+frontend_dist_dir = Path(__file__).resolve().parent / "frontend" / "dist"
+assets_dir = frontend_dist_dir / "assets"
+
+if assets_dir.exists():
+    app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_index():
+    frontend_index = frontend_dist_dir / "index.html"
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0"
+    }
+    if frontend_index.exists():
+        return HTMLResponse(content=frontend_index.read_text(encoding="utf-8"), status_code=200, headers=headers)
+        
+    index_path = Path(__file__).resolve().parent / "templates" / "index.html"
+    if not index_path.exists():
+        raise HTTPException(status_code=404, detail="Index HTML not found")
+    return HTMLResponse(content=index_path.read_text(encoding="utf-8"), status_code=200, headers=headers)
+
+@app.get("/{filename}")
+async def serve_public_file(filename: str):
+    # Security: Prevent path traversal (e.g. filename = "../data/rosepay.db")
+    try:
+        # Check in frontend dist folder
+        file_path = (frontend_dist_dir / filename).resolve()
+        if file_path.is_file() and str(file_path).startswith(str(frontend_dist_dir.resolve())):
+            # Block access to configuration/build files
+            if filename in (".env", "config.json", "package.json", "package-lock.json", "tsconfig.json", "vite.config.ts"):
+                raise HTTPException(status_code=403, detail="Access denied")
+            return FileResponse(file_path)
+            
+        # Fallback to check legacy templates folder
+        legacy_dir = Path(__file__).resolve().parent / "templates"
+        legacy_path = (legacy_dir / filename).resolve()
+        if legacy_path.is_file() and str(legacy_path).startswith(str(legacy_dir.resolve())):
+            return FileResponse(legacy_path)
+    except HTTPException as he:
+        raise he
+    except Exception:
+        pass
+    raise HTTPException(status_code=404, detail="File not found")
+
+
+# --- SCRAPER API ---
+
+def _auto_save_2fa_to_db(pid: str, pass2fa: str):
+    """Helper to automatically save extracted 2FA password to the database."""
+    if not pass2fa or not pass2fa.strip():
+        return
+    try:
+        from db import engine, AccountDb, Session, select
+        import re
+        with Session(engine) as session:
+            # 1. Try exact match on page_id
+            stmt = select(AccountDb).where(AccountDb.page_id == pid)
+            db_accs = session.exec(stmt).all()
+            
+            # 2. If no match, try extracting UUID token and matching
+            if not db_accs:
+                token_match = re.search(r"token=([a-zA-Z0-9\-]+)", pid)
+                token_val = token_match.group(1) if token_match else pid
+                stmt = select(AccountDb).where((AccountDb.page_id == token_val) | (AccountDb.page_id.like(f"%{token_val}%")))
+                db_accs = session.exec(stmt).all()
+                
+            for db_acc in db_accs:
+                if db_acc.pass2fa != pass2fa:
+                    db_acc.pass2fa = pass2fa
+                    session.add(db_acc)
+                    # Sync to config.json file
+                    try:
+                        config_path = account_config_path(db_acc.id)
+                        if config_path.exists():
+                            config = load_json(config_path)
+                            config["pass2fa"] = pass2fa
+                            save_json(config_path, config)
+                    except Exception as e:
+                        print(f"Error syncing 2FA to config json: {e}")
+            session.commit()
+    except Exception as e:
+        print(f"Error in _auto_save_2fa_to_db: {e}")
+
+@app.get("/api/scraper/fetch")
+async def fetch_scraper_data(page_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    """Fetches device verification code and 2fa password from the old target scraping URL."""
+    pid = (page_id or DEFAULT_SCRAPER_PAGE_ID).strip()
+    
+    # 如果是新接码平台链接，不进行自动爬取，直接返回空以等待用户手动输入
+    if "add4533.com" in pid or "onlinestore-fx-jm" in pid:
+        return {
+            "code": None,
+            "pass2fa": None,
+            "login_time": None
+        }
+        
+    code = None
+    pass2fa = None
+    login_time = None
+    
+    try:
+        # 旧版 HTML 平台 (feijige.shop) 爬虫
+        uuid_val = pid
+        if "http" in pid:
+            uuid_match = re.search(r"/([a-zA-Z0-9\-]{36})", pid)
+            if uuid_match:
+                uuid_val = uuid_match.group(1)
+                
+        url = f"https://tgapi.feijige.shop/{uuid_val}/GetHTML"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        loop = asyncio.get_running_loop()
+        resp = await loop.run_in_executor(None, lambda: requests.get(url, headers=headers, timeout=8))
+        resp.raise_for_status()
+        
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        code_input = soup.find('input', id='code')
+        if code_input:
+            code = code_input.get('value')
+        pass2fa_input = soup.find('input', id='pass2fa')
+        if pass2fa_input:
+            pass2fa = pass2fa_input.get('value')
+        time_label = soup.find(string=lambda t: t and "登录时间" in t)
+        if time_label:
+            parent = time_label.find_parent('div', class_='form-group')
+            if parent:
+                inp = parent.find('input')
+                if inp:
+                    login_time = inp.get('value')
+    except Exception as e:
+        print(f"[Scraper] Old platform fetch failed: {e}")
+        
+    if pass2fa:
+        _auto_save_2fa_to_db(pid, pass2fa)
+        
+    return {
+        "code": code,
+        "pass2fa": pass2fa,
+        "login_time": login_time
+    }
+
+# --- ACCOUNT MANAGEMENT APIs ---
+
+def cleanup_stale_unauthorized_accounts():
+    """Disabled safety hook.
+
+    Runtime auth status can be empty after a restart, so deleting accounts here
+    can remove real account rows and session files by mistake.
+    """
+    return
+
+@app.get("/api/accounts")
+def get_accounts(scope: str = "mine", user: dict = Depends(get_current_user)):
+    """Lists all configured Telegram accounts from database."""
+    cleanup_stale_unauthorized_accounts()
+    from db import engine, AccountDb, Session, select
+    started_at = time.time()
+    campaign_scan_ms = 0
+    busy_scan_ms = 0
+    with Session(engine) as session:
+        db_accounts = session.exec(query_accounts_for_view_scope(session, user, scope)).all()
+        result = []
+        for acc in db_accounts:
+            campaign_started = time.time()
+            is_campaign_running = acc.id in active_processes and active_processes[acc.id].poll() is None
+            if not is_campaign_running:
+                is_campaign_running = find_campaign_process(acc.id) is not None
+            campaign_scan_ms += int((time.time() - campaign_started) * 1000)
+            
+            # Fetch status from account_status_store
+            # Check persistent spambot cache as fallback if not in store yet
+            cached = spambot_cache.get(acc.id)
+            default_spambot_status = cached.get("status", "unknown") if cached else "unknown"
+            default_spambot_details = cached.get("details", "") if cached else ""
+            default_spambot_time = cached.get("timestamp", None) if cached else None
+
+            status = account_status_store.get(acc.id, {
+                "is_connected": False,
+                "is_authorized": False,
+                "me": "未初始化（等待检测）",
+                "spambot_status": default_spambot_status,
+                "spambot_details": default_spambot_details,
+                "spambot_time": default_spambot_time
+            })
+            
+            busy_started = time.time()
+            busy_status = get_account_busy_status(acc.id)
+            busy_scan_ms += int((time.time() - busy_started) * 1000)
+            live_client = active_clients.get(acc.id)
+            live_connected = bool(live_client and live_client.is_connected())
+            active_operation = active_account_operations.get(acc.id)
+            private_listener_active = (acc.id in auto_private_listener_accounts and live_connected) if ENABLE_REALTIME_PRIVATE_DM else False
+
+            result.append({
+                "id": acc.id,
+                "name": acc.account_name,
+                "is_available": acc.is_available,
+                "company": acc.company,
+                "created_by": acc.created_by,
+                "owner_username": acc.owner_username,
+                "bot_setup_status": acc.bot_setup_status or "not_started",
+                "config": acc.to_dict(),
+                "campaign_running": is_campaign_running,
+                "is_busy": is_account_busy_with_task(acc.id),
+                "busy_status": busy_status,
+                "active_operation": active_operation.get("operation") if active_operation else None,
+                "active_operation_label": active_operation.get("label") if active_operation else None,
+                "private_listener": private_listener_active,
+                "private_listener_source": "auto" if private_listener_active else None,
+                "is_connected": live_connected,
+                "is_authorized": status.get("is_authorized", False),
+                "isAuthorized": status.get("is_authorized", False),
+                "meInfo": status.get("me", "未初始化（等待检测）"),
+                "spambot_status": status.get("spambot_status", "unknown"),
+                "spambot_details": status.get("spambot_details", ""),
+                "spambot_time": status.get("spambot_time", None),
+                "is_deactivated": status.get("is_deactivated", False),
+                "connection_status": status.get("connection_status", "connected" if live_connected else "disconnected"),
+                "auth_status": status.get("auth_status", "authorized" if status.get("is_authorized", False) else "unauthorized"),
+                "task_status": busy_status,
+                "availability_status": "available" if acc.is_available else "occupied",
+                "last_checked_at": status.get("last_checked_at", None),
+                "last_error": status.get("last_error", status.get("error", None)),
+                "source": status.get("source", "accounts")
+            })
+        total_ms = int((time.time() - started_at) * 1000)
+        print(f"[AccountsTiming] total={total_ms}ms count={len(result)} campaign_scan={campaign_scan_ms}ms busy_scan={busy_scan_ms}ms")
+        return result
+
+
+def private_user_display_name(entity) -> str:
+    first_name = getattr(entity, "first_name", "") or ""
+    last_name = getattr(entity, "last_name", "") or ""
+    name = f"{first_name} {last_name}".strip()
+    username = getattr(entity, "username", "") or ""
+    if name:
+        return name
+    if username:
+        return f"@{username}"
+    return str(getattr(entity, "id", "Unknown"))
+
+
+def message_preview_text(message) -> str:
+    if not message:
+        return ""
+    text = getattr(message, "message", "") or ""
+    if text:
+        return text.replace("\n", " ").strip()
+    if getattr(message, "media", None):
+        return "[media]"
+    return ""
+
+
+def serialize_private_dialog(dialog) -> Optional[dict]:
+    if not getattr(dialog, "is_user", False):
+        return None
+    entity = dialog.entity
+    if not isinstance(entity, types.User):
+        return None
+    if bool(getattr(entity, "bot", False)):
+        return None
+    peer_id = str(entity.id)
+    last_message = dialog.message
+    last_date = getattr(last_message, "date", None)
+    return {
+        "peer_id": peer_id,
+        "name": private_user_display_name(entity),
+        "username": f"@{entity.username}" if getattr(entity, "username", None) else "",
+        "phone": getattr(entity, "phone", "") or "",
+        "is_bot": bool(getattr(entity, "bot", False)),
+        "unread_count": int(getattr(dialog, "unread_count", 0) or 0),
+        "last_message": message_preview_text(last_message),
+        "last_message_at": last_date.isoformat() if last_date else None,
+    }
+
+
+def serialize_private_message(message) -> dict:
+    date = getattr(message, "date", None)
+    text = getattr(message, "message", "") or ""
+    return {
+        "id": message.id,
+        "text": text,
+        "out": bool(getattr(message, "out", False)),
+        "date": date.isoformat() if date else None,
+        "has_media": bool(getattr(message, "media", None)),
+    }
+
+
+def event_to_private_message(event: dict) -> dict:
+    timestamp = float(event.get("timestamp") or event.get("created_at") or time.time())
+    message_id = int(event.get("message_id") or 0)
+    if message_id <= 0:
+        message_id = -int(timestamp * 1000)
+    return {
+        "id": message_id,
+        "text": event.get("text") or "",
+        "out": bool(event.get("out", False)),
+        "date": datetime.datetime.fromtimestamp(timestamp).isoformat(),
+        "has_media": (event.get("text") or "") in ("", "[media]"),
+    }
+
+
+def is_bot_private_event(event: dict) -> bool:
+    if bool(event.get("sender_is_bot", False)) or bool(event.get("is_bot", False)):
+        return True
+    username = str(event.get("sender_username") or event.get("username") or "").strip().lstrip("@").lower()
+    return bool(username and username.endswith("bot"))
+
+
+def get_cached_private_dialogs(account_id: str, limit: int = 30) -> List[dict]:
+    raw_events = read_private_dm_events({str(account_id)}, limit=2000)
+    events = list({private_dm_event_key(event): event for event in raw_events}.values())
+    dialogs_by_peer: Dict[str, dict] = {}
+    ack_ts = float(private_dm_event_ack.get(str(account_id), 0) or 0)
+    unread_by_peer: Dict[str, int] = {}
+    for event in events:
+        if is_bot_private_event(event):
+            continue
+        peer_id = str(event.get("sender_id") or event.get("peer_id") or "")
+        if not peer_id:
+            continue
+        timestamp = float(event.get("timestamp") or event.get("created_at") or 0)
+        if timestamp > ack_ts and not bool(event.get("out", False)):
+            unread_by_peer[peer_id] = unread_by_peer.get(peer_id, 0) + 1
+        current = dialogs_by_peer.get(peer_id)
+        if current and float(current.get("_timestamp") or 0) >= timestamp:
+            continue
+        dialogs_by_peer[peer_id] = {
+            "peer_id": peer_id,
+            "name": event.get("sender_name") or event.get("sender_username") or f"ID {peer_id}",
+            "username": event.get("sender_username") or "",
+            "phone": "",
+            "is_bot": False,
+            "unread_count": unread_by_peer.get(peer_id, 0),
+            "last_message": event.get("text") or "[media]",
+            "last_message_at": datetime.datetime.fromtimestamp(timestamp or time.time()).isoformat(),
+            "_timestamp": timestamp,
+            "cached": True,
+        }
+    for peer_id, dialog in dialogs_by_peer.items():
+        dialog["unread_count"] = unread_by_peer.get(peer_id, 0)
+        dialog.pop("_timestamp", None)
+    dialogs = sorted(dialogs_by_peer.values(), key=lambda item: item.get("last_message_at") or "", reverse=True)
+    return dialogs[:max(1, min(limit, 200))]
+
+
+def get_cached_private_messages(account_id: str, peer_id: str, limit: int = 30) -> List[dict]:
+    events = [
+        event for event in read_private_dm_events({str(account_id)}, limit=3000)
+        if str(event.get("sender_id") or event.get("peer_id") or "") == str(peer_id) and not is_bot_private_event(event)
+    ]
+    events_by_key = {private_dm_event_key(event): event for event in events}
+    ordered = sorted(events_by_key.values(), key=lambda event: float(event.get("timestamp") or event.get("created_at") or 0))
+    messages = [event_to_private_message(event) for event in ordered]
+    return messages[-max(1, min(limit, 200)):]
+
+
+def cache_private_message(account_id: str, peer: types.User, message) -> None:
+    if not isinstance(peer, types.User) or bool(getattr(peer, "bot", False)):
+        return
+    msg_date = getattr(message, "date", None)
+    timestamp = msg_date.timestamp() if msg_date else time.time()
+    is_out = bool(getattr(message, "out", False))
+    peer_id = int(getattr(peer, "id", 0) or 0)
+    event = {
+        "account_id": str(account_id),
+        "account_label": str(account_id),
+        "source": "message_cache",
+        "sender_id": peer_id,
+        "peer_id": peer_id,
+        "sender_name": private_user_display_name(peer),
+        "sender_username": f"@{peer.username}" if getattr(peer, "username", None) else "",
+        "sender_is_bot": bool(getattr(peer, "bot", False)),
+        "message_id": int(getattr(message, "id", 0) or 0),
+        "text": message_preview_text(message),
+        "out": is_out,
+        "notify": False,
+        "timestamp": timestamp,
+        "created_at": time.time(),
+    }
+    append_private_dm_event(event)
+
+
+def queued_private_message_payload(queue_id: str, text: str) -> dict:
+    return {
+        "id": -int(time.time() * 1000),
+        "text": text,
+        "out": True,
+        "date": datetime.datetime.now().isoformat(),
+        "has_media": False,
+        "status": "queued",
+        "queue_id": queue_id,
+    }
+
+
+def private_queue_item_from_record(record) -> dict:
+    return {
+        "id": record.id,
+        "account_id": str(record.account_id),
+        "peer_id": str(record.peer_id),
+        "text": record.text,
+        "created_by": record.created_by or "",
+        "created_at": float(record.created_at or time.time()),
+        "status": record.status or "queued",
+    }
+
+
+def save_private_send_queue_record(item: dict) -> None:
+    from db import engine, PrivateSendQueueDb, Session
+    now = time.time()
+    with Session(engine) as session:
+        record = session.get(PrivateSendQueueDb, str(item["id"]))
+        if record is None:
+            record = PrivateSendQueueDb(
+                id=str(item["id"]),
+                account_id=str(item["account_id"]),
+                peer_id=str(item["peer_id"]),
+                text=str(item["text"]),
+                status=str(item.get("status") or "queued"),
+                created_by=str(item.get("created_by") or ""),
+                created_at=float(item.get("created_at") or now),
+                updated_at=now,
+            )
+        else:
+            record.status = str(item.get("status") or record.status or "queued")
+            record.updated_at = now
+        record.error = item.get("error")
+        sent_message = item.get("sent_message")
+        if sent_message:
+            record.sent_message_id = int(sent_message.get("id") or 0) or None
+            record.sent_message_json = json.dumps(sent_message, ensure_ascii=False)
+            record.sent_at = now
+        session.add(record)
+        session.commit()
+
+
+def update_private_send_queue_record(queue_id: str, status: str, *, error: Optional[str] = None, sent_message: Optional[dict] = None) -> None:
+    from db import engine, PrivateSendQueueDb, Session
+    now = time.time()
+    with Session(engine) as session:
+        record = session.get(PrivateSendQueueDb, str(queue_id))
+        if record is None:
+            return
+        record.status = status
+        record.updated_at = now
+        record.error = error
+        if sent_message:
+            record.sent_message_id = int(sent_message.get("id") or 0) or None
+            record.sent_message_json = json.dumps(sent_message, ensure_ascii=False)
+            record.sent_at = now
+        session.add(record)
+        session.commit()
+
+
+def load_pending_private_sends_from_db() -> None:
+    from db import engine, PrivateSendQueueDb, Session, select
+    try:
+        with Session(engine) as session:
+            records = session.exec(
+                select(PrivateSendQueueDb).where(PrivateSendQueueDb.status.in_(["queued", "sending"]))
+            ).all()
+            loaded = 0
+            for record in records:
+                if record.status == "sending":
+                    record.status = "queued"
+                    record.updated_at = time.time()
+                    session.add(record)
+                pending_private_sends.setdefault(str(record.account_id), deque()).append(private_queue_item_from_record(record))
+                loaded += 1
+            if loaded:
+                session.commit()
+                print(f"[PrivateSendQueue] Restored {loaded} pending private send(s) from DB.")
+    except Exception as exc:
+        print(f"[PrivateSendQueue] Failed to restore pending queue: {exc}")
+
+
+def enqueue_private_send(account_id: str, peer_id: str, text: str, created_by: str = "") -> dict:
+    queue_id = secrets.token_hex(8)
+    item = {
+        "id": queue_id,
+        "account_id": str(account_id),
+        "peer_id": str(peer_id),
+        "text": text,
+        "created_by": created_by,
+        "created_at": time.time(),
+        "status": "queued",
+    }
+    pending_private_sends.setdefault(str(account_id), deque()).append(item)
+    try:
+        save_private_send_queue_record(item)
+    except Exception as exc:
+        print(f"[PrivateSendQueue] Failed to persist queued send {queue_id}: {exc}")
+    return item
+
+
+async def send_private_message_with_client(account_id: str, client: TelegramClient, peer_id: str, text: str, reply_to_msg_id: Optional[int] = None) -> dict:
+    if not await client.is_user_authorized():
+        raise HTTPException(status_code=401, detail="账号未登录")
+    try:
+        entity = await client.get_entity(int(peer_id))
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"私聊对象不存在: {exc}")
+    if not isinstance(entity, types.User):
+        raise HTTPException(status_code=400, detail="只支持私聊用户，不支持群聊或频道")
+    if bool(getattr(entity, "bot", False)):
+        raise HTTPException(status_code=400, detail="已排除 Bot 私聊")
+    sent = await client.send_message(entity, text, reply_to=reply_to_msg_id)
+    try:
+        cache_private_message(account_id, entity, sent)
+    except Exception:
+        pass
+    message = serialize_private_message(sent)
+    message["status"] = "sent"
+    return message
+
+
+async def drain_pending_private_sends(account_id: str, client: Optional[TelegramClient] = None, max_items: int = 5) -> int:
+    account_id = str(account_id)
+    queue = pending_private_sends.get(account_id)
+    if not queue:
+        return 0
+    lock = private_send_queue_locks.setdefault(account_id, asyncio.Lock())
+    if lock.locked():
+        return 0
+    sent_count = 0
+    async with lock:
+        if client is None:
+            client = await get_client(account_id)
+        while queue and sent_count < max_items:
+            item = queue[0]
+            try:
+                item["status"] = "sending"
+                update_private_send_queue_record(str(item["id"]), "sending")
+                
+                # 从 created_by 解析 reply_to_msg_id
+                created_by = str(item.get("created_by") or "")
+                reply_to_msg_id = None
+                if created_by.startswith("bot:reply_to:"):
+                    try:
+                        reply_to_msg_id = int(created_by.split("bot:reply_to:", 1)[1])
+                    except Exception:
+                        pass
+                
+                sent_message = await send_private_message_with_client(
+                    account_id, 
+                    client, 
+                    str(item["peer_id"]), 
+                    str(item["text"]),
+                    reply_to_msg_id=reply_to_msg_id
+                )
+                item["status"] = "sent"
+                item["sent_message"] = sent_message
+                update_private_send_queue_record(str(item["id"]), "sent", sent_message=sent_message)
+                sent_count += 1
+                queue.popleft()
+            except Exception as exc:
+                item["status"] = "failed"
+                item["error"] = getattr(exc, "detail", None) or str(exc)
+                update_private_send_queue_record(str(item["id"]), "failed", error=item["error"])
+                queue.popleft()
+                print(f"[PrivateSendQueue] Failed account={account_id} peer={item.get('peer_id')}: {item['error']}")
+        if not queue:
+            pending_private_sends.pop(account_id, None)
+    return sent_count
+
+
+def get_private_poll_skip_reason(account_id: str) -> Optional[str]:
+    """Avoid opening a controller client while another task owns the account session."""
+    active_op = active_account_operations.get(account_id)
+    if active_op:
+        return f"账号正在执行操作: {active_op.get('label') or active_op.get('operation') or 'active'}"
+
+    busy_status = get_account_busy_status(account_id)
+    if busy_status and busy_status != "idle":
+        return f"账号正在执行任务: {busy_status}"
+
+    try:
+        process = active_processes.get(account_id)
+        if process and process.poll() is None:
+            return "账号正在执行广告任务"
+        if find_campaign_process(account_id) is not None:
+            return "账号正在执行广告进程"
+    except Exception:
+        pass
+    return None
+
+
+def get_external_private_dm_unread(account_id: str) -> dict:
+    ack_ts = float(private_dm_event_ack.get(str(account_id), 0) or 0)
+    raw_events = [
+        item for item in read_private_dm_events({str(account_id)}, limit=1000)
+        if float(item.get("timestamp") or item.get("created_at") or 0) > ack_ts and not bool(item.get("out", False))
+    ]
+    events_by_key = {}
+    for item in raw_events:
+        sender_id = str(item.get("sender_id") or "")
+        message_id = str(item.get("message_id") or "")
+        if sender_id and message_id and message_id != "0":
+            key = f"{sender_id}:{message_id}"
+        else:
+            key = f"{sender_id}:{item.get('timestamp') or item.get('created_at') or ''}:{item.get('text') or ''}"
+        events_by_key[key] = item
+    events = list(events_by_key.values())
+    sender_ids = {str(item.get("sender_id") or "") for item in events if item.get("sender_id")}
+    last_event = max(events, key=lambda item: float(item.get("timestamp") or item.get("created_at") or 0), default=None)
+    return {
+        "external_unread_messages": len(events),
+        "external_unread_dialogs": len(sender_ids),
+        "last_private_event": last_event,
+    }
+
+
+def mark_private_dm_events_read(account_id: str) -> None:
+    events = read_private_dm_events({str(account_id)}, limit=1000)
+    max_event_ts = max(
+        [float(item.get("timestamp") or item.get("created_at") or 0) for item in events] or [0]
+    )
+    private_dm_event_ack[str(account_id)] = max(time.time(), max_event_ts + 1)
+    save_private_dm_ack(private_dm_event_ack)
+    cached = private_unread_cache.get(str(account_id), {})
+    private_unread_cache[str(account_id)] = {
+        **cached,
+        "unread_dialogs": 0,
+        "unread_messages": 0,
+        "external_unread_dialogs": 0,
+        "external_unread_messages": 0,
+        "last_private_event": None,
+        "loading": False,
+        "stale": False,
+        "error": None,
+        "updated_at": time.time(),
+        "_event_sender_ids": [],
+        "_event_keys": list(cached.get("_event_keys") or [])[-200:],
+    }
+
+
+async def compute_private_unread_summary(account_id: str) -> dict:
+    external_unread = get_external_private_dm_unread(account_id)
+    return {
+        "unread_dialogs": int(external_unread["external_unread_dialogs"] or 0),
+        "unread_messages": int(external_unread["external_unread_messages"] or 0),
+        **external_unread,
+        "error": None,
+        "updated_at": time.time(),
+        "loading": False,
+        "stale": False,
+    }
+
+
+async def refresh_private_unread_cache(account_id: str) -> None:
+    if account_id in private_unread_refreshing:
+        return
+    private_unread_refreshing.add(account_id)
+    try:
+        private_unread_cache[account_id] = await compute_private_unread_summary(account_id)
+    finally:
+        private_unread_refreshing.discard(account_id)
+
+
+@app.get("/api/accounts/private-unread-summary")
+async def get_private_unread_summary(force: bool = False, scope: str = "mine", user: dict = Depends(get_current_user)):
+    """Return unread private chat counts from the local DM event cache."""
+    from db import engine, AccountDb, Session
+    with Session(engine) as session:
+        db_accounts = session.exec(query_accounts_for_view_scope(session, user, scope)).all()
+
+    result = {}
+    for acc in db_accounts:
+        cached = private_unread_cache.get(acc.id)
+        external_unread = get_external_private_dm_unread(acc.id)
+        skip_reason = get_private_poll_skip_reason(acc.id)
+        base = cached or {"unread_dialogs": 0, "unread_messages": 0, "error": None, "updated_at": None}
+        unread_dialogs = int(external_unread["external_unread_dialogs"] or 0)
+        unread_messages = int(external_unread["external_unread_messages"] or 0)
+        result[acc.id] = {
+            **base,
+            "unread_dialogs": unread_dialogs,
+            "unread_messages": unread_messages,
+            "external_unread_dialogs": unread_dialogs,
+            "external_unread_messages": unread_messages,
+            "last_private_event": external_unread["last_private_event"],
+            "stale": False,
+            "loading": False,
+            "busy": bool(skip_reason),
+            "error": skip_reason if skip_reason else base.get("error"),
+            "updated_at": time.time(),
+        }
+    return result
+
+
+@app.post("/api/accounts/{account_id}/private-dm-events/read")
+async def mark_private_dm_events_read_api(account_id: str, user: dict = Depends(get_current_user)):
+    check_account_company(account_id, user)
+    mark_private_dm_events_read(account_id)
+    return {"ok": True}
+
+
+@app.post("/api/accounts/private-listeners/start-idle")
+async def start_idle_private_listeners(req: Optional[PrivateListenerStartRequest] = Body(default=None), user: dict = Depends(get_current_user)):
+    """Bring idle account clients online so private-message listeners can receive DMs."""
+    if not ENABLE_REALTIME_PRIVATE_DM:
+        return {
+            "started": [],
+            "skipped": [],
+            "failed": [],
+            "disabled": True,
+            "message": "实时私聊监听已关闭，请使用 Bot 通知/中转方案"
+        }
+    from db import engine, Session
+    with Session(engine) as session:
+        db_accounts = session.exec(query_allowed_accounts(session, user)).all()
+
+    target_ids = set(req.account_ids or []) if req else set()
+    started = []
+    skipped = []
+    failed = []
+
+    for acc in db_accounts:
+        if target_ids and acc.id not in target_ids:
+            continue
+
+        skip_reason = get_private_poll_skip_reason(acc.id)
+        if skip_reason:
+            skipped.append({"account_id": acc.id, "name": acc.account_name, "reason": skip_reason})
+            continue
+
+        try:
+            client = await get_client(acc.id)
+            if not await client.is_user_authorized():
+                failed.append({"account_id": acc.id, "name": acc.account_name, "error": "账号未登录"})
+                continue
+            started.append({"account_id": acc.id, "name": acc.account_name})
+        except Exception as exc:
+            detail = getattr(exc, "detail", None) or str(exc)
+            failed.append({"account_id": acc.id, "name": acc.account_name, "error": detail})
+
+    return {"started": started, "skipped": skipped, "failed": failed}
+
+
+@app.get("/api/accounts/{account_id}/private-dialogs")
+async def get_private_dialogs(account_id: str, limit: int = 30, cache_only: bool = False, user: dict = Depends(get_current_user)):
+    check_account_company(account_id, user)
+    if not ENABLE_REALTIME_PRIVATE_DM:
+        cache_only = True
+    started_at = time.time()
+    cached_dialogs = get_cached_private_dialogs(account_id, limit)
+    if cache_only:
+        print(f"[PrivateDialogsTiming] account={account_id} total={int((time.time() - started_at) * 1000)}ms cache_only=1 count={len(cached_dialogs)}")
+        return {"account_id": account_id, "dialogs": cached_dialogs, "cached": True, "cache_only": True}
+    skip_reason = get_private_poll_skip_reason(account_id)
+    if skip_reason:
+        mark_private_dm_events_read(account_id)
+        print(f"[PrivateDialogsTiming] account={account_id} total={int((time.time() - started_at) * 1000)}ms cache_only=1 reason={skip_reason} count={len(cached_dialogs)}")
+        return {"account_id": account_id, "dialogs": cached_dialogs, "cached": True, "busy": True, "notice": skip_reason}
+
+    async with account_operation_guard(account_id, "private_dialogs", label="读取私聊"):
+        t0 = time.time()
+        client = await get_client(account_id)
+        get_client_ms = int((time.time() - t0) * 1000)
+        t0 = time.time()
+        if not await client.is_user_authorized():
+            raise HTTPException(status_code=401, detail="账号未登录")
+        auth_ms = int((time.time() - t0) * 1000)
+
+        dialogs = []
+        t0 = time.time()
+        async for dialog in client.iter_dialogs(limit=max(1, min(limit, 200))):
+            item = serialize_private_dialog(dialog)
+            if item:
+                dialogs.append(item)
+        iter_ms = int((time.time() - t0) * 1000)
+        cached_by_peer = {item["peer_id"]: item for item in cached_dialogs}
+        for item in dialogs:
+            cached_by_peer[item["peer_id"]] = item
+        dialogs = list(cached_by_peer.values())
+        dialogs.sort(key=lambda item: ((item.get("unread_count") or 0) > 0, item.get("last_message_at") or ""), reverse=True)
+        t0 = time.time()
+        mark_private_dm_events_read(account_id)
+        ack_ms = int((time.time() - t0) * 1000)
+        print(f"[PrivateDialogsTiming] account={account_id} total={int((time.time() - started_at) * 1000)}ms get_client={get_client_ms}ms auth={auth_ms}ms iter={iter_ms}ms ack={ack_ms}ms count={len(dialogs)}")
+        return {"account_id": account_id, "dialogs": dialogs}
+
+
+@app.get("/api/accounts/{account_id}/private-dialogs/{peer_id}/messages")
+async def get_private_messages(account_id: str, peer_id: str, limit: int = 30, cache_only: bool = False, user: dict = Depends(get_current_user)):
+    check_account_company(account_id, user)
+    if not ENABLE_REALTIME_PRIVATE_DM:
+        cache_only = True
+    started_at = time.time()
+    cached_messages = get_cached_private_messages(account_id, peer_id, limit)
+    if cache_only:
+        print(f"[PrivateMessagesTiming] account={account_id} peer={peer_id} total={int((time.time() - started_at) * 1000)}ms cache_only=1 count={len(cached_messages)}")
+        return {"account_id": account_id, "peer_id": peer_id, "messages": cached_messages, "cached": True, "cache_only": True}
+    skip_reason = get_private_poll_skip_reason(account_id)
+    if skip_reason:
+        mark_private_dm_events_read(account_id)
+        print(f"[PrivateMessagesTiming] account={account_id} peer={peer_id} total={int((time.time() - started_at) * 1000)}ms cache_only=1 reason={skip_reason} count={len(cached_messages)}")
+        return {"account_id": account_id, "peer_id": peer_id, "messages": cached_messages, "cached": True, "busy": True, "notice": skip_reason}
+
+    async with account_operation_guard(account_id, "private_messages", label="读取私聊消息"):
+        t0 = time.time()
+        client = await get_client(account_id)
+        get_client_ms = int((time.time() - t0) * 1000)
+        if not await client.is_user_authorized():
+            raise HTTPException(status_code=401, detail="账号未登录")
+        try:
+            t0 = time.time()
+            entity = await client.get_entity(int(peer_id))
+            entity_ms = int((time.time() - t0) * 1000)
+        except Exception as exc:
+            raise HTTPException(status_code=404, detail=f"私聊对象不存在: {exc}")
+        if not isinstance(entity, types.User):
+            raise HTTPException(status_code=400, detail="只支持私聊用户，不支持群聊或频道")
+        if bool(getattr(entity, "bot", False)):
+            raise HTTPException(status_code=400, detail="已排除 Bot 私聊")
+
+        t0 = time.time()
+        raw_messages = [msg async for msg in client.iter_messages(entity, limit=max(1, min(limit, 200)))]
+        for msg in raw_messages:
+            try:
+                cache_private_message(account_id, entity, msg)
+            except Exception:
+                pass
+        messages = [serialize_private_message(msg) for msg in raw_messages]
+        iter_ms = int((time.time() - t0) * 1000)
+        messages.reverse()
+        cached_by_id = {str(msg.get("id")): msg for msg in cached_messages}
+        for msg in messages:
+            cached_by_id[str(msg.get("id"))] = msg
+        messages = sorted(cached_by_id.values(), key=lambda msg: msg.get("date") or "")
+        try:
+            t0 = time.time()
+            await client.send_read_acknowledge(entity)
+            ack_tg_ms = int((time.time() - t0) * 1000)
+        except Exception:
+            ack_tg_ms = -1
+        t0 = time.time()
+        mark_private_dm_events_read(account_id)
+        ack_local_ms = int((time.time() - t0) * 1000)
+        print(f"[PrivateMessagesTiming] account={account_id} peer={peer_id} total={int((time.time() - started_at) * 1000)}ms get_client={get_client_ms}ms entity={entity_ms}ms iter={iter_ms}ms tg_ack={ack_tg_ms}ms local_ack={ack_local_ms}ms count={len(messages)}")
+        return {"account_id": account_id, "peer_id": peer_id, "messages": messages}
+
+
+@app.post("/api/accounts/{account_id}/private-dialogs/{peer_id}/send")
+async def send_private_message(account_id: str, peer_id: str, req: PrivateMessageSendRequest, user: dict = Depends(get_current_user)):
+    check_account_company(account_id, user)
+    text = (req.message or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="消息不能为空")
+    busy_reason = get_private_poll_skip_reason(account_id)
+    if busy_reason:
+        queued = enqueue_private_send(account_id, peer_id, text, user.get("username", ""))
+        return {
+            "ok": True,
+            "queued": True,
+            "queue_id": queued["id"],
+            "message": queued_private_message_payload(queued["id"], text),
+            "notice": f"{busy_reason}，消息已加入高优先级发送队列。",
+        }
+
+    async with account_operation_guard(account_id, "private_send", label="发送私聊"):
+        client = await get_client(account_id)
+        message = await send_private_message_with_client(account_id, client, peer_id, text)
+        return {"ok": True, "queued": False, "message": message}
+
+
+class BotReplyPrivateDmRequest(BaseModel):
+    account_id: str
+    customer_id: str
+    reply_text: str
+    reply_to_msg_id: Optional[int] = None
+
+@app.post("/api/bot/reply-private-dm")
+async def bot_reply_private_dm(req: BotReplyPrivateDmRequest):
+    account_id = req.account_id
+    customer_id = req.customer_id
+    reply_text = req.reply_text
+    reply_to_msg_id = req.reply_to_msg_id
+    
+    # 检查逻辑忙碌状态
+    busy_reason = get_account_operation_block_reason(account_id, block_task_busy=True)
+    if busy_reason:
+        # 账号逻辑上正忙，将消息放入待发送私聊队列
+        created_by_str = "bot"
+        if reply_to_msg_id is not None:
+            created_by_str = f"bot:reply_to:{reply_to_msg_id}"
+            
+        try:
+            item = enqueue_private_send(
+                account_id=account_id,
+                peer_id=str(customer_id),
+                text=reply_text,
+                created_by=created_by_str
+            )
+            # 立即在后台触发一次清空尝试（若此时刚好在冷却期，物理锁未占，将立刻秒发）
+            asyncio.create_task(drain_pending_private_sends(account_id))
+            return {"ok": True, "queued": True, "queue_id": item["id"]}
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"加入发送队列失败: {exc}")
+            
+    # 若账号闲置，直接并发安全发送，实现毫秒级送达
+    async with account_operation_guard(account_id, "bot_reply", label="Bot中转回复"):
+        try:
+            client = await get_client(account_id)
+            if not await client.is_user_authorized():
+                raise HTTPException(status_code=401, detail="账号未登录")
+            
+            try:
+                peer = int(customer_id)
+            except ValueError:
+                peer = customer_id
+            
+            sent_msg = await client.send_message(peer, reply_text, reply_to=reply_to_msg_id)
+            
+            # 缓存发送出去的消息
+            try:
+                entity = await client.get_entity(peer)
+                cache_private_message(account_id, entity, sent_msg)
+            except Exception:
+                pass
+            
+            return {"ok": True, "queued": False, "message_id": sent_msg.id}
+        except Exception as exc:
+            detail = getattr(exc, "detail", None) or str(exc)
+            if "Could not find the input entity" in detail:
+                detail = "找不到目标用户的实体缓存(Could not find the input entity)。原因：此用户 ID 可能是测试脚本模拟的虚拟 ID，或者该账号的 Telethon Session 尚未与此用户建立过真实的私聊会话。请使用真实的小号主动私聊托管账号来进行测试。"
+            raise HTTPException(status_code=500, detail=f"发送失败: {detail}")
+
+
+class BotReplyViaThreadRequest(BaseModel):
+    thread_id: int
+    reply_text: str
+    chat_id: Optional[int] = None
+
+
+@app.post("/api/bot/reply-via-thread")
+async def bot_reply_via_thread(req: BotReplyViaThreadRequest):
+    thread_id = req.thread_id
+    reply_text = req.reply_text
+    chat_id = req.chat_id
+    
+    from private_dm_events import get_info_by_thread_id
+    info = get_info_by_thread_id(thread_id, chat_id=chat_id)
+    if not info:
+        raise HTTPException(status_code=404, detail="找不到该主题(Thread)对应的会话映射，请确保已通过系统建立会话")
+        
+    account_id, customer_id = info
+    
+    sub_req = BotReplyPrivateDmRequest(
+        account_id=account_id,
+        customer_id=str(customer_id),
+        reply_text=reply_text,
+        reply_to_msg_id=None
+    )
+    return await bot_reply_private_dm(sub_req)
+
+
+@app.get("/api/bot/export-folders")
+async def bot_export_folders(account_id: str):
+    busy_reason = get_account_operation_block_reason(account_id, block_task_busy=True)
+    if busy_reason:
+        raise HTTPException(status_code=400, detail=f"账号当前正忙 ({busy_reason})，请稍后再试。")
+        
+    async with account_operation_guard(account_id, "export_folders", label="导出文件夹"):
+        try:
+            client = await get_client(account_id)
+            if not await client.is_user_authorized():
+                raise HTTPException(status_code=401, detail="账号未登录")
+                
+            result = await client(functions.messages.GetDialogFiltersRequest())
+            raw_filters = getattr(result, "filters", result)
+            filters = [
+                item
+                for item in raw_filters
+                if isinstance(item, (types.DialogFilter, types.DialogFilterChatlist))
+            ]
+            
+            from sync_folder_groups import collect_records, normalize_title
+            include_types = {"group", "supergroup", "channel"}
+            
+            from db import engine, AccountDb, Session
+            db_account_name = account_id
+            with Session(engine) as db_session:
+                acc_rec = db_session.get(AccountDb, account_id)
+                if acc_rec and acc_rec.account_name:
+                    db_account_name = acc_rec.account_name
+                    
+            output_lines = [
+                f"=========================================",
+                f" 托管账号: {db_account_name} (ID: {account_id})",
+                f" 导出时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"=========================================",
+                ""
+            ]
+            for item in filters:
+                folder_title = normalize_title(item.title)
+                output_lines.append(f"{folder_title} (文件夹)")
+                
+                try:
+                    records = await collect_records(client, item, include_types)
+                    if records:
+                        for r in records:
+                            info_str = r.title
+                            if r.username:
+                                info_str += f" (t.me/{r.username})"
+                            output_lines.append(f"- {info_str}")
+                    else:
+                        output_lines.append("- (空)")
+                except Exception as e:
+                    output_lines.append(f"- (读取出错: {e})")
+                output_lines.append("") 
+                
+            txt_content = "\n".join(output_lines)
+            return {"ok": True, "content": txt_content}
+        except Exception as exc:
+            detail = getattr(exc, "detail", None) or str(exc)
+            raise HTTPException(status_code=500, detail=f"获取文件夹失败: {detail}")
+
+
+@app.get("/api/bot/get-private-messages")
+async def bot_get_private_messages(account_id: str, peer_id: str, limit: int = 15):
+    cached_messages = get_cached_private_messages(account_id, peer_id, limit)
+    
+    if len(cached_messages) < 3:
+        try:
+            async with account_operation_guard(account_id, "bot_private_messages", label="Bot读取私聊历史"):
+                client = await get_client(account_id)
+                if await client.is_user_authorized():
+                    try:
+                        peer = int(peer_id)
+                    except ValueError:
+                        peer = peer_id
+                    entity = await client.get_entity(peer)
+                    raw_messages = [msg async for msg in client.iter_messages(entity, limit=limit)]
+                    for msg in raw_messages:
+                        try:
+                            cache_private_message(account_id, entity, msg)
+                        except Exception:
+                            pass
+                    cached_messages = [serialize_private_message(msg) for msg in raw_messages]
+                    cached_messages.reverse()
+        except Exception as exc:
+            print(f"[BotGetMessages] Failed to fetch live messages: {exc}")
+            
+    return {"ok": True, "messages": cached_messages}
+
+
+@app.get("/api/accounts/{account_id}/private-send-queue/{queue_id}")
+def get_private_send_queue_status(account_id: str, queue_id: str, user: dict = Depends(get_current_user)):
+    check_account_company(account_id, user)
+    from db import engine, PrivateSendQueueDb, Session
+    with Session(engine) as session:
+        record = session.get(PrivateSendQueueDb, queue_id)
+        if not record or str(record.account_id) != str(account_id):
+            raise HTTPException(status_code=404, detail="排队消息不存在")
+        sent_message = None
+        if record.sent_message_json:
+            try:
+                sent_message = json.loads(record.sent_message_json)
+            except Exception:
+                sent_message = None
+        return {
+            "ok": True,
+            "queue_id": record.id,
+            "account_id": record.account_id,
+            "peer_id": record.peer_id,
+            "text": record.text,
+            "status": record.status,
+            "created_at": record.created_at,
+            "updated_at": record.updated_at,
+            "sent_at": record.sent_at,
+            "error": record.error,
+            "message": sent_message,
+        }
+
+
+@app.get("/api/account-status/stream")
+async def stream_account_status(token: Optional[str] = None):
+    """Streams lightweight account status updates for the account-management page."""
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    user_payload = verify_token(token)
+    if not user_payload:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    from db import engine, AdminDb, AccountDb, Session
+    from sqlmodel import select
+    with Session(engine) as session:
+        db_user = session.exec(select(AdminDb).where(AdminDb.username == user_payload["username"])).first()
+        if not db_user:
+            raise HTTPException(status_code=401, detail="User not found")
+        user = {
+            "username": db_user.username,
+            "role": db_user.role,
+            "company": db_user.company or "admin"
+        }
+        db_accounts = session.exec(query_allowed_accounts(session, user)).all()
+        allowed_ids = {acc.id for acc in db_accounts}
+        initial_payload = []
+        for acc in db_accounts:
+            status = normalize_account_status_patch(acc.id, account_status_store.get(acc.id, {}))
+            initial_payload.append({
+                "account_id": acc.id,
+                "patch": {
+                    **status,
+                    "is_available": acc.is_available,
+                    "availability_status": "available" if acc.is_available else "occupied",
+                    "bot_setup_status": acc.bot_setup_status or status.get("bot_setup_status", "not_started")
+                }
+            })
+
+    queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+    account_status_subscribers.add(queue)
+
+    async def event_generator():
+        try:
+            yield f"data: {json.dumps({'type': 'initial', 'accounts': initial_payload}, ensure_ascii=False)}\n\n"
+            while True:
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=25)
+                    try:
+                        decoded = json.loads(payload)
+                        if decoded.get("account_id") not in allowed_ids:
+                            continue
+                    except Exception:
+                        pass
+                    yield f"data: {payload}\n\n"
+                except asyncio.TimeoutError:
+                    yield "event: ping\ndata: {}\n\n"
+        finally:
+            account_status_subscribers.discard(queue)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.get("/api/private-dm/stream")
+async def stream_private_dm_events(token: Optional[str] = None):
+    """Streams private DM events to the account-management page."""
+    if not ENABLE_REALTIME_PRIVATE_DM:
+        async def disabled_generator():
+            yield "data: {\"type\": \"info\", \"message\": \"实时私聊已关闭\"}\n\n"
+            while True:
+                await asyncio.sleep(60)
+                yield "event: ping\ndata: {}\n\n"
+        return StreamingResponse(disabled_generator(), media_type="text/event-stream")
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    user_payload = verify_token(token)
+    if not user_payload:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    from db import engine, AdminDb, Session
+    from sqlmodel import select
+    with Session(engine) as session:
+        db_user = session.exec(select(AdminDb).where(AdminDb.username == user_payload["username"])).first()
+        if not db_user:
+            raise HTTPException(status_code=401, detail="User not found")
+        user = {
+            "username": db_user.username,
+            "role": db_user.role,
+            "company": db_user.company or "admin"
+        }
+        allowed_accounts = session.exec(query_allowed_accounts(session, user)).all()
+        allowed_ids = {acc.id for acc in allowed_accounts}
+        allowed_account_meta = {
+            str(acc.id): {
+                "account_label": acc.account_name or acc.id,
+                "account_owner_username": acc.owner_username or "",
+                "account_created_by": acc.created_by or "",
+                "account_company": acc.company or "",
+            }
+            for acc in allowed_accounts
+        }
+
+    queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+    private_dm_subscribers.add(queue)
+    sent_keys: set[str] = set()
+    stream_started_at = time.time()
+    last_file_seen_at = stream_started_at
+
+    async def event_generator():
+        nonlocal last_file_seen_at
+        try:
+            yield f"data: {json.dumps({'type': 'ready'}, ensure_ascii=False)}\n\n"
+            while True:
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=2)
+                    try:
+                        decoded = json.loads(payload)
+                        event = decoded.get("event") or {}
+                        if str(event.get("account_id") or "") not in allowed_ids:
+                            continue
+                        event.update(allowed_account_meta.get(str(event.get("account_id") or ""), {}))
+                        key = private_dm_event_key(event)
+                        if key in sent_keys:
+                            continue
+                        sent_keys.add(key)
+                    except Exception:
+                        pass
+                    yield f"data: {payload}\n\n"
+                except asyncio.TimeoutError:
+                    emitted = False
+                    for event in read_private_dm_events(allowed_ids, limit=200):
+                        account_id = str(event.get("account_id") or "")
+                        event_time = float(event.get("created_at") or event.get("timestamp") or 0)
+                        ack_ts = float(private_dm_event_ack.get(account_id, 0) or 0)
+                        if event_time <= max(last_file_seen_at, ack_ts):
+                            continue
+                        if bool(event.get("out", False)):
+                            continue
+                        if not bool(event.get("notify", False)):
+                            continue
+                        event = {**event, **allowed_account_meta.get(account_id, {})}
+                        key = private_dm_event_key(event)
+                        if key in sent_keys:
+                            continue
+                        sent_keys.add(key)
+                        merge_private_dm_event_into_cache(event)
+                        yield f"data: {json.dumps({'type': 'private_dm', 'event': event}, ensure_ascii=False)}\n\n"
+                        emitted = True
+                    last_file_seen_at = time.time()
+                    if not emitted:
+                        yield "event: ping\ndata: {}\n\n"
+        finally:
+            private_dm_subscribers.discard(queue)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+@app.post("/api/accounts/{account_id}/toggle-status")
+def toggle_account_status(account_id: str, user: dict = Depends(get_current_user)):
+    """Toggles the availability status (is_available) of a configured account."""
+    block_reason = get_account_operation_block_reason(account_id, block_task_busy=True)
+    if block_reason:
+        raise HTTPException(status_code=409, detail=f"{block_reason}，请等待完成后再切换账号状态。")
+    from db import engine, AccountDb, Session
+    with Session(engine) as session:
+        db_account = session.get(AccountDb, account_id)
+        if not db_account:
+            raise HTTPException(status_code=404, detail="Account not found")
+        
+        # Check permissions
+        if user["username"] not in ("eason", "admin") and user["company"] != "admin" and db_account.company != user["company"]:
+            raise HTTPException(status_code=403, detail="Permission denied")
+            
+        db_account.is_available = not db_account.is_available
+        session.add(db_account)
+        session.commit()
+        session.refresh(db_account)
+        
+        # Sync changes to JSON configs
+        try:
+            from account_manager import account_config_path, save_json
+            path = account_config_path(db_account.id)
+            save_json(path, db_account.to_dict())
+        except Exception as e:
+            print(f"Failed to sync toggled account to json config: {e}")
+        set_account_status(
+            account_id,
+            {
+                "is_available": db_account.is_available,
+                "availability_status": "available" if db_account.is_available else "occupied"
+            },
+            source="toggle-status"
+        )
+            
+        return {"status": "success", "is_available": db_account.is_available}
+
+@app.post("/api/accounts/{account_id}/reset-lock")
+def reset_account_lock(account_id: str, user: dict = Depends(get_current_user)):
+    """Manually clear stale in-memory operation locks for an account."""
+    check_account_company_scope(account_id, user)
+    active_account_operations.pop(account_id, None)
+    lock = account_operation_locks.get(account_id)
+    if lock and lock.locked():
+        # asyncio.Lock has no owner tracking; replacing a stale lock is safer
+        # than trying to release a lock that may belong to an active request.
+        account_operation_locks[account_id] = asyncio.Lock()
+    set_account_status(
+        account_id,
+        {
+            "active_operation": None,
+            "active_operation_label": None,
+            "error": None,
+            "last_error": None,
+        },
+        source="reset-lock",
+    )
+    return {"status": "success"}
+
+# --- TELEGRAM BOT COOPERATION API ---
+
+def check_local_bot_approval(telegram_id: int, phone: str) -> bool:
+    try:
+        import json
+        from pathlib import Path
+        bot_dir = Path("E:/telegram_translate_bot_workspace")
+        access_path = bot_dir / "data" / "translate_access.json"
+        
+        # Check translate_access.json
+        if access_path.exists():
+            with open(access_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                allowed_ids = data.get("allowed_user_ids", [])
+                if telegram_id in allowed_ids or str(telegram_id) in allowed_ids:
+                    return True
+                    
+        # Check access_requests.json
+        requests_path = bot_dir / "data" / "access_requests.json"
+        if requests_path.exists():
+            with open(requests_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                requests = data.get("requests", {})
+                for uid, req in requests.items():
+                    if req.get("status") == "approved":
+                        # Check telegram_id
+                        if req.get("user_id") == telegram_id or str(req.get("user_id")) == str(telegram_id):
+                            return True
+                        # Check phone match
+                        req_phone = str(req.get("phone_number", "")).replace("+", "").replace(" ", "").strip()
+                        clean_phone = str(phone).replace("+", "").replace(" ", "").strip()
+                        if req_phone == clean_phone:
+                            return True
+    except Exception as e:
+        print(f"Error checking local bot approval status: {e}")
+    return False
+
+def approve_local_bot_access(telegram_id: int, phone: str, name: str, username: str):
+    try:
+        import json
+        import time
+        from pathlib import Path
+        bot_dir = Path("E:/telegram_translate_bot_workspace")
+        data_dir = bot_dir / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 1. Update translate_access.json
+        access_path = data_dir / "translate_access.json"
+        access_data = {"allowed_usernames": [], "allowed_user_ids": [], "allowed_chat_ids": [], "owner_chat_ids": []}
+        if access_path.exists():
+            try:
+                with open(access_path, "r", encoding="utf-8") as f:
+                    access_data = json.load(f)
+            except Exception:
+                pass
+        
+        allowed_ids = access_data.setdefault("allowed_user_ids", [])
+        if telegram_id not in allowed_ids:
+            allowed_ids.append(telegram_id)
+        access_data["allowed_user_ids"] = sorted(list(set(allowed_ids)))
+        
+        with open(access_path, "w", encoding="utf-8") as f:
+            json.dump(access_data, f, indent=2, ensure_ascii=False)
+            
+        # 2. Update access_requests.json
+        requests_path = data_dir / "access_requests.json"
+        requests_data = {"requests": {}}
+        if requests_path.exists():
+            try:
+                with open(requests_path, "r", encoding="utf-8") as f:
+                    requests_data = json.load(f)
+            except Exception:
+                pass
+                
+        requests = requests_data.setdefault("requests", {})
+        clean_phone = phone if phone.startswith("+") else f"+{phone}"
+        requests[str(telegram_id)] = {
+            "user_id": telegram_id,
+            "name": name,
+            "username": username if username.startswith("@") else f"@{username}" if username else "(no username)",
+            "phone_number": clean_phone,
+            "status": "approved",
+            "created_at": int(time.time()),
+            "reviewed_at": int(time.time())
+        }
+        
+        with open(requests_path, "w", encoding="utf-8") as f:
+            json.dump(requests_data, f, indent=2, ensure_ascii=False)
+            
+        print(f"Successfully wrote local bot authorization for Telegram ID {telegram_id} ({phone})")
+    except Exception as e:
+        print(f"Error writing local bot authorization: {e}")
+
+async def auto_trigger_bot_setup_for_account(account_id: str, client):
+    try:
+        from db import engine, AccountDb, Session
+        with Session(engine) as session:
+            db_acc = session.get(AccountDb, account_id)
+            if not db_acc:
+                return
+            if db_acc.bot_setup_status == "approved":
+                return
+                
+            bot_username = "RosePay_translation_bot"
+            import asyncio
+            if not client.is_connected():
+                await client.connect()
+            if not await client.is_user_authorized():
+                return
+                
+            me = await client.get_me()
+            if not me or not me.phone:
+                return
+                
+            # 1. Check if already approved locally
+            if check_local_bot_approval(me.id, me.phone):
+                db_acc.bot_setup_status = "approved"
+                db_acc.bot_username = bot_username
+                session.add(db_acc)
+                session.commit()
+                try:
+                    from account_manager import account_config_path, save_json
+                    save_json(account_config_path(db_acc.id), db_acc.to_dict())
+                except Exception:
+                    pass
+                return
+                
+            # 2. Send /start
+            bot_entity = await client.get_input_entity(bot_username)
+            await client.send_message(bot_entity, "/start")
+            
+            # 3. Wait 1.5 seconds
+            await asyncio.sleep(1.5)
+            
+            # 4. Click the "apply_access" callback button if present
+            try:
+                messages = await client.get_messages(bot_entity, limit=5)
+                for msg in messages:
+                    if msg.buttons:
+                        clicked = False
+                        for row in msg.buttons:
+                            for button in row:
+                                if button.data == b'apply_access':
+                                    await msg.click(button)
+                                    clicked = True
+                                    break
+                            if clicked:
+                                break
+                        if clicked:
+                            break
+            except Exception as btn_ex:
+                print(f"Failed to click callback button: {btn_ex}")
+            
+            # 5. Wait 1.5 seconds
+            await asyncio.sleep(1.5)
+            
+            # 6. Send contact card
+            from telethon import types
+            await client.send_message(
+                bot_entity,
+                file=types.InputMediaContact(
+                    phone_number=me.phone,
+                    first_name=me.first_name or "",
+                    last_name=me.last_name or "",
+                    vcard=""
+                )
+            )
+            
+            # 7. Wait 1.5 seconds for bot to process
+            await asyncio.sleep(1.5)
+            
+            # 8. Pin Dialog
+            try:
+                from telethon.tl.functions.messages import ToggleDialogPinRequest
+                try:
+                    await client(ToggleDialogPinRequest(peer=bot_entity, pinned=True))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            
+            # 9. Write local authorization to files
+            name = f"{me.first_name or ''} {me.last_name or ''}".strip() or f"User_{me.id}"
+            username = me.username or ""
+            approve_local_bot_access(me.id, me.phone, name, username)
+            
+            # 10. Send message from bot
+            bot_token = None
+            try:
+                from pathlib import Path
+                env_path = Path("E:/telegram_translate_bot_workspace/.env")
+                if env_path.exists():
+                    with open(env_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            if line.strip().startswith("BOT_TOKEN="):
+                                bot_token = line.split("=", 1)[1].strip()
+                                break
+            except Exception:
+                pass
+            if not bot_token:
+                bot_token = "8998918901:AAFSSlT0P1pWUdXgpVZ4weDFMUdcmTdCheI"
+            
+            if bot_token:
+                try:
+                    import httpx
+                    notification_text = "✅ 你的 RosePay 翻译机器人使用权限已通过。\n现在可以直接发送文字或使用 /tr 翻译。"
+                    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+                    async with httpx.AsyncClient() as http_client:
+                        await http_client.post(url, json={
+                            "chat_id": me.id,
+                            "text": notification_text
+                        })
+                except Exception:
+                    pass
+            
+            # 11. Update DB to approved
+            db_acc.bot_setup_status = "approved"
+            db_acc.bot_username = bot_username
+            db_acc.bot_step_1_input = me.phone
+            session.add(db_acc)
+            session.commit()
+            
+            # Sync to disk
+            try:
+                from account_manager import account_config_path, save_json
+                save_json(account_config_path(db_acc.id), db_acc.to_dict())
+            except Exception:
+                pass
+                
+            print(f"Successfully auto-configured BOT for imported/logged in account {account_id}")
+    except Exception as e:
+        print(f"Failed to auto-configure BOT for account {account_id}: {e}")
+
+async def check_and_update_bot_approval_status(account_id: str, client, session) -> str:
+    """Checks local bot files and dialog history with @RosePay_translation_bot to see if it is approved.
+    Updates the database status to 'approved' or 'pending_approval' if needed.
+    Acquires the account client lock safely.
+    Returns the current/new status.
+    """
+    from db import AccountDb
+    from telethon import types
+    
+    db_acc = session.get(AccountDb, account_id)
+    if not db_acc:
+        return "not_started"
+        
+    current_status = db_acc.bot_setup_status or "not_started"
+    if current_status == "approved":
+        return "approved"
+        
+    bot_username = db_acc.bot_username or "RosePay_translation_bot"
+    
+    # 1. First check if logged in and check local bot authorization files
+    try:
+        if client.is_connected() and await client.is_user_authorized():
+            me = await client.get_me()
+            if me:
+                if check_local_bot_approval(me.id, me.phone):
+                    db_acc.bot_setup_status = "approved"
+                    db_acc.bot_username = bot_username
+                    session.add(db_acc)
+                    session.commit()
+                    try:
+                        from account_manager import account_config_path, save_json
+                        save_json(account_config_path(db_acc.id), db_acc.to_dict())
+                    except Exception:
+                        pass
+                    return "approved"
+    except Exception as local_ex:
+        print(f"Error in check_local_bot_approval within check_and_update: {local_ex}")
+        
+    # 2. Fallback to Telegram message check
+    if account_id not in client_locks:
+        client_locks[account_id] = asyncio.Lock()
+        
+    try:
+        async with client_locks[account_id]:
+            if not client.is_connected():
+                await client.connect()
+            if not await client.is_user_authorized():
+                return current_status
+                
+            # Get last 10 messages from bot
+            messages = await client.get_messages(bot_username, limit=10)
+            
+            is_approved = False
+            has_contact_card = False
+            
+            for m in messages:
+                text = m.text or ""
+                if "使用权限已通过" in text or "拥有使用权限" in text:
+                    is_approved = True
+                    break
+                # Check if a contact card was sent by current account (outgoing)
+                if m.out and getattr(m, 'media', None):
+                    if isinstance(m.media, types.MessageMediaContact):
+                        has_contact_card = True
+                        
+            new_status = current_status
+            if is_approved:
+                new_status = "approved"
+                # Since we found it is approved on telegram, sync it to local bot files as well!
+                try:
+                    me = await client.get_me()
+                    if me:
+                        name = f"{me.first_name or ''} {me.last_name or ''}".strip() or f"User_{me.id}"
+                        username = me.username or ""
+                        approve_local_bot_access(me.id, me.phone, name, username)
+                except Exception as sync_ex:
+                    print(f"Failed to sync approved state to local files: {sync_ex}")
+            elif has_contact_card and current_status == "not_started":
+                new_status = "pending_approval"
+                
+            if new_status != current_status:
+                db_acc.bot_setup_status = new_status
+                db_acc.bot_username = bot_username
+                session.add(db_acc)
+                session.commit()
+                # Sync to JSON config
+                try:
+                    from account_manager import account_config_path, save_json
+                    save_json(account_config_path(db_acc.id), db_acc.to_dict())
+                except Exception as e:
+                    print(f"Failed to sync bot status to config: {e}")
+                    
+            return new_status
+    except Exception as e:
+        print(f"Error checking bot approval status for {account_id}: {e}")
+        return current_status
+
+@app.get("/api/accounts/{account_id}/bot/status")
+@account_api_operation("bot_status", label="检查 Bot 授权")
+async def get_account_bot_status(account_id: str, user: dict = Depends(get_current_user)):
+    from db import engine, AccountDb, Session
+    with Session(engine) as session:
+        db_acc = session.get(AccountDb, account_id)
+        if not db_acc:
+            raise HTTPException(status_code=404, detail="Account not found")
+        if user["username"] not in ("eason", "admin") and user["company"] != "admin" and db_acc.company != user["company"]:
+            raise HTTPException(status_code=403, detail="Permission denied")
+        
+        bot_username = db_acc.bot_username or "RosePay_translation_bot"
+        current_status = db_acc.bot_setup_status or "not_started"
+        
+        # If it is not approved yet, check message history with the bot to see if approval text exists
+        if current_status != "approved":
+            try:
+                client = await get_client(account_id)
+                if client:
+                    current_status = await check_and_update_bot_approval_status(account_id, client, session)
+            except Exception as e:
+                print(f"Error checking bot approval status for {account_id}: {e}")
+                
+        return {
+            "account_id": account_id,
+            "bot_setup_status": current_status,
+            "bot_username": bot_username
+        }
+
+@app.post("/api/accounts/{account_id}/bot/start")
+@account_api_operation("bot_setup", label="配置 Bot")
+async def start_account_bot_setup(account_id: str, user: dict = Depends(get_current_user)):
+    from db import engine, AccountDb, Session
+    with Session(engine) as session:
+        db_acc = session.get(AccountDb, account_id)
+        if not db_acc:
+            raise HTTPException(status_code=404, detail="Account not found")
+        if user["username"] not in ("eason", "admin") and user["company"] != "admin" and db_acc.company != user["company"]:
+            raise HTTPException(status_code=403, detail="Permission denied")
+            
+        bot_username = "RosePay_translation_bot"
+        try:
+            import asyncio
+            client = await get_client(account_id)
+            async with client_locks[account_id]:
+                if not client.is_connected():
+                    await client.connect()
+                if not await client.is_user_authorized():
+                    raise HTTPException(status_code=400, detail="账号未登录，无法配置 Bot")
+                
+                me = await client.get_me()
+                if not me or not me.phone:
+                    raise HTTPException(status_code=400, detail="获取当前账号手机号失败")
+                
+                # 1. Check if already approved locally
+                if check_local_bot_approval(me.id, me.phone):
+                    db_acc.bot_setup_status = "approved"
+                    db_acc.bot_username = bot_username
+                    session.add(db_acc)
+                    session.commit()
+                    try:
+                        from account_manager import account_config_path, save_json
+                        save_json(account_config_path(db_acc.id), db_acc.to_dict())
+                    except Exception:
+                        pass
+                    return {"status": "success", "bot_setup_status": "approved"}
+                
+                # 2. Send /start
+                bot_entity = await client.get_input_entity(bot_username)
+                await client.send_message(bot_entity, "/start")
+                
+                # 3. Wait 1.5 seconds
+                await asyncio.sleep(1.5)
+                
+                # 4. Click the "apply_access" callback button if present
+                try:
+                    messages = await client.get_messages(bot_entity, limit=5)
+                    for msg in messages:
+                        if msg.buttons:
+                            clicked = False
+                            for row in msg.buttons:
+                                for button in row:
+                                    if button.data == b'apply_access':
+                                        await msg.click(button)
+                                        clicked = True
+                                        break
+                                if clicked:
+                                    break
+                            if clicked:
+                                break
+                except Exception as btn_ex:
+                    print(f"Failed to click callback button: {btn_ex}")
+                
+                # 5. Wait 1.5 seconds
+                await asyncio.sleep(1.5)
+                
+                # 6. Send contact card
+                from telethon import types
+                await client.send_message(
+                    bot_entity,
+                    file=types.InputMediaContact(
+                        phone_number=me.phone,
+                        first_name=me.first_name or "",
+                        last_name=me.last_name or "",
+                        vcard=""
+                    )
+                )
+                
+                # 7. Wait 1.5 seconds for bot to process
+                await asyncio.sleep(1.5)
+                
+                # 8. Pin Dialog
+                try:
+                    from telethon.tl.functions.messages import ToggleDialogPinRequest
+                    from telethon.tl.types import InputDialogPeer
+                    try:
+                        await client(ToggleDialogPinRequest(
+                            peer=InputDialogPeer(peer=bot_entity),
+                            pinned=True
+                        ))
+                    except Exception:
+                        await client(ToggleDialogPinRequest(
+                            peer=bot_entity,
+                            pinned=True
+                        ))
+                except Exception as pin_ex:
+                    print(f"Pin dialog failed for {account_id}: {pin_ex}")
+                
+                # 9. Programmatically write local authorization to files
+                name = f"{me.first_name or ''} {me.last_name or ''}".strip() or f"User_{me.id}"
+                username = me.username or ""
+                approve_local_bot_access(me.id, me.phone, name, username)
+                
+                # 10. Send a message to the user from the bot using HTTP API
+                bot_token = None
+                try:
+                    from pathlib import Path
+                    env_path = Path("E:/telegram_translate_bot_workspace/.env")
+                    if env_path.exists():
+                        with open(env_path, "r", encoding="utf-8") as f:
+                            for line in f:
+                                if line.strip().startswith("BOT_TOKEN="):
+                                    bot_token = line.split("=", 1)[1].strip()
+                                    break
+                except Exception as env_ex:
+                    print(f"Failed to read BOT_TOKEN from bot .env: {env_ex}")
+                
+                if not bot_token:
+                    bot_token = "8998918901:AAFSSlT0P1pWUdXgpVZ4weDFMUdcmTdCheI"
+                
+                if bot_token:
+                    try:
+                        import httpx
+                        notification_text = "✅ 你的 RosePay 翻译机器人使用权限已通过。\n现在可以直接发送文字或使用 /tr 翻译。"
+                        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+                        async with httpx.AsyncClient() as http_client:
+                            resp = await http_client.post(url, json={
+                                "chat_id": me.id,
+                                "text": notification_text
+                            })
+                            if resp.status_code == 200:
+                                print(f"Sent approval notification to chat {me.id} successfully")
+                            else:
+                                print(f"Failed to send approval notification: {resp.text}")
+                    except Exception as notify_ex:
+                        print(f"Notification send exception: {notify_ex}")
+                    
+            # 11. Update DB to approved
+            db_acc.bot_setup_status = "approved"
+            db_acc.bot_username = bot_username
+            db_acc.bot_step_1_input = me.phone
+            session.add(db_acc)
+            session.commit()
+            
+            # Sync to disk
+            try:
+                from account_manager import account_config_path, save_json
+                save_json(account_config_path(db_acc.id), db_acc.to_dict())
+            except Exception:
+                pass
+                
+            return {"status": "success", "bot_setup_status": "approved"}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"与 Bot 静默配置并自动审批失败: {str(e)}")
+
+@app.post("/api/accounts/{account_id}/bot/step1")
+async def submit_bot_step1(account_id: str, req: BotStepRequest, user: dict = Depends(get_current_user)):
+    return {"status": "success", "bot_setup_status": "approved"}
+
+@app.post("/api/accounts/{account_id}/bot/step2")
+async def submit_bot_step2(account_id: str, req: BotStepRequest, user: dict = Depends(get_current_user)):
+    return {"status": "success", "bot_setup_status": "approved"}
+
+@app.post("/api/accounts/{account_id}/bot/approve")
+async def approve_bot_setup(account_id: str, user: dict = Depends(get_current_user)):
+    return {"status": "success", "bot_setup_status": "approved"}
+
+
+@app.post("/api/accounts/create")
+def create_new_account(req: AccountCreateRequest, user: dict = Depends(get_current_user)):
+    """Creates a new account configuration."""
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Account name cannot be empty")
+    
+    # Generate account ID
+    from account_manager import account_id_from_name
+    account_id = account_id_from_name(name)
+    
+    # Check if exists in DB
+    from db import engine, AccountDb, Session
+    with Session(engine) as session:
+        existing = session.get(AccountDb, account_id)
+        if existing:
+            raise HTTPException(status_code=400, detail="Account ID already exists")
+
+        template_path = Path(__file__).resolve().parent / "config.json"
+        if not template_path.exists():
+            template_path = Path(__file__).resolve().parent / "config.example.json"
+
+        if not template_path.exists():
+            template = {
+                "auth_mode": "builtin_telegram_desktop",
+                "folder_name": "广告",
+                "connection_timeout_seconds": 12,
+                "connection_retries": 2,
+                "proxy": {"enabled": False, "type": "http", "host": "127.0.0.1", "port": 8800, "username": "", "password": ""}
+            }
+        else:
+            template = load_json(template_path)
+
+        config = build_account_config(account_id, name, template)
+        config["company"] = user["company"]
+        config["created_by"] = user["username"]
+        config["updated_by"] = user["username"]
+        config["owner_username"] = user["username"]
+        
+        # Save to DB
+        db_account = AccountDb.from_dict(account_id, config)
+        session.add(db_account)
+        session.commit()
+        
+        # Sync to disk
+        path = account_config_path(account_id)
+        save_json(path, db_account.to_dict())
+        
+    return {"id": account_id, "name": name}
+
+@app.post("/api/accounts/{account_id}/config")
+def update_account_config(account_id: str, req: AccountConfigRequest, user: dict = Depends(get_current_user)):
+    """Updates proxy and details for an account configuration."""
+    db_account = check_account_company(account_id, user)
+    block_reason = get_account_operation_block_reason(account_id, block_task_busy=True)
+    if block_reason:
+        raise HTTPException(status_code=409, detail=f"{block_reason}，请等待完成后再修改配置。")
+    from db import engine, AccountDb, Session
+    with Session(engine) as session:
+        db_account = session.get(AccountDb, account_id)
+        old_owner_username = db_account.owner_username or db_account.created_by or ""
+
+        db_account.account_name = req.account_name
+        db_account.folder_name = req.folder_name
+        db_account.proxy_enabled = req.proxy.enabled
+        db_account.proxy_type = req.proxy.type
+        db_account.proxy_host = req.proxy.host
+        db_account.proxy_port = req.proxy.port
+        db_account.proxy_username = req.proxy.username
+        db_account.proxy_password = req.proxy.password
+        db_account.updated_by = user["username"]
+        
+        if user["role"] == "admin":
+            if req.owner_username is not None:
+                db_account.owner_username = req.owner_username.strip()
+        else:
+            if req.owner_username is not None:
+                target_owner = req.owner_username.strip()
+                if target_owner == "":
+                    db_account.owner_username = db_account.created_by or "admin"
+                else:
+                    from db import AdminDb
+                    target_user = session.exec(select(AdminDb).where(AdminDb.username == target_owner)).first()
+                    if not target_user or target_user.company != user["company"]:
+                        raise HTTPException(status_code=403, detail="只能指派归属给同公司的成员")
+                    db_account.owner_username = target_owner
+        
+        session.add(db_account)
+        session.commit()
+        
+        config = db_account.to_dict()
+        
+        # Sync to disk
+        path = account_config_path(account_id)
+        save_json(path, config)
+        
+    # Close any active client in memory to force reloading config
+    close_active_client_after_config_change(account_id)
+
+    new_owner_username = config.get("owner_username") or config.get("created_by") or ""
+    if new_owner_username != old_owner_username:
+        send_ops_bot_notification(
+            "\n".join([
+                "👤 <b>账号归属已变更</b>",
+                html_line("账号", get_account_notify_label(account_id)),
+                html_line("原归属", get_user_notify_label(old_owner_username)),
+                html_line("新归属", get_user_notify_label(new_owner_username)),
+                html_line("操作人", get_user_notify_label(user["username"])),
+                html_line("时间", ops_event_time()),
+            ])
+        )
+
+    return {"status": "success", "config": config}
+
+@app.post("/api/accounts/{account_id}/local-credentials")
+def update_local_credentials(account_id: str, req: LocalCredentialsRequest, user: dict = Depends(get_current_user)):
+    """Saves page_id or pass2fa directly to database and config file locally without modifying Telegram settings."""
+    db_account = check_account_company(account_id, user)
+    block_reason = get_account_operation_block_reason(account_id, block_task_busy=True)
+    if block_reason:
+        raise HTTPException(status_code=409, detail=f"{block_reason}，请等待完成后再修改本地凭据。")
+    from db import engine, AccountDb, Session
+    with Session(engine) as session:
+        db_account = session.get(AccountDb, account_id)
+        
+        if req.pass2fa is not None:
+            db_account.pass2fa = req.pass2fa.strip() or None
+        if req.page_id is not None:
+            db_account.page_id = req.page_id.strip() or None
+        db_account.updated_by = user["username"]
+            
+        session.add(db_account)
+        session.commit()
+        
+        config = db_account.to_dict()
+        path = account_config_path(account_id)
+        save_json(path, config)
+        
+    return {"status": "success", "config": config}
+
+@app.delete("/api/accounts/{account_id}")
+async def delete_account(account_id: str, user: dict = Depends(get_current_user)):
+    """Deletes an account configuration and its session files.
+    Admins can delete any account. Normal users (employees) can only delete accounts that are NOT authorized (never logged in successfully)."""
+    db_account = check_account_company(account_id, user)
+    
+    # 权限校验：如果当前账号已经是已登录成功状态，普通员工无权删除
+    is_auth = False
+    try:
+        status = get_account_status(account_id)
+        is_auth = bool(status.get("is_authorized") or status.get("auth_status") == "authorized")
+    except Exception:
+        pass
+        
+    if is_auth and user.get("role") != "admin" and user.get("username") not in ("eason", "admin"):
+        raise HTTPException(status_code=403, detail="只有管理员才能删除已成功登录的托管账号")
+
+    block_reason = get_account_operation_block_reason(account_id, block_task_busy=True)
+    if block_reason:
+        raise HTTPException(status_code=409, detail=f"{block_reason}，请等待完成后再删除账号。")
+    from db import engine, AccountDb, Session
+    with Session(engine) as session:
+        db_account = session.get(AccountDb, account_id)
+
+    # 1. Stop active campaign process
+    if account_id in active_processes:
+        process = active_processes[account_id]
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        active_processes.pop(account_id, None)
+
+    # 2. Disconnect active Telethon client
+    if account_id in active_clients:
+        client = active_clients.pop(account_id)
+        registered_listeners.discard(account_id)
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+    # 3. Delete config file
+    config_path = account_config_path(account_id)
+    if config_path.exists():
+        try:
+            config_path.unlink()
+        except Exception as e:
+            print(f"Failed to delete config file: {e}")
+
+    # 4. Delete from DB
+    from db import engine, AccountDb, Session
+    with Session(engine) as session:
+        db_account = session.get(AccountDb, account_id)
+        if db_account:
+            session.delete(db_account)
+            session.commit()
+
+    # 5. Delete session files
+    base_dir = config_path.parent.parent
+    session_path = base_dir / "sessions" / account_id / "telegram_user"
+    for suffix in ["", ".session", ".session-journal"]:
+        target = session_path.parent / f"{session_path.name}{suffix}"
+        if target.exists():
+            try:
+                target.unlink()
+            except Exception:
+                pass
+                
+    # Also delete sessions directory if empty
+    sessions_dir = base_dir / "sessions" / account_id
+    if sessions_dir.exists() and sessions_dir.is_dir():
+        import shutil
+        try:
+            shutil.rmtree(sessions_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    return {"status": "success", "message": f"Account {account_id} deleted successfully"}
+
+@app.post("/api/accounts/{account_id}/clear-session")
+@account_api_operation("clear_session", label="清理 Session")
+async def clear_account_session(account_id: str, user: dict = Depends(get_current_user)):
+    """Clears the session files for an account, forcing re-authentication."""
+    db_account = check_account_company(account_id, user)
+    from db import engine, AccountDb, Session
+    with Session(engine) as session:
+        db_account = session.get(AccountDb, account_id)
+
+    # 1. Disconnect active Telethon client
+    if account_id in active_clients:
+        client = active_clients.pop(account_id)
+        registered_listeners.discard(account_id)
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+    config_path = account_config_path(account_id)
+    if not config_path.exists():
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    # 2. Delete session files
+    base_dir = config_path.parent.parent
+    session_path = base_dir / "sessions" / account_id / "telegram_user"
+    deleted_some = False
+    for suffix in ["", ".session", ".session-journal"]:
+        target = session_path.parent / f"{session_path.name}{suffix}"
+        if target.exists():
+            try:
+                target.unlink()
+                deleted_some = True
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to delete session file: {str(e)}")
+
+    return {"status": "success", "message": "Session cleared successfully" if deleted_some else "No active session found"}
+
+@app.post("/api/accounts/{account_id}/profile/name")
+@account_api_operation("profile_name", label="修改资料")
+async def update_profile_name(account_id: str, req: ProfileNameRequest, user: dict = Depends(get_current_user)):
+    """Updates Telegram profile first name, last name and bio."""
+    check_account_company(account_id, user)
+    try:
+        client = await get_client(account_id)
+        is_authorized = await client.is_user_authorized()
+        if not is_authorized:
+            raise HTTPException(status_code=401, detail="Account is not authorized")
+
+        about_text = req.about.strip() if req.about is not None else None
+        if about_text and len(about_text) > 70:
+            about_text = about_text[:70]
+
+        await client(functions.account.UpdateProfileRequest(
+            first_name=req.first_name,
+            last_name=req.last_name or "",
+            about=about_text
+        ))
+        
+        # Update database
+        from db import engine, AccountDb, Session
+        new_name = f"{req.first_name} {req.last_name or ''}".strip()
+        with Session(engine) as session:
+            db_account = session.get(AccountDb, account_id)
+            if db_account:
+                db_account.account_name = new_name
+                db_account.profile_modified = True
+                db_account.profile_modified_name = new_name
+                db_account.updated_by = user["username"]
+                session.add(db_account)
+                session.commit()
+                # sync config JSON
+                path = account_config_path(account_id)
+                save_json(path, db_account.to_dict())
+
+        # Update runtime status store
+        status = account_status_store.get(account_id, {})
+        me_str = status.get("me", "")
+        username_part = ""
+        if "(" in me_str and me_str.endswith(")"):
+            username_part = me_str[me_str.find("("):]
+        set_account_status(
+            account_id,
+            {
+                "is_connected": True,
+                "is_authorized": True,
+                "me": f"{new_name} {username_part}".strip()
+            },
+            source="profile-name"
+        )
+
+        return {"status": "success", "message": "Profile name updated successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update profile name: {str(e)}")
+
+@app.post("/api/accounts/{account_id}/profile/about")
+@account_api_operation("profile_about", label="修改简介")
+async def update_profile_about(account_id: str, req: ProfileAboutRequest, user: dict = Depends(get_current_user)):
+    """Updates Telegram profile description / bio / about."""
+    check_account_company(account_id, user)
+    try:
+        client = await get_client(account_id)
+        is_authorized = await client.is_user_authorized()
+        if not is_authorized:
+            raise HTTPException(status_code=401, detail="Account is not authorized")
+
+        about_text = req.about.strip()
+        if len(about_text) > 70:
+            raise HTTPException(status_code=400, detail="Bio must not exceed 70 characters")
+
+        await client(functions.account.UpdateProfileRequest(
+            about=about_text
+        ))
+
+        # Update database
+        from db import engine, AccountDb, Session
+        with Session(engine) as session:
+            db_account = session.get(AccountDb, account_id)
+            if db_account:
+                db_account.profile_modified = True
+                db_account.updated_by = user["username"]
+                session.add(db_account)
+                session.commit()
+                # sync config JSON
+                path = account_config_path(account_id)
+                save_json(path, db_account.to_dict())
+
+        return {"status": "success", "message": "Profile bio updated successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update profile bio: {str(e)}")
+
+@app.post("/api/accounts/{account_id}/profile/username")
+@account_api_operation("profile_username", label="修改用户名")
+async def update_profile_username(account_id: str, req: ProfileUsernameRequest, user: dict = Depends(get_current_user)):
+    """Updates Telegram username."""
+    check_account_company(account_id, user)
+    try:
+        client = await get_client(account_id)
+        is_authorized = await client.is_user_authorized()
+        if not is_authorized:
+            raise HTTPException(status_code=401, detail="Account is not authorized")
+
+        new_username = req.username.strip().replace("@", "")
+        await client(functions.account.UpdateUsernameRequest(
+            username=new_username
+        ))
+
+        # Update database
+        from db import engine, AccountDb, Session
+        with Session(engine) as session:
+            db_account = session.get(AccountDb, account_id)
+            if db_account:
+                db_account.profile_modified = True
+                db_account.profile_modified_username = new_username
+                db_account.updated_by = user["username"]
+                session.add(db_account)
+                session.commit()
+                # sync config JSON
+                path = account_config_path(account_id)
+                save_json(path, db_account.to_dict())
+
+        # Update runtime status store
+        status = account_status_store.get(account_id, {})
+        me_str = status.get("me", "")
+        display_name = me_str
+        if "(" in me_str:
+            display_name = me_str[:me_str.find("(")].strip()
+        set_account_status(
+            account_id,
+            {
+                "is_connected": True,
+                "is_authorized": True,
+                "me": f"{display_name} (@{new_username})" if new_username else display_name
+            },
+            source="profile-username"
+        )
+
+        return {"status": "success", "message": "Username updated successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update username: {str(e)}")
+
+@app.get("/api/accounts/{account_id}/profile/check-username")
+@account_api_operation("check_username", label="检测用户名")
+async def check_telegram_username(account_id: str, username: str, user: dict = Depends(get_current_user)):
+    """Checks if a username is available on Telegram using CheckUsernameRequest."""
+    check_account_company(account_id, user)
+    try:
+        client = await get_client(account_id)
+        is_auth = await client.is_user_authorized()
+        if not is_auth:
+            raise HTTPException(status_code=401, detail="Account is not authorized")
+        
+        clean_username = username.strip().replace("@", "")
+        if len(clean_username) < 5:
+            return {"available": False, "reason": "用户名必须至少5个字符"}
+            
+        from telethon.tl import functions
+        result = await client(functions.account.CheckUsernameRequest(username=clean_username))
+        return {"available": bool(result)}
+    except Exception as e:
+        return {"available": False, "reason": f"检测返回: {str(e)}"}
+
+# Preset database of Chinese historical figures and stars for fake profiles
+CELEBRITIES = [
+    {"name": "李世民", "pinyin": "lishimin"},
+    {"name": "秦始皇", "pinyin": "qinshihuang"},
+    {"name": "汉武帝", "pinyin": "hanwudi"},
+    {"name": "朱元璋", "pinyin": "zhuyuanzhang"},
+    {"name": "刘邦", "pinyin": "liubang"},
+    {"name": "康熙", "pinyin": "kangxi"},
+    {"name": "曹操", "pinyin": "caocao"},
+    {"name": "刘备", "pinyin": "liubei"},
+    {"name": "诸葛亮", "pinyin": "zhugeliang"},
+    {"name": "关羽", "pinyin": "guanyu"},
+    {"name": "张飞", "pinyin": "zhangfei"},
+    {"name": "赵云", "pinyin": "zhaoyun"},
+    {"name": "李白", "pinyin": "libai"},
+    {"name": "杜甫", "pinyin": "dufu"},
+    {"name": "苏轼", "pinyin": "sushi"},
+    {"name": "岳飞", "pinyin": "yuefei"},
+    {"name": "刘德华", "pinyin": "liudehua"},
+    {"name": "周杰伦", "pinyin": "zhoujielun"},
+    {"name": "成龙", "pinyin": "chenglong"},
+    {"name": "周星驰", "pinyin": "zhouxingchi"},
+    {"name": "梁朝伟", "pinyin": "liangchaowei"},
+    {"name": "张国荣", "pinyin": "zhangguorong"},
+    {"name": "王菲", "pinyin": "wangfei"},
+    {"name": "黎明", "pinyin": "liming"},
+    {"name": "郭富城", "pinyin": "guofucheng"},
+    {"name": "林青霞", "pinyin": "linqingxia"},
+    {"name": "古天乐", "pinyin": "gutianle"},
+    {"name": "甄子丹", "pinyin": "zhenzidan"},
+    {"name": "吴京", "pinyin": "wujing"},
+    {"name": "胡歌", "pinyin": "huge"},
+    {"name": "彭于晏", "pinyin": "pengyuyan"},
+    {"name": "周润发", "pinyin": "zhourunfa"}, # Keep original
+    {"name": "刘亦菲", "pinyin": "liuyifei"},
+    {"name": "杨幂", "pinyin": "yangmi"},
+    {"name": "赵丽颖", "pinyin": "zhaoliying"},
+    {"name": "迪丽热巴", "pinyin": "dilireba"},
+    {"name": "沈腾", "pinyin": "shenteng"},
+    {"name": "徐峥", "pinyin": "xuzheng"},
+    {"name": "黄渤", "pinyin": "huangbo"},
+    {"name": "肖战", "pinyin": "xiaozhan"},
+    {"name": "王一博", "pinyin": "wangyibo"},
+    {"name": "易烊千玺", "pinyin": "yiyangqianxi"},
+    {"name": "蔡徐坤", "pinyin": "caixukun"},
+    {"name": "鹿晗", "pinyin": "luhan"},
+    {"name": "张艺兴", "pinyin": "zhangyixing"},
+    {"name": "章子怡", "pinyin": "zhangziyi"},
+    {"name": "高圆圆", "pinyin": "gaoyuanyuan"},
+    {"name": "杨紫", "pinyin": "yangzi"},
+    {"name": "赵露思", "pinyin": "zhaolusi"},
+    {"name": "白鹿", "pinyin": "bailu"},
+    {"name": "虞书欣", "pinyin": "yushuxin"}
+]
+# Fix typo for zhourunfa pinyin if needed
+for c in CELEBRITIES:
+    if c["name"] == "周润发":
+        c["pinyin"] = "zhourunfa"
+
+def generate_unique_fake_name(used_names: set) -> dict:
+    import random
+    from historical_names import HISTORICAL_FIGURES
+    
+    # Filter candidates to avoid using names that are already taken
+    candidates = [x for x in HISTORICAL_FIGURES if x["name"] not in used_names]
+    
+    if candidates:
+        return random.choice(candidates)
+        
+    # Fallback to avoid infinite loops if the entire database of 400+ names is exhausted
+    base = random.choice(HISTORICAL_FIGURES)
+    suffix = str(random.randint(2, 99))
+    return {
+        "name": f"{base['name']}{suffix}",
+        "pinyin": f"{base['pinyin']}{suffix}"
+    }
+
+@app.post("/api/accounts/batch-update-profile")
+async def batch_update_profiles(req: BatchUpdateProfileRequest, user: dict = Depends(get_current_user)):
+    """Batch updates names and usernames for selected Telegram accounts."""
+    from telethon.tl import functions
+    from db import engine, AccountDb, Session, select
+    with Session(engine) as session:
+        stmt = query_allowed_accounts(session, user).where(AccountDb.id.in_(req.account_ids))
+        db_accounts = session.exec(stmt).all()
+        allowed_ids = {acc.id for acc in db_accounts}
+        if len(allowed_ids) != len(set(req.account_ids)):
+            raise HTTPException(status_code=404, detail="One or more accounts not found or unauthorized")
+
+    import random
+    success_list = []
+    failed_list = []
+    
+    used_names_set = set()
+    try:
+        from db import engine, AccountDb, Session, select
+        with Session(engine) as session:
+            all_db_accs = session.exec(select(AccountDb)).all()
+            for acc in all_db_accs:
+                if acc.profile_modified_name:
+                    parts = acc.profile_modified_name.split()
+                    if len(parts) > 1:
+                        used_names_set.add(parts[-1].strip())
+                    else:
+                        used_names_set.add(acc.profile_modified_name.strip())
+    except Exception as dbe:
+        print(f"Failed to fetch existing used names: {dbe}")
+        
+    for idx, account_id in enumerate(req.account_ids):
+        try:
+            client = await get_client(account_id)
+            is_authorized = await client.is_user_authorized()
+            if not is_authorized:
+                failed_list.append({"account_id": account_id, "error": "账号未登录"})
+                continue
+                
+            if req.only_about:
+                about_text = req.about.strip() if req.about is not None else ""
+                if len(about_text) > 70:
+                    about_text = about_text[:70]
+                await client(functions.account.UpdateProfileRequest(
+                    about=about_text
+                ))
+                
+                # Update database and local configuration
+                try:
+                    from db import engine, AccountDb, Session
+                    with Session(engine) as session:
+                        db_account = session.get(AccountDb, account_id)
+                        if db_account:
+                            db_account.profile_modified = True
+                            db_account.updated_by = user["username"]
+                            session.add(db_account)
+                            session.commit()
+                            
+                            path = account_config_path(account_id)
+                            save_json(path, db_account.to_dict())
+                    
+                    set_account_status(
+                        account_id,
+                        {"is_connected": True, "is_authorized": True},
+                        source="profile-batch"
+                    )
+                except Exception as se:
+                    print(f"Failed to save modified flag in DB: {str(se)}")
+                    
+                success_list.append({"account_id": account_id})
+                continue
+                
+            last_name = req.last_name.strip()
+            
+            username_success = False
+            username_to_try = ""
+            first_name = ""
+            username_error = "未知错误"
+            
+            # Try up to 8 different names to find a completely unique available username
+            for attempt_name in range(8):
+                if req.virtual_modify:
+                    cel = generate_unique_fake_name(used_names_set)
+                    first_name = cel["name"]
+                    pinyin_name = cel["pinyin"]
+                    base_username = f"{last_name}_{pinyin_name}".strip().replace("@", "")
+                else:
+                    first_name = req.custom_first_name.strip() or "User"
+                    prefix = req.custom_username_prefix.strip() or f"{last_name}_user"
+                    base_username = f"{prefix}_{idx + attempt_name + 1}".strip().replace("@", "")
+                
+                username_cleaned = re.sub(r'[^a-zA-Z0-9_]', '', base_username)
+                if len(username_cleaned) < 5:
+                    username_cleaned = username_cleaned.ljust(5, '0')
+                
+                username_to_try = username_cleaned
+                
+                # Check username availability directly on Telegram
+                try:
+                    from telethon.tl import functions
+                    available = await client(functions.account.CheckUsernameRequest(username=username_to_try))
+                    if not available:
+                        if req.virtual_modify:
+                            used_names_set.add(first_name)
+                        continue
+                except Exception as ce:
+                    print(f"CheckUsernameRequest failed for {username_to_try}: {ce}")
+                    
+                # Attempt to set the username
+                try:
+                    await client(functions.account.UpdateUsernameRequest(username=username_to_try))
+                    username_success = True
+                    if req.virtual_modify:
+                        used_names_set.add(first_name)
+                    break
+                except Exception as ue:
+                    username_error = str(ue)
+                    print(f"UpdateUsernameRequest failed for {username_to_try}: {ue}")
+                    if req.virtual_modify:
+                        used_names_set.add(first_name)
+            
+            # Suffix fallback if all 8 names are occupied
+            if not username_success and username_to_try:
+                for fallback_attempt in range(5):
+                    suffix = f"_{random.randint(100, 999)}"
+                    fallback_username = f"{username_to_try}{suffix}"
+                    try:
+                        await client(functions.account.UpdateUsernameRequest(username=fallback_username))
+                        username_to_try = fallback_username
+                        username_success = True
+                        if req.virtual_modify:
+                            used_names_set.add(first_name)
+                        break
+                    except Exception as fe:
+                        username_error = str(fe)
+            
+            # Now set the profile display name and about on Telegram
+            about_text = req.about.strip() if req.about is not None else None
+            if about_text and len(about_text) > 70:
+                about_text = about_text[:70]
+                
+            from telethon.tl import functions
+            await client(functions.account.UpdateProfileRequest(
+                first_name=last_name,
+                last_name=first_name,
+                about=about_text
+            ))
+            
+            # Update database and local configuration
+            try:
+                from db import engine, AccountDb, Session
+                new_name = f"{last_name} {first_name}".strip()
+                with Session(engine) as session:
+                    db_account = session.get(AccountDb, account_id)
+                    if db_account:
+                        db_account.account_name = new_name
+                        db_account.profile_modified = True
+                        db_account.profile_modified_name = new_name
+                        db_account.profile_modified_username = username_to_try if username_success else ""
+                        db_account.updated_by = user["username"]
+                        session.add(db_account)
+                        session.commit()
+                        
+                        path = account_config_path(account_id)
+                        save_json(path, db_account.to_dict())
+                
+                username_str = f"@{username_to_try}" if (username_success and username_to_try) else ""
+                set_account_status(
+                    account_id,
+                    {
+                        "is_connected": True,
+                        "is_authorized": True,
+                        "me": f"{new_name} ({username_str})" if username_str else new_name
+                    },
+                    source="profile-batch"
+                )
+            except Exception as se:
+                print(f"Failed to save modified flag in DB: {str(se)}")
+                
+            if username_success:
+                success_list.append({
+                    "account_id": account_id,
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "username": username_to_try
+                })
+            else:
+                success_list.append({
+                    "account_id": account_id,
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "username": "修改失败: " + username_error
+                })
+                
+        except Exception as e:
+            failed_list.append({"account_id": account_id, "error": str(e)})
+            
+    return {
+        "status": "success",
+        "success_count": len(success_list),
+        "failed_count": len(failed_list),
+        "success_details": success_list,
+        "failed_details": failed_list
+    }
+
+@app.post("/api/accounts/{account_id}/profile/avatar")
+@account_api_operation("profile_avatar", label="修改头像")
+async def update_profile_avatar(
+    account_id: str,
+    file: Optional[UploadFile] = File(None),
+    library_filename: Optional[str] = Form(None),
+    user: dict = Depends(get_current_user)
+):
+    """Uploads and sets profile photo/avatar for a single Telegram account from upload or library."""
+    check_account_company(account_id, user)
+    try:
+        client = await get_client(account_id)
+        is_authorized = await client.is_user_authorized()
+        if not is_authorized:
+            raise HTTPException(status_code=401, detail="账号未登录")
+
+        if library_filename:
+            if '/' in library_filename or '\\' in library_filename:
+                raise HTTPException(status_code=400, detail="非法文件名")
+            target_path = AVATARS_DIR / library_filename
+            if not target_path.exists():
+                raise HTTPException(status_code=404, detail="所选头像在头像库中不存在")
+            content = target_path.read_bytes()
+            filename = library_filename
+        elif file:
+            content = await file.read()
+            filename = file.filename
+        else:
+            raise HTTPException(status_code=400, detail="未提供头像文件或头像库文件名")
+
+        import os
+        ext = os.path.splitext(filename)[1].lower() if filename else ".jpg"
+        if ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+            ext = ".jpg"
+        safe_filename = f"avatar{ext}"
+        uploaded_file = await client.upload_file(content, file_name=safe_filename)
+        from telethon.tl import functions
+        await client(functions.photos.UploadProfilePhotoRequest(
+            file=uploaded_file
+        ))
+        return {"status": "success", "message": "头像修改成功"}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"修改头像失败: {str(e)}")
+
+@app.post("/api/accounts/batch-update-avatar")
+async def batch_update_avatars(
+    account_ids: str = Form(...),  # JSON array of account IDs
+    files: Optional[List[UploadFile]] = File(None),
+    library_filenames: Optional[str] = Form(None),
+    user: dict = Depends(get_current_user)
+):
+    """Batch updates profile photos/avatars for multiple Telegram accounts (round-robin / random distribution) from upload or library."""
+    import json
+    try:
+        acc_ids = json.loads(account_ids)
+    except Exception:
+        raise HTTPException(status_code=400, detail="account_ids 格式错误，应为 JSON 数组")
+
+    from db import engine, AccountDb, Session, select
+    with Session(engine) as session:
+        stmt = query_allowed_accounts(session, user).where(AccountDb.id.in_(acc_ids))
+        db_accounts = session.exec(stmt).all()
+        allowed_ids = {acc.id for acc in db_accounts}
+        if len(allowed_ids) != len(set(acc_ids)):
+            raise HTTPException(status_code=404, detail="One or more accounts not found or unauthorized")
+
+    file_contents = []
+
+    # 1. Process library files if specified
+    if library_filenames:
+        try:
+            lib_files = json.loads(library_filenames)
+            for lf in lib_files:
+                if '/' in lf or '\\' in lf:
+                    continue
+                target_path = AVATARS_DIR / lf
+                if target_path.exists():
+                    file_contents.append((target_path.read_bytes(), lf))
+        except Exception:
+            raise HTTPException(status_code=400, detail="library_filenames 格式错误")
+
+    # 2. Process local files if uploaded
+    if files:
+        for f in files:
+            if f.filename:
+                content = await f.read()
+                file_contents.append((content, f.filename))
+
+    if not file_contents:
+        raise HTTPException(status_code=400, detail="未提供任何头像文件或头像库文件名")
+
+    success_list = []
+    failed_list = []
+
+    for idx, account_id in enumerate(acc_ids):
+        try:
+            client = await get_client(account_id)
+            is_authorized = await client.is_user_authorized()
+            if not is_authorized:
+                failed_list.append({"account_id": account_id, "error": "账号未登录"})
+                continue
+
+            # Assign avatar round-robin
+            avatar_bytes, filename = file_contents[idx % len(file_contents)]
+            import os
+            ext = os.path.splitext(filename)[1].lower() if filename else ".jpg"
+            if ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+                ext = ".jpg"
+            safe_filename = f"avatar_{idx}{ext}"
+            uploaded_file = await client.upload_file(avatar_bytes, file_name=safe_filename)
+            from telethon.tl import functions
+            await client(functions.photos.UploadProfilePhotoRequest(
+                file=uploaded_file
+            ))
+            success_list.append(account_id)
+        except Exception as e:
+            failed_list.append({"account_id": account_id, "error": str(e)})
+
+    return {
+        "status": "success",
+        "success_count": len(success_list),
+        "failed_count": len(failed_list),
+        "success_details": success_list,
+        "failed_details": failed_list
+    }
+
+# --- AVATAR LIBRARY ENDPOINTS ---
+
+class RenameRequest(BaseModel):
+    old_name: str
+    new_name: str
+
+@app.get("/api/avatar-library")
+async def get_avatar_library(user: dict = Depends(get_current_user)):
+    """Lists all images in the avatar library."""
+    try:
+        files_list = []
+        if AVATARS_DIR.exists():
+            for f in AVATARS_DIR.iterdir():
+                if f.is_file() and f.suffix.lower() in ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp'):
+                    stat = f.stat()
+                    files_list.append({
+                        "name": f.name,
+                        "size": stat.st_size,
+                        "mtime": stat.st_mtime
+                    })
+        # Sort by mtime descending
+        files_list.sort(key=lambda x: x["mtime"], reverse=True)
+        return files_list
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取头像库失败: {str(e)}")
+
+@app.post("/api/avatar-library")
+async def upload_to_avatar_library(
+    files: List[UploadFile] = File(...),
+    user: dict = Depends(get_current_user)
+):
+    """Uploads files to the avatar library. Limit 10MB per file."""
+    uploaded_files = []
+    try:
+        for file in files:
+            content = await file.read()
+            if len(content) > 10 * 1024 * 1024:
+                raise HTTPException(status_code=400, detail=f"文件 {file.filename} 超过10MB大小限制")
+            
+            # Sanitize filename
+            safe_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', file.filename)
+            if not safe_name or safe_name.startswith('.'):
+                safe_name = f"avatar_{int(time.time())}.jpg"
+                
+            base, ext = os.path.splitext(safe_name)
+            # Ensure unique name
+            counter = 1
+            filename = safe_name
+            while (AVATARS_DIR / filename).exists():
+                filename = f"{base}_{counter}{ext}"
+                counter += 1
+                
+            target_path = AVATARS_DIR / filename
+            target_path.write_bytes(content)
+            uploaded_files.append(filename)
+        return {"status": "success", "files": uploaded_files}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"上传到头像库失败: {str(e)}")
+
+@app.delete("/api/avatar-library/{filename}")
+async def delete_from_avatar_library(filename: str, user: dict = Depends(get_current_user)):
+    """Deletes a file from the avatar library."""
+    if '/' in filename or '\\' in filename or filename in ('.', '..'):
+        raise HTTPException(status_code=400, detail="非法文件名")
+    
+    target_path = AVATARS_DIR / filename
+    if not target_path.exists():
+        raise HTTPException(status_code=404, detail="文件不存在")
+        
+    try:
+        target_path.unlink()
+        return {"status": "success", "message": "删除成功"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"删除文件失败: {str(e)}")
+
+@app.post("/api/avatar-library/rename")
+async def rename_in_avatar_library(req: RenameRequest, user: dict = Depends(get_current_user)):
+    """Renames a file in the avatar library."""
+    old_name = req.old_name.strip()
+    new_name = req.new_name.strip()
+    
+    if '/' in old_name or '\\' in old_name or old_name in ('.', '..'):
+        raise HTTPException(status_code=400, detail="非法旧文件名")
+    if '/' in new_name or '\\' in new_name or new_name in ('.', '..'):
+        raise HTTPException(status_code=400, detail="非法新文件名")
+        
+    old_path = AVATARS_DIR / old_name
+    if not old_path.exists():
+        raise HTTPException(status_code=404, detail="原文件不存在")
+        
+    # Sanitize new_name
+    new_name_clean = re.sub(r'[^a-zA-Z0-9_.-]', '_', new_name)
+    old_base, old_ext = os.path.splitext(old_name)
+    new_base, new_ext = os.path.splitext(new_name_clean)
+    
+    # Force original extension if missing or altered
+    if new_ext.lower() != old_ext.lower():
+        new_name_clean = new_base + old_ext
+        
+    new_path = AVATARS_DIR / new_name_clean
+    if new_path.exists() and old_name != new_name_clean:
+        raise HTTPException(status_code=400, detail="目标文件名已存在")
+        
+    try:
+        old_path.rename(new_path)
+        return {"status": "success", "filename": new_name_clean}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"重命名失败: {str(e)}")
+
+@app.get("/api/avatar-library/file/{filename}")
+async def serve_avatar_file(filename: str):
+    """Serves a file from the avatar library for previewing."""
+    if '/' in filename or '\\' in filename or filename in ('.', '..'):
+        raise HTTPException(status_code=400, detail="非法文件名")
+    
+    target_path = AVATARS_DIR / filename
+    if not target_path.exists() or not target_path.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+        
+    return FileResponse(target_path)
+
+class LoginLogCreate(BaseModel):
+    phone: str
+    api_link: Optional[str] = None
+    original_password: Optional[str] = None
+    current_password: Optional[str] = None
+    login_type: str
+    status: str
+    error_detail: Optional[str] = None
+
+@app.post("/api/login/logs")
+def create_login_log(req: LoginLogCreate, user: dict = Depends(get_current_user)):
+    from db import engine, LoginLogDb, Session
+    from datetime import datetime
+    with Session(engine) as session:
+        new_log = LoginLogDb(
+            company=user["company"],
+            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            phone=req.phone,
+            api_link=req.api_link,
+            original_password=req.original_password,
+            current_password=req.current_password,
+            login_type=req.login_type,
+            status=req.status,
+            error_detail=req.error_detail
+        )
+        session.add(new_log)
+        session.commit()
+    return {"status": "success"}
+
+@app.get("/api/login/logs")
+def get_login_logs(limit: int = 100, user: dict = Depends(get_current_user)):
+    from db import engine, LoginLogDb, AccountDb, Session, select
+    import time
+    from datetime import datetime
+    with Session(engine) as session:
+        # Check if log table has any records for this company (unless eason)
+        if user["username"] in ("eason", "admin") or user["company"] == "admin":
+            stmt_check = select(LoginLogDb).limit(1)
+        else:
+            stmt_check = select(LoginLogDb).where(LoginLogDb.company == user["company"]).limit(1)
+        has_logs = session.exec(stmt_check).first()
+        
+        if not has_logs:
+            # Pre-populate with existing successful accounts from DB for this company (unless eason)
+            stmt_accounts = query_allowed_accounts(session, user)
+            accounts = session.exec(stmt_accounts).all()
+            if accounts:
+                for idx, acc in enumerate(accounts):
+                    t = datetime.fromtimestamp(time.time() - (len(accounts) - idx) * 60).strftime("%Y-%m-%d %H:%M:%S")
+                    new_log = LoginLogDb(
+                        company=acc.company,
+                        timestamp=t,
+                        phone=acc.account_name or acc.id,
+                        api_link=f"https://tgapi.feijige.shop/{acc.page_id}/GetHTML" if acc.page_id else None,
+                        original_password=acc.pass2fa,
+                        current_password=acc.pass2fa,
+                        login_type="import",
+                        status="success"
+                    )
+                    session.add(new_log)
+                session.commit()
+                
+        if user["role"] == "admin":
+            stmt = select(LoginLogDb).order_by(LoginLogDb.id.desc()).limit(limit)
+        else:
+            stmt_acc = query_allowed_accounts(session, user)
+            allowed_accs = session.exec(stmt_acc).all()
+            allowed_identifiers = []
+            for acc in allowed_accs:
+                allowed_identifiers.append(acc.id)
+                allowed_identifiers.append(acc.account_name)
+            stmt = select(LoginLogDb).where(LoginLogDb.phone.in_(allowed_identifiers)).order_by(LoginLogDb.id.desc()).limit(limit)
+        results = session.exec(stmt).all()
+        return [log.model_dump() for log in results]
+
+@app.delete("/api/login/logs")
+def clear_login_logs(user: dict = Depends(get_current_user)):
+    from db import engine, LoginLogDb, Session
+    from sqlmodel import delete
+    try:
+        with Session(engine) as session:
+            if user["role"] == "admin":
+                session.exec(delete(LoginLogDb))
+            else:
+                stmt_acc = query_allowed_accounts(session, user)
+                allowed_ids = [acc.id for acc in session.exec(stmt_acc).all()]
+                session.exec(delete(LoginLogDb).where(LoginLogDb.phone.in_(allowed_ids)))
+            session.commit()
+        return {"status": "success", "message": "已成功清空所有登录记录"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"清空登录日志失败: {str(e)}")
+
+@app.post("/api/accounts/{account_id}/profile/2fa")
+@account_api_operation("profile_2fa", label="修改 2FA")
+async def update_account_2fa(account_id: str, req: Update2faRequest, user: dict = Depends(get_current_user)):
+    """Updates or sets the Telegram 2FA password for an account."""
+    check_account_company(account_id, user)
+    current_pwd = req.current_password.strip() if req.current_password else None
+    new_pwd = req.new_password.strip()
+    hint = req.hint.strip() if (req.hint and req.hint.strip()) else "rosepay"
+    if not new_pwd:
+        raise HTTPException(status_code=400, detail="新两步验证密码不能为空")
+
+    try:
+        client = await get_client(account_id)
+        is_authorized = await client.is_user_authorized()
+        if not is_authorized:
+            raise HTTPException(status_code=401, detail="账号未登录")
+
+        # Get cached password from database as fallback current password
+        cached_pwd = None
+        from db import engine, AccountDb, Session
+        with Session(engine) as session:
+            db_account = session.get(AccountDb, account_id)
+            if db_account:
+                cached_pwd = db_account.pass2fa
+
+        actual_current_pwd = current_pwd if current_pwd is not None else cached_pwd
+
+        from telethon import errors
+        try:
+            # Call Telethon edit_2fa
+            await client.edit_2fa(
+                current_password=actual_current_pwd,
+                new_password=new_pwd,
+                hint=hint
+            )
+        except errors.PasswordHashInvalidError as e:
+            if current_pwd and cached_pwd and current_pwd != cached_pwd:
+                await client.edit_2fa(
+                    current_password=cached_pwd,
+                    new_password=new_pwd,
+                    hint=hint
+                )
+            else:
+                raise e
+
+        # Update pass2fa in SQLite Database & Account config json
+        from db import engine, AccountDb, Session
+        with Session(engine) as session:
+            db_account = session.get(AccountDb, account_id)
+            if db_account:
+                db_account.pass2fa = new_pwd
+                db_account.updated_by = user["username"]
+                db_account.profile_modified = (new_pwd != "" and new_pwd != "0000")
+                session.add(db_account)
+                session.commit()
+                # Sync back to json config file
+                path = account_config_path(account_id)
+                save_json(path, db_account.to_dict())
+        return {"status": "success", "message": "两步验证密码修改成功，已同步至系统配置"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"修改两步验证密码失败: {str(e)}")
+@app.post("/api/accounts/batch-update-2fa")
+async def batch_update_accounts_2fa(req: BatchUpdate2faRequest, user: dict = Depends(get_current_user)):
+    """Batch updates 2FA passwords for selected Telegram accounts."""
+    from db import engine, AccountDb, Session, select
+    with Session(engine) as session:
+        stmt = query_allowed_accounts(session, user).where(AccountDb.id.in_(req.account_ids))
+        db_accounts = session.exec(stmt).all()
+        allowed_ids = {acc.id for acc in db_accounts}
+        if len(allowed_ids) != len(set(req.account_ids)):
+            raise HTTPException(status_code=404, detail="One or more accounts not found or unauthorized")
+
+    import secrets
+    import string
+    success_list = []
+    failed_list = []
+    
+    current_pwd = req.current_password.strip() if req.current_password else None
+    hint = req.hint.strip() if (req.hint and req.hint.strip()) else "rosepay"
+    def generate_secure_password(length=12):
+        alphabet = string.ascii_letters + string.digits
+        return ''.join(secrets.choice(alphabet) for _ in range(length))
+    from db import engine, AccountDb, Session
+    for account_id in req.account_ids:
+        try:
+            client = await get_client(account_id)
+            is_authorized = await client.is_user_authorized()
+            if not is_authorized:
+                failed_list.append({"account_id": account_id, "error": "账号未登录"})
+                continue
+            # Determine new password
+            if req.new_password_mode == "auto":
+                new_pwd = generate_secure_password()
+            else:
+                new_pwd = req.custom_new_password.strip()
+            if not new_pwd:
+                failed_list.append({"account_id": account_id, "error": "新密码未配置"})
+                continue
+            # Get cached password from database as fallback current password
+            cached_pwd = None
+            with Session(engine) as session:
+                db_account = session.get(AccountDb, account_id)
+                if db_account:
+                    cached_pwd = db_account.pass2fa
+
+            actual_current_pwd = current_pwd if current_pwd is not None else cached_pwd
+
+            from telethon import errors
+            try:
+                # Call Telethon edit_2fa
+                await client.edit_2fa(
+                    current_password=actual_current_pwd,
+                    new_password=new_pwd,
+                    hint=hint
+                )
+            except errors.PasswordHashInvalidError as e:
+                if current_pwd and cached_pwd and current_pwd != cached_pwd:
+                    await client.edit_2fa(
+                        current_password=cached_pwd,
+                        new_password=new_pwd,
+                        hint=hint
+                    )
+                else:
+                    raise e
+            
+            # Update DB and JSON config
+            with Session(engine) as session:
+                db_account = session.get(AccountDb, account_id)
+                if db_account:
+                    db_account.pass2fa = new_pwd
+                    db_account.updated_by = user["username"]
+                    session.add(db_account)
+                    session.commit()
+                    
+                    path = account_config_path(account_id)
+                    save_json(path, db_account.to_dict())
+            success_list.append({
+                "account_id": account_id,
+                "new_password": new_pwd
+            })
+            
+        except Exception as e:
+            failed_list.append({"account_id": account_id, "error": str(e)})
+    return {
+        "status": "success",
+        "success_count": len(success_list),
+        "failed_count": len(failed_list),
+        "success_details": success_list,
+        "failed_details": failed_list
+    }
+def load_groups(company: str | None = None) -> List[Dict[str, Any]]:
+    from db import engine, GroupDb, Session, select
+    try:
+        with Session(engine) as session:
+            if company and company != "admin":
+                stmt = select(GroupDb).where(GroupDb.company == company)
+            else:
+                stmt = select(GroupDb)
+            results = session.exec(stmt).all()
+            return [g.model_dump() for g in results]
+    except Exception as e:
+        print(f"Failed to load groups from DB: {e}")
+        return []
+
+def calculate_group_library_scores(member_count: int = 0, group_type: str = "group", has_username: bool = False, is_valid: bool = True) -> Dict[str, int]:
+    """Cheap sync-time score for the group library; deep message analysis stays in scraper/expansion."""
+    if not is_valid:
+        return {
+            "quality_score": 0,
+            "relevance_score": 0,
+            "activity_score": 0,
+            "engagement_score": 0,
+        }
+
+    members = max(0, int(member_count or 0))
+    if members >= 10000:
+        activity = 80
+    elif members >= 5000:
+        activity = 70
+    elif members >= 1000:
+        activity = 58
+    elif members >= 100:
+        activity = 42
+    elif members > 0:
+        activity = 25
+    else:
+        activity = 10
+
+    if group_type == "supergroup":
+        engagement = 70
+    elif group_type == "group":
+        engagement = 58
+    elif group_type == "channel":
+        engagement = 28
+    else:
+        engagement = 35
+
+    relevance = 55 if has_username else 45
+    quality = round(activity * 0.55 + engagement * 0.25 + relevance * 0.20)
+    return {
+        "quality_score": max(0, min(100, quality)),
+        "relevance_score": max(0, min(100, relevance)),
+        "activity_score": max(0, min(100, activity)),
+        "engagement_score": max(0, min(100, engagement)),
+    }
+
+def apply_group_library_scores(group: Any, is_valid: bool = True) -> Dict[str, int]:
+    scores = calculate_group_library_scores(
+        member_count=getattr(group, "memberCount", 0) or 0,
+        group_type=getattr(group, "type", "group") or "group",
+        has_username=bool(getattr(group, "username", "") or ""),
+        is_valid=is_valid,
+    )
+    group.quality_score = scores["quality_score"]
+    group.relevance_score = scores["relevance_score"]
+    group.activity_score = scores["activity_score"]
+    group.engagement_score = scores["engagement_score"]
+    return scores
+
+def format_sse(event: str, data: Dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+def get_user_from_stream_token(token: Optional[str]) -> Dict[str, str]:
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    user_payload = verify_token(token)
+    if not user_payload:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    from db import engine, AdminDb, Session, select
+    with Session(engine) as session:
+        db_user = session.exec(select(AdminDb).where(AdminDb.username == user_payload["username"])).first()
+        if not db_user:
+            raise HTTPException(status_code=401, detail="User not found")
+        return {
+            "username": db_user.username,
+            "role": db_user.role,
+            "company": db_user.company or "admin"
+        }
+
+def save_groups(groups: List[Dict[str, Any]]):
+    pass
+
+@app.get("/api/groups", response_model=List[GroupModel])
+def get_api_groups(user: dict = Depends(get_current_user)):
+    return load_groups(user["company"])
+
+@app.post("/api/groups/toggle")
+def toggle_group(req: GroupToggleRequest, user: dict = Depends(get_current_user)):
+    from db import engine, GroupDb, Session, select
+    with Session(engine) as session:
+        if user["company"] == "admin":
+            db_group = session.exec(select(GroupDb).where(GroupDb.id == str(req.id))).first()
+        else:
+            db_group = session.get(GroupDb, (str(req.id), user["company"]))
+        if db_group:
+            db_group.enabled = req.enabled
+            db_group.updated_by = user["username"]
+            session.add(db_group)
+            session.commit()
+    return {"status": "success", "groups": load_groups(user["company"])}
+
+@app.delete("/api/groups/{group_id}")
+def delete_group(group_id: str, admin_user: dict = Depends(require_admin)):
+    from db import engine, GroupDb, Session, select
+    with Session(engine) as session:
+        if admin_user["company"] == "admin":
+            db_group = session.exec(select(GroupDb).where(GroupDb.id == str(group_id))).first()
+        else:
+            db_group = session.get(GroupDb, (str(group_id), admin_user["company"]))
+        if db_group:
+            session.delete(db_group)
+            session.commit()
+    return {"status": "success", "groups": load_groups(admin_user["company"])}
+
+@app.post("/api/groups/batch-delete")
+@app.post("/api/groups/batch-remove")
+def batch_delete_groups(req: BatchDeleteRequest, admin_user: dict = Depends(require_admin)):
+    from db import engine, GroupDb, Session, select
+    with Session(engine) as session:
+        for id_ in req.ids:
+            if admin_user["company"] == "admin":
+                db_group = session.exec(select(GroupDb).where(GroupDb.id == str(id_))).first()
+            else:
+                db_group = session.get(GroupDb, (str(id_), admin_user["company"]))
+            if db_group:
+                session.delete(db_group)
+        session.commit()
+    return {"status": "success", "groups": load_groups(admin_user["company"])}
+
+@app.post("/api/groups/batch-update-category")
+def batch_update_category(req: BatchCategoryRequest, user: dict = Depends(get_current_user)):
+    from db import engine, GroupDb, Session, select
+    with Session(engine) as session:
+        for id_ in req.ids:
+            if user["company"] == "admin":
+                db_group = session.exec(select(GroupDb).where(GroupDb.id == str(id_))).first()
+            else:
+                db_group = session.get(GroupDb, (str(id_), user["company"]))
+            if db_group:
+                db_group.category = req.category
+                db_group.updated_by = user["username"]
+                session.add(db_group)
+        session.commit()
+    return {"status": "success", "groups": load_groups(user["company"])}
+
+@app.post("/api/groups/update-price")
+def update_group_price(req: GroupPriceUpdateRequest, user: dict = Depends(get_current_user)):
+    from db import engine, GroupDb, Session, select
+    with Session(engine) as session:
+        if user["company"] == "admin":
+            db_group = session.exec(select(GroupDb).where(GroupDb.id == str(req.id))).first()
+        else:
+            db_group = session.get(GroupDb, (str(req.id), user["company"]))
+        if db_group:
+            db_group.price = req.price
+            db_group.updated_by = user["username"]
+            session.add(db_group)
+            session.commit()
+    return {"status": "success", "groups": load_groups(user["company"])}
+
+@app.post("/api/groups/update-category")
+def update_group_category(req: GroupCategoryUpdateRequest, user: dict = Depends(get_current_user)):
+    from db import engine, GroupDb, Session, select
+    with Session(engine) as session:
+        if user["company"] == "admin":
+            db_group = session.exec(select(GroupDb).where(GroupDb.id == str(req.id))).first()
+        else:
+            db_group = session.get(GroupDb, (str(req.id), user["company"]))
+        if db_group:
+            db_group.category = req.category
+            db_group.updated_by = user["username"]
+            session.add(db_group)
+            session.commit()
+    return {"status": "success", "groups": load_groups(user["company"])}
+
+@app.get("/api/group-categories", response_model=List[GroupCategoryModel])
+def get_group_categories(user: dict = Depends(get_current_user)):
+    from db import engine, GroupCategoryDb, Session, select
+    with Session(engine) as session:
+        if user["company"] == "admin":
+            stmt = select(GroupCategoryDb)
+        else:
+            stmt = select(GroupCategoryDb).where((GroupCategoryDb.company == user["company"]) | (GroupCategoryDb.company == "admin"))
+        results = session.exec(stmt).all()
+        return [GroupCategoryModel(id=c.id, name=c.name, company=c.company) for c in results]
+
+@app.post("/api/group-categories")
+def add_group_category(req: AddCategoryRequest, user: dict = Depends(get_current_user)):
+    from db import engine, GroupCategoryDb, Session, select
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="类型名称不能为空")
+    with Session(engine) as session:
+        existing = session.exec(select(GroupCategoryDb).where(GroupCategoryDb.name == name)).first()
+        if existing:
+            raise HTTPException(status_code=400, detail=f"类型 '{name}' 已存在")
+        new_cat = GroupCategoryDb(name=name, company=user["company"])
+        session.add(new_cat)
+        session.commit()
+    return {"status": "success"}
+
+@app.delete("/api/group-categories/{name}")
+def delete_group_category(name: str, user: dict = Depends(get_current_user)):
+    from db import engine, GroupCategoryDb, GroupDb, Session, select
+    with Session(engine) as session:
+        stmt = select(GroupCategoryDb).where(GroupCategoryDb.name == name)
+        cat = session.exec(stmt).first()
+        if not cat:
+            raise HTTPException(status_code=404, detail="未找到该类型")
+        
+        # Check if in use by groups
+        group_using = session.exec(select(GroupDb).where(GroupDb.category == name)).first()
+        if group_using:
+            raise HTTPException(status_code=400, detail=f"类型 '{name}' 正在被群组使用，请先修改这些群组的类型后再删除。")
+            
+        session.delete(cat)
+        session.commit()
+    return {"status": "success"}
+
+@app.post("/api/group-categories/rename")
+def rename_group_category(req: RenameCategoryRequest, user: dict = Depends(get_current_user)):
+    from db import engine, GroupCategoryDb, GroupDb, Session, select
+    old_name = req.old_name.strip()
+    new_name = req.new_name.strip()
+    if not old_name or not new_name:
+        raise HTTPException(status_code=400, detail="名称不能为空")
+    if old_name == new_name:
+        return {"status": "success"}
+    with Session(engine) as session:
+        cat = session.exec(select(GroupCategoryDb).where(GroupCategoryDb.name == old_name)).first()
+        if not cat:
+            raise HTTPException(status_code=404, detail="未找到该类型")
+        
+        existing = session.exec(select(GroupCategoryDb).where(GroupCategoryDb.name == new_name)).first()
+        if existing:
+            raise HTTPException(status_code=400, detail=f"类型 '{new_name}' 已存在")
+            
+        cat.name = new_name
+        session.add(cat)
+        
+        # Update all groups using this category
+        groups_to_update = session.exec(select(GroupDb).where(GroupDb.category == old_name)).all()
+        for g in groups_to_update:
+            g.category = new_name
+            session.add(g)
+            
+        session.commit()
+    return {"status": "success"}
+
+
+@app.post("/api/groups/sync")
+async def sync_groups_from_folders(user: dict = Depends(get_current_user)):
+    """
+    Queries Telegram API for all logged-in accounts, finds the groups in their configured
+    folders, and synchronizes them directly into the groups_library table.
+    """
+    from db import engine, AccountDb, GroupDb, Session, select
+    from sync_folder_groups import collect_records
+
+    # 1. Get all accounts from database for this company
+    with Session(engine) as session:
+        stmt = query_allowed_accounts(session, user)
+        db_accounts = filter_executable_accounts_for_task(session.exec(stmt).all())
+
+    if not db_accounts:
+        raise HTTPException(status_code=400, detail="没有绑定任何账号")
+    synced_count = 0
+    added_count = 0
+    skipped_count = 0
+    errors = []
+    logs = []
+    logs.append("开始同步聊天文件夹中的群组。")
+
+    for acc in db_accounts:
+        account_id = acc.id
+        folder_name = acc.folder_name or ""
+        account_label = acc.account_name or account_id
+        logs.append(f"账号 {account_label} 开始执行，目标文件夹：{folder_name or '未配置'}。")
+
+        try:
+            client = await get_client(account_id)
+            if not await client.is_user_authorized():
+                logs.append(f"账号 {account_label} 未授权登录，跳过。")
+                continue
+            # Fetch folders
+            result = await client(functions.messages.GetDialogFiltersRequest())
+            raw_filters = getattr(result, "filters", result)
+            # Find the matching folder
+            folder = next((item for item in raw_filters if isinstance(item, (types.DialogFilter, types.DialogFilterChatlist)) and normalize_title(item.title) == folder_name), None)
+
+            if not folder:
+                errors.append(f"账号 {acc.account_name}: 未找到文件夹 '{folder_name}'")
+                logs.append(f"账号 {account_label} 未找到文件夹 {folder_name}，跳过。")
+                continue
+
+            # Collect records
+            include_types = set([x.strip() for x in acc.include_types.split(",") if x.strip()])
+            if not include_types:
+                include_types = {"group", "supergroup"}
+            records = await collect_records(client, folder, include_types)
+            logs.append(f"账号 {account_label} 读取到 {len(records)} 个群组，开始写入群组库。")
+            # Upsert into groups_library
+            with Session(engine) as session:
+                for record in records:
+                    group_id = str(record.chat_id)
+                    db_group = session.get(GroupDb, (group_id, user["company"]))
+                    if db_group:
+                        db_group.title = record.title
+                        db_group.username = record.username or ""
+                        db_group.type = record.type
+                        db_group.updated_by = user["username"]
+                        session.add(db_group)
+                        skipped_count += 1
+                        logs.append(f"账号 {account_label} 更新已有群组：{record.title} ({record.username or group_id})。")
+                    else:
+                        new_group = GroupDb(
+                            id=group_id,
+                            company=user["company"],
+                            title=record.title,
+                            username=record.username or "",
+                            type=record.type,
+                            enabled=True,
+                            memberCount=0,
+                            category=record.folder or "中文广告",
+                            created_by=user["username"],
+                            updated_by=user["username"]
+                        )
+                        session.add(new_group)
+                        added_count += 1
+                        logs.append(f"账号 {account_label} 新增群组：{record.title} ({record.username or group_id})。")
+                session.commit()
+            synced_count += len(records)
+            logs.append(f"账号 {account_label} 文件夹同步完成：读取 {len(records)} 个群组。")
+        except Exception as e:
+            errors.append(f"账号 {acc.account_name} 同步失败: {str(e)}")
+            logs.append(f"账号 {account_label} 同步失败：{str(e)}。")
+
+    logs.append(f"文件夹同步结束：读取 {synced_count} 个，新增 {added_count} 个，更新已有 {skipped_count} 个。")
+    return {
+        "status": "success",
+        "synced_count": synced_count,
+        "added_count": added_count,
+        "skipped_count": skipped_count,
+        "errors": errors,
+        "logs": logs,
+        "groups": load_groups(user["company"])
+    }
+@app.post("/api/groups/sync-status")
+async def sync_groups_status(user: dict = Depends(get_current_user)):
+    """
+    Iterates through all groups in the database and updates their status
+    (title, username, memberCount, enabled) using an active Telegram client.
+    """
+    from db import engine, GroupDb, AccountDb, Session, select
+    import asyncio
+    import random
+    logs = []
+    logs.append("开始从 Telegram 更新群组状态与成员数。")
+    
+    # 0. 重置 group_categories 表，确保系统内置分类为这四个新分类
+    try:
+        from sqlmodel import text
+        with Session(engine) as session:
+            session.exec(text("DELETE FROM group_categories"))
+            session.exec(text("INSERT INTO group_categories (name, company) VALUES ('中文长', 'rosepay')"))
+            session.exec(text("INSERT INTO group_categories (name, company) VALUES ('中文短', 'rosepay')"))
+            session.exec(text("INSERT INTO group_categories (name, company) VALUES ('英文长', 'rosepay')"))
+            session.exec(text("INSERT INTO group_categories (name, company) VALUES ('英文短', 'rosepay')"))
+            session.commit()
+            logs.append("已重置系统群组分类为：'中文长', '中文短', '英文长', '英文短'。")
+    except Exception as reset_err:
+        print(f"Failed to reset group categories: {reset_err}")
+        logs.append(f"重置系统内置分类失败 (将继续同步): {reset_err}")
+    
+    # Get all account IDs of this user's company
+    with Session(engine) as session:
+        stmt = query_allowed_accounts(session, user)
+        allowed_account_ids = {a.id for a in filter_executable_accounts_for_task(session.exec(stmt).all())}
+        account_names = {a.id: (a.account_name or a.id) for a in session.exec(stmt).all()}
+
+    # 1. Get first active authorized client for the company
+    client = None
+    selected_account_id = None
+    for account_id, c in list(active_clients.items()):
+        if account_id in allowed_account_ids and c.is_connected() and await c.is_user_authorized():
+            client = c
+            selected_account_id = account_id
+            break
+            
+    if not client:
+        # Check list of accounts to see if any can be connected and verified
+        from account_manager import list_accounts
+        accounts = list_accounts()
+        for path in accounts:
+            account_id = path.stem
+            if account_id not in allowed_account_ids:
+                continue
+            try:
+                c = await get_client(account_id)
+                if c.is_connected() and await c.is_user_authorized():
+                    client = c
+                    selected_account_id = account_id
+                    break
+            except Exception:
+                continue
+
+    if not client:
+        raise HTTPException(
+            status_code=400, 
+            detail="检测到未登录任何电报账号。请先到“账号登录”页面成功登录一个账号后重试。"
+        )
+    logs.append(f"执行账号：{account_names.get(selected_account_id or '', selected_account_id or '未知账号')}，开始建立群组缓存。")
+
+    # 2. Load all groups for the company from DB
+    with Session(engine) as session:
+        if user["username"] in ("eason", "admin") or user["company"] == "admin":
+            groups = session.exec(select(GroupDb)).all()
+        else:
+            groups = session.exec(select(GroupDb).where(GroupDb.company == user["company"])).all()
+        
+    if not groups:
+        return {"status": "success", "message": "群组列表为空，无需同步", "groups": [], "logs": logs}
+
+    # 3. Fetch all dialogs to build a local entity cache (fast lookups)
+    entities_map = {}
+    try:
+        async for dialog in client.iter_dialogs():
+            entity = dialog.entity
+            entities_map[str(entity.id)] = entity
+            if getattr(entity, "username", None):
+                entities_map[entity.username.lower()] = entity
+        logs.append(f"执行账号缓存建立完成：读取到 {len(entities_map)} 个可匹配实体。")
+    except Exception as e:
+        print(f"Failed to fetch dialogs for cache: {e}")
+        logs.append(f"执行账号建立实体缓存失败：{e}，后续将逐个解析。")
+
+    updated_count = 0
+    disabled_count = 0
+    invalid_groups = []
+    total_groups = len(groups)
+    
+    # We will update groups one by one
+    with Session(engine) as session:
+        for index, group in enumerate(groups, start=1):
+            entity = None
+            is_valid = True
+            original_title = group.title
+            logs.append(f"[{index}/{total_groups}] 开始检测群组：{group.title or group.id}，执行账号：{account_names.get(selected_account_id or '', selected_account_id or '未知账号')}。")
+            
+            # Check if this is a private invite link group
+            if group.id and group.id.startswith("invite_"):
+                invite_hash = group.id.replace("invite_", "")
+                try:
+                    invite = await client(functions.messages.CheckChatInviteRequest(hash=invite_hash))
+                    if isinstance(invite, types.ChatInviteAlready):
+                        entity = invite.chat
+                    else:
+                        # ChatInvite - valid but not joined yet
+                        group.title = invite.title
+                        group.memberCount = invite.participants_count
+                        group.type = "channel" if invite.broadcast else "group"
+                        scores = apply_group_library_scores(group, is_valid=True)
+                        session.add(group)
+                        updated_count += 1
+                        logs.append(f"[{index}/{total_groups}] 私密邀请群有效：{group.title}，成员数 {group.memberCount or 0}，基础评分 {scores['quality_score']}。")
+                        continue
+                except Exception as invite_err:
+                    print(f"Check invite link failed for {group.id}: {invite_err}")
+                    logs.append(f"[{index}/{total_groups}] 私密邀请群检测失败：{group.title or group.id}，原因：{invite_err}。")
+                    is_valid = False
+
+            # Try to find in cache first
+            if is_valid and not entity:
+                entity = entities_map.get(group.id)
+                if not entity and group.username:
+                    entity = entities_map.get(group.username.lower())
+                    
+            # If not in cache, try to resolve via API
+            if is_valid and not entity:
+                try:
+                    if group.username:
+                        entity = await client.get_entity(group.username)
+                    else:
+                        # Try to resolve by ID
+                        clean_id = None
+                        try:
+                            clean_id = int(group.id)
+                        except ValueError:
+                            pass
+                        
+                        if clean_id is not None:
+                            try:
+                                # Try channel/supergroup peer first, then chat peer
+                                if group.type in ("channel", "supergroup"):
+                                    entity = await client.get_entity(types.PeerChannel(clean_id))
+                                else:
+                                    entity = await client.get_entity(types.PeerChat(clean_id))
+                            except Exception:
+                                # Fallback to direct integer if peer types fail
+                                try:
+                                    entity = await client.get_entity(clean_id)
+                                except Exception:
+                                    entity = None
+                        else:
+                            # Fallback to resolving group.id directly
+                            try:
+                                entity = await client.get_entity(group.id)
+                            except Exception:
+                                entity = None
+                except Exception as get_err:
+                    print(f"Could not resolve group {group.id} ({group.title}): {get_err}")
+                    logs.append(f"[{index}/{total_groups}] 解析群组失败：{group.title or group.id}，原因：{get_err}。")
+                    is_valid = False
+
+            if is_valid and entity:
+                # We found the entity! Update properties
+                try:
+                    group.title = getattr(entity, "title", group.title) or group.title
+                    group.username = getattr(entity, "username", group.username) or ""
+                    group.type = "channel" if getattr(entity, "broadcast", False) else "group"
+                    if getattr(entity, "megagroup", False):
+                        group.type = "supergroup"
+                    participants_count = getattr(entity, "participants_count", None)
+                    if participants_count is not None:
+                        group.memberCount = participants_count
+                    
+                    # === 核心增加：跑消息分析，将广告分类划归为 "中文长", "中文短", "英文长", "英文短" ===
+                    try:
+                        import re
+                        input_peer = await client.get_input_entity(entity)
+                        msgs = await client.get_messages(input_peer, limit=10)
+                        
+                        # 1. 判定字数限制
+                        msg_lengths = [len(m.message) for m in msgs if m.message]
+                        is_short_ad = False
+                        if msg_lengths:
+                            max_len = max(msg_lengths)
+                            if max_len < 200:
+                                is_short_ad = True
+                                
+                        # 2. 判定语言 (中英文)，综合考虑群名和活跃发言
+                        has_chinese_name = False
+                        g_title = getattr(entity, "title", "") or ""
+                        if g_title:
+                            has_chinese_name = bool(re.search(r"[\u4e00-\u9fa5]", g_title)) or "🇨🇳" in g_title
+                            
+                        text_messages = [m.message for m in msgs if m.message]
+                        has_messages = len(text_messages) > 0
+                        combined_text = "".join(text_messages)
+                        has_chinese_messages = bool(re.search(r"[\u4e00-\u9fa5]", combined_text))
+                        
+                        is_chinese = False
+                        if has_messages:
+                            if has_chinese_messages:
+                                is_chinese = True
+                        else:
+                            if has_chinese_name:
+                                is_chinese = True
+                                
+                        # 3. 决定新的 category
+                        if is_chinese:
+                            if is_short_ad:
+                                new_cat = "中文短"
+                            else:
+                                new_cat = "中文长"
+                        else:
+                            if is_short_ad:
+                                new_cat = "英文短"
+                            else:
+                                new_cat = "英文长"
+                                
+                        group.category = new_cat
+                        logs.append(f"[{index}/{total_groups}] 群组分类重构：'{group.title}' -> 判定为 '{new_cat}' (字数: {'短' if is_short_ad else '长'}, 语言: {'中文' if is_chinese else '英文'})")
+                    except Exception as cat_err:
+                        # 优雅退化
+                        g_title = getattr(entity, "title", "") or ""
+                        has_chinese_name = bool(re.search(r"[\u4e00-\u9fa5]", g_title)) or "🇨🇳" in g_title
+                        new_cat = "中文长" if has_chinese_name else "英文长"
+                        group.category = new_cat
+                        logs.append(f"[{index}/{total_groups}] 拉取消息判定失败，退回名字判定：'{group.title}' -> 判定为 '{new_cat}'，原因：{cat_err}")
+                        
+                    scores = apply_group_library_scores(group, is_valid=True)
+                    session.add(group)
+                    updated_count += 1
+                    logs.append(f"[{index}/{total_groups}] 检测成功并重分类：{original_title} -> {group.title}，用户名 @{group.username or '-'}，类型 {group.type}，成员数 {group.memberCount or 0}，基础评分 {scores['quality_score']}。")
+                except Exception as update_err:
+                    print(f"Error updating properties for {group.id}: {update_err}")
+                    logs.append(f"[{index}/{total_groups}] 更新群组属性失败：{group.title or group.id}，原因：{update_err}。")
+                    is_valid = False
+            elif not entity and (not group.id or not group.id.startswith("invite_")):
+                is_valid = False
+
+            if not is_valid:
+                # Entity not found and cannot be resolved -> Directly delete from DB (遇到失效群组直接删掉)
+                invalid_groups.append({
+                    "id": group.id,
+                    "title": group.title,
+                    "username": group.username
+                })
+                session.delete(group)
+                disabled_count += 1
+                logs.append(f"[{index}/{total_groups}] 检测到群组已失效，已从群组库中物理删除：{group.title or group.id}。")
+
+            if index < total_groups:
+                wait_seconds = random.randint(0, 1)
+                logs.append(f"[{index}/{total_groups}] 等待 {wait_seconds} 秒后继续检测下一个群组。")
+                if wait_seconds:
+                    await asyncio.sleep(wait_seconds)
+                    
+        session.commit()
+
+    logs.append(f"状态同步结束：检测 {total_groups} 个群组，更新 {updated_count} 个，本次禁用 {disabled_count} 个，失效 {len(invalid_groups)} 个。")
+    return {
+        "status": "success",
+        "updated_count": updated_count,
+        "disabled_count": disabled_count,
+        "invalid_groups": invalid_groups,
+        "logs": logs,
+        "groups": load_groups(user["company"])
+    }
+
+async def analyze_group_category_with_ai(title: str, description: str, recent_msgs: list, user_permissions_str: str) -> dict:
+    """
+    使用系统配置中的 DeepSeek 或 Gemini API，对群组的语言、长短、活跃度、有效性及风控程度进行智能分类和诊断评估。
+    结合了最近 10 条消息的时间跨度和发送间隔作为物理指标。
+    """
+    import requests
+    import json
+    import re
+    from datetime import datetime, timezone
+    
+    # 动态获取系统中的 API 密钥
+    deepseek_api_key = get_deepseek_api_key()
+    gemini_api_key = get_gemini_api_key()
+    
+    # 提取纯文本列表
+    messages_text = [m.text for m in recent_msgs if m.text]
+    
+    # 计算消息时间差与活跃指标
+    time_metrics_str = "【近期消息时间分析】: 暂无消息时间指标"
+    avg_interval_mins = 9999.0
+    latest_age_hours = 9999.0
+    
+    if len(recent_msgs) >= 2:
+        first_date = recent_msgs[0].date
+        last_date = recent_msgs[-1].date
+        
+        total_span_secs = (first_date - last_date).total_seconds()
+        avg_interval_mins = (total_span_secs / (len(recent_msgs) - 1)) / 60.0
+        
+        now_utc = datetime.now(timezone.utc)
+        latest_age_hours = (now_utc - first_date).total_seconds() / 3600.0
+        
+        time_metrics_str = f"【近期消息时间分析】:\n"
+        time_metrics_str += f"- 最新一条消息发送时间: {first_date.strftime('%Y-%m-%d %H:%M:%S')} UTC (距今约 {latest_age_hours:.2f} 小时)\n"
+        time_metrics_str += f"- 最近 {len(recent_msgs)} 条消息时间总跨度: {total_span_secs/3600.0:.2f} 小时\n"
+        time_metrics_str += f"- 消息平均发送间隔: {avg_interval_mins:.2f} 分钟/条"
+    elif len(recent_msgs) == 1:
+        first_date = recent_msgs[0].date
+        now_utc = datetime.now(timezone.utc)
+        latest_age_hours = (now_utc - first_date).total_seconds() / 3600.0
+        time_metrics_str = f"【近期消息时间分析】:\n- 仅有 1 条消息，发送时间: {first_date.strftime('%Y-%m-%d %H:%M:%S')} UTC (距今约 {latest_age_hours:.2f} 小时)"
+
+    # 格式化消息样本
+    formatted_msgs = []
+    for idx, msg in enumerate(messages_text, 1):
+        clean_msg = str(msg).replace("\n", " ").strip()[:100]
+        formatted_msgs.append(f"{idx}. {clean_msg}")
+    messages_str = "\n".join(formatted_msgs) if formatted_msgs else "(暂无近期文字消息)"
+    
+    prompt = f"""
+你是一个专业的电报群发拓客与风控分析 AI。请根据以下电报群组的元数据、近期消息、发言权限及物理时间分析，进行全方位智能判定。
+
+群组基本信息：
+- 标题: {title}
+- 描述/简介: {description}
+- 当前账号在群内的发言权限: {user_permissions_str}
+
+消息样本物理时间指标：
+{time_metrics_str}
+
+最新 10 条消息样本：
+{messages_str}
+
+【判定规则（极为重要，请严格遵守）】
+1. 语言与类型判定 (category)：
+   - 必须是以下四种分类之一：["中文长", "中文短", "英文长", "英文短"]。
+   - 语言标准：如果群内大部分消息是中文，则为中文；如果是英文、印地语、或者其他拼音文字，则为英文。
+   - 长短标准：
+     - 若群员主要发布排版工整、大段文字、多段业务详情/通道介绍的复杂文案（字数多，超过 150 字符），判定为 "长"。
+     - 若群员多发布零散交流、极简短语、单句需求（如 "need yes bank", "来卡", "15s"），判定为 "短"。
+     - 如果群内几乎没有消息或以简短消息为主，优先归为 "短"。
+2. 活跃度判定 (is_active)：
+   - 必须参考“消息样本物理时间指标”：
+     - 如果最新消息距今小于 24 小时，且最近 10 条消息的平均发送间隔在数小时内，判定为 true（活跃群）。
+     - 如果最新消息距今超过 48 小时，或者 10 条消息的时间跨度跨越了数天甚至数周，判定为 false（死群/不活跃）。
+3. 有效性判定 (is_valid)：
+   - 若是活跃的跑分群、卡商群、OTC承兑群、博彩推广群，即为 true（对我们营销有价值）；若全是无价值乱码、死群、完全无互动的死号灌水，为 false。
+4. 易封禁风控判定 (is_highly_moderated)：
+   - 若群内有防垃圾 Bot（如 GHClone2Bot, RemoveHyperlinkBot, fangzhangBot）频繁发出警告、删除提示，或者当前账号在群内“已被禁言”，为 true；否则为 false。
+5. 理由 (reason)：
+   - 用一句简短的中文（35字以内）说明判定依据（必须包含时间间隔及分类原因，如：“英文短群，最新消息1小时前，平均15分钟一条，极活跃”）。
+
+你必须严格且仅返回以下 JSON 格式（不要包含 markdown ``` 代码块包装，直接返回 JSON 对象）：
+{{
+  "category": "中文长" | "中文短" | "英文长" | "英文短",
+  "is_active": true | false,
+  "is_valid": true | false,
+  "is_highly_moderated": true | false,
+  "reason": "判定依据简述"
+}}
+"""
+
+    # 1. 优先使用 DeepSeek
+    if deepseek_api_key:
+        try:
+            url = "https://api.deepseek.com/chat/completions"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {deepseek_api_key}"
+            }
+            body = {
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant that outputs JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                "response_format": {
+                    "type": "json_object"
+                }
+            }
+            response = requests.post(url, json=body, headers=headers, timeout=15)
+            if response.status_code == 200:
+                res_json = response.json()
+                text = res_json["choices"][0]["message"]["content"].strip()
+                return json.loads(text)
+        except Exception as e:
+            print(f"[AI Sync] DeepSeek analysis failed: {e}")
+
+    # 2. 兜底使用 Gemini
+    if gemini_api_key:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_api_key}"
+            body = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "responseMimeType": "application/json"
+                }
+            }
+            response = requests.post(url, json=body, timeout=15)
+            if response.status_code == 200:
+                res_data = response.json()
+                text = res_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                return json.loads(text)
+        except Exception as e:
+            print(f"[AI Sync] Gemini analysis failed: {e}")
+
+    # 3. 如果 API Key 均不可用，进行本地高精度正则兜底
+    # 统计汉字和英文字符比例
+    content_sample = (title + " " + " ".join(messages_text)).strip()
+    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', content_sample))
+    english_words = len(re.findall(r'[a-zA-Z]+', content_sample))
+    
+    lang = "中文" if chinese_chars * 2 > english_words else "英文"
+    
+    # 判定长短：是否有消息大于 120 字符
+    has_long = any(len(str(m)) > 120 for m in messages_text)
+    length = "长" if has_long else "短"
+    
+    is_active = len(messages_text) >= 3
+    is_valid = len(messages_text) > 0
+    
+    return {
+        "category": f"{lang}{length}",
+        "is_active": is_active,
+        "is_valid": is_valid,
+        "is_highly_moderated": False,
+        "reason": "本地正则兜底 analysis"
+    }
+
+
+@app.get("/api/groups/sync-stream")
+async def stream_groups_sync(token: Optional[str] = None):
+    """Foreground group sync with realtime SSE logs for the UI execution modal."""
+    user = get_user_from_stream_token(token)
+
+    async def event_generator():
+        from db import engine, GroupDb, AccountDb, Session, select
+        from sync_folder_groups import collect_records
+        import asyncio
+        import random
+
+        sync_data = {
+            "status": "success",
+            "synced_count": 0,
+            "added_count": 0,
+            "skipped_count": 0,
+            "errors": [],
+        }
+        status_data = {
+            "status": "success",
+            "updated_count": 0,
+            "disabled_count": 0,
+            "invalid_groups": [],
+        }
+
+        def log(message: str) -> str:
+            return format_sse("log", {"message": message})
+
+        try:
+            yield log("已跳过账号聊天文件夹同步，直接对系统后台维护的群组执行检测与 AI 分类诊断。")
+            yield log("开始从 Telegram 更新群组状态、成员数与基础评分。")
+
+            with Session(engine) as session:
+                stmt = query_allowed_accounts(session, user)
+                allowed_accounts = filter_executable_accounts_for_task(session.exec(stmt).all())
+                allowed_account_ids = {a.id for a in allowed_accounts}
+                account_names = {a.id: (a.account_name or a.id) for a in allowed_accounts}
+
+            client = None
+            selected_account_id = None
+            for account_id, c in list(active_clients.items()):
+                if account_id in allowed_account_ids and c.is_connected() and await c.is_user_authorized():
+                    client = c
+                    selected_account_id = account_id
+                    break
+
+            if not client:
+                from account_manager import list_accounts
+                accounts = list_accounts()
+                for path in accounts:
+                    account_id = path.stem
+                    if account_id not in allowed_account_ids:
+                        continue
+                    try:
+                        c = await get_client(account_id)
+                        if c.is_connected() and await c.is_user_authorized():
+                            client = c
+                            selected_account_id = account_id
+                            break
+                    except Exception:
+                        continue
+
+            if not client:
+                yield format_sse("sync_error", {"message": "检测到未登录任何电报账号。请先到“账号登录”页面成功登录一个账号后重试。"})
+                return
+
+            selected_account_label = account_names.get(selected_account_id or "", selected_account_id or "未知账号")
+            yield log(f"执行账号：{selected_account_label}，开始建立群组缓存。")
+
+            with Session(engine) as session:
+                if user["username"] in ("eason", "admin") or user["company"] == "admin":
+                    groups = session.exec(select(GroupDb)).all()
+                else:
+                    groups = session.exec(select(GroupDb).where(GroupDb.company == user["company"])).all()
+
+            if not groups:
+                status_data["groups"] = []
+                yield log("群组列表为空，无需同步。")
+                yield format_sse("done", {"syncData": sync_data, "statusData": status_data, "groups": []})
+                return
+
+            entities_map = {}
+            try:
+                async for dialog in client.iter_dialogs():
+                    entity = dialog.entity
+                    entities_map[str(entity.id)] = entity
+                    if getattr(entity, "username", None):
+                        entities_map[entity.username.lower()] = entity
+                yield log(f"执行账号缓存建立完成：读取到 {len(entities_map)} 个可匹配实体。")
+            except Exception as e:
+                yield log(f"执行账号建立实体缓存失败：{e}，后续将逐个解析。")
+
+            total_groups = len(groups)
+            with Session(engine) as session:
+                for index, group in enumerate(groups, start=1):
+                    entity = None
+                    is_valid = True
+                    original_title = group.title
+                    yield log(f"[{index}/{total_groups}] 开始检测群组：{group.title or group.id}，执行账号：{selected_account_label}。")
+
+                    if group.id and group.id.startswith("invite_"):
+                        invite_hash = group.id.replace("invite_", "")
+                        try:
+                            invite = await client(functions.messages.CheckChatInviteRequest(hash=invite_hash))
+                            if isinstance(invite, types.ChatInviteAlready):
+                                entity = invite.chat
+                            else:
+                                group.title = invite.title
+                                group.memberCount = invite.participants_count
+                                group.type = "channel" if invite.broadcast else "group"
+                                scores = apply_group_library_scores(group, is_valid=True)
+                                session.add(group)
+                                status_data["updated_count"] += 1
+                                yield log(f"[{index}/{total_groups}] 私密邀请群有效：{group.title}，成员数 {group.memberCount or 0}，基础评分 {scores['quality_score']}。")
+                                if index < total_groups:
+                                    wait_seconds = random.randint(0, 1)
+                                    yield log(f"[{index}/{total_groups}] 等待 {wait_seconds} 秒后继续检测下一个群组。")
+                                    if wait_seconds:
+                                        await asyncio.sleep(wait_seconds)
+                                continue
+                        except Exception as invite_err:
+                            yield log(f"[{index}/{total_groups}] 私密邀请群检测失败：{group.title or group.id}，原因：{invite_err}。")
+                            is_valid = False
+
+                    if is_valid and not entity:
+                        entity = entities_map.get(group.id)
+                        if not entity and group.username:
+                            entity = entities_map.get(group.username.lower())
+
+                    if is_valid and not entity:
+                        try:
+                            if group.username:
+                                entity = await client.get_entity(group.username)
+                            else:
+                                clean_id = None
+                                try:
+                                    clean_id = int(group.id)
+                                except ValueError:
+                                    pass
+
+                                if clean_id is not None:
+                                    try:
+                                        if group.type in ("channel", "supergroup"):
+                                            entity = await client.get_entity(types.PeerChannel(clean_id))
+                                        else:
+                                            entity = await client.get_entity(types.PeerChat(clean_id))
+                                    except Exception:
+                                        try:
+                                            entity = await client.get_entity(clean_id)
+                                        except Exception:
+                                            entity = None
+                                else:
+                                    try:
+                                        entity = await client.get_entity(group.id)
+                                    except Exception:
+                                        entity = None
+                        except Exception as get_err:
+                            yield log(f"[{index}/{total_groups}] 解析群组失败：{group.title or group.id}，原因：{get_err}。")
+                            is_valid = False
+
+                    if is_valid and entity:
+                        try:
+                            group.title = getattr(entity, "title", group.title) or group.title
+                            group.username = getattr(entity, "username", group.username) or ""
+                            group.type = "channel" if getattr(entity, "broadcast", False) else "group"
+                            if getattr(entity, "megagroup", False):
+                                group.type = "supergroup"
+                            participants_count = getattr(entity, "participants_count", None)
+                            if participants_count is not None:
+                                group.memberCount = participants_count
+                            # 0. 过滤并忽略个人账号 (User)，防止爬取个人私聊
+                            from telethon.tl.types import User
+                            if isinstance(entity, User):
+                                yield log(f"[{index}/{total_groups}] 忽略个人账号：{original_title} (ID: {group.id} 为个人私聊，非群组/频道)。")
+                                group.enabled = False
+                                apply_group_library_scores(group, is_valid=False)
+                                session.add(group)
+                                session.commit()
+                                continue
+
+                            # 1. 尝试获取最近 10 条消息作为 AI 分析样本
+                            recent_msgs = []
+                            try:
+                                recent_msgs = await client.get_messages(entity, limit=10)
+                            except Exception as msg_err:
+                                print(f"[AI Sync] 获取群消息失败: {msg_err}")
+
+                            # 2. 获取当前账号在该群的发言权限状态
+                            perms_str = "正常"
+                            try:
+                                perms = await client.get_permissions(entity, 'me')
+                                if perms.has_left:
+                                    perms_str = "账号已不在该群内 (未加入/被踢出)"
+                                elif not perms.can_send_messages:
+                                    perms_str = "账号已被该群禁言"
+                            except Exception as perm_err:
+                                if "UserNotParticipant" in type(perm_err).__name__:
+                                    perms_str = "账号未加入该群 (非成员)"
+                                else:
+                                    perms_str = f"获取权限异常: {perm_err}"
+
+                            # 3. 调用 AI 智能进行分类诊断与风控评估
+                            yield log(f"[{index}/{total_groups}] 正在请 AI 智能评估群组「{original_title}」的历史消息与风控...")
+                            ai_res = await analyze_group_category_with_ai(group.title, getattr(entity, "about", "") or "", recent_msgs, perms_str)
+                            
+                            # 4. 应用 AI 评估结论更新群组属性
+                            if ai_res:
+                                old_cat = group.category
+                                group.category = ai_res.get("category", group.category)
+                                
+                                # 根据 AI 的有效性判定决定是否启用
+                                is_group_valid = bool(ai_res.get("is_valid", True))
+                                group.enabled = is_group_valid
+                                
+                                # 写入 AI 的判定日志到弹窗流中
+                                yield log(f"[{index}/{total_groups}] AI 评估 ➔ 类型: {group.category} | 活跃: {ai_res.get('is_active')} | 有效: {group.enabled} | 依据: {ai_res.get('reason')}")
+                                if ai_res.get("is_highly_moderated"):
+                                    yield log(f"  ⚠️ 警告：该群被检测为高风控群组，可能存在严密风控 Bot 或处于禁言状态！")
+                            else:
+                                yield log(f"[{index}/{total_groups}] AI 评估失败，使用本地兜底算法。")
+
+                            scores = apply_group_library_scores(group, is_valid=group.enabled)
+                            session.add(group)
+                            status_data["updated_count"] += 1
+                            yield log(f"[{index}/{total_groups}] 检测成功：{original_title} -> {group.title}，用户名 @{group.username or '-'}，类型 {group.type}，成员数 {group.memberCount or 0}，最终分类 【{group.category}】，基础评分 {scores['quality_score']}。")
+                        except Exception as update_err:
+                            yield log(f"[{index}/{total_groups}] 更新群组属性失败：{group.title or group.id}，原因：{update_err}。")
+                            is_valid = False
+                    elif not entity and (not group.id or not group.id.startswith("invite_")):
+                        is_valid = False
+
+                    if not is_valid:
+                        status_data["invalid_groups"].append({
+                            "id": group.id,
+                            "title": group.title,
+                            "username": group.username
+                        })
+                        if group.enabled:
+                            group.enabled = False
+                            status_data["disabled_count"] += 1
+                        apply_group_library_scores(group, is_valid=False)
+                        session.add(group)
+                        yield log(f"[{index}/{total_groups}] 检测失败并标记禁用：{group.title or group.id}，评分 0 / 疑似失效。")
+
+                    session.commit()
+
+                    if index < total_groups:
+                        wait_seconds = random.randint(0, 1)
+                        yield log(f"[{index}/{total_groups}] 等待 {wait_seconds} 秒后继续检测下一个群组。")
+                        if wait_seconds:
+                            await asyncio.sleep(wait_seconds)
+
+            status_data["groups"] = load_groups(user["company"])
+            yield log(f"状态同步结束：检测 {total_groups} 个群组，更新 {status_data['updated_count']} 个，本次禁用 {status_data['disabled_count']} 个，失效 {len(status_data['invalid_groups'])} 个。")
+            yield format_sse("done", {
+                "syncData": sync_data,
+                "statusData": status_data,
+                "groups": status_data["groups"],
+            })
+        except Exception as e:
+            yield format_sse("sync_error", {"message": f"同步执行异常：{type(e).__name__}: {e}"})
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+def map_telegram_error(e: Exception, default_msg: str) -> str:
+    err_str = str(e)
+    if "UsernameNotOccupied" in err_str or "No user has" in err_str:
+        return "该 Telegram 用户名/群组/频道链接不存在或已失效"
+    if "ChannelPrivate" in err_str:
+        return "该频道/群组为私有且当前账号未加入"
+    if "InviteHashExpired" in err_str or "InviteHashExpiredError" in err_str:
+        return "该私有邀请链接已过期或失效"
+    if "InviteHashInvalid" in err_str or "InviteHashInvalidError" in err_str:
+        return "私有邀请链接无效，哈希校验不通过"
+    if "ChatInvalid" in err_str or "ChatIdInvalid" in err_str:
+        return "无效的群组/频道 ID"
+    if "FloodWait" in err_str:
+        return "触发 Telegram 接口频率限制，请稍后重试"
+    return f"{default_msg}: {err_str}"
+
+@app.post("/api/groups/resolve", response_model=GroupModel)
+async def resolve_group(req: GroupResolveRequest, user: dict = Depends(get_current_user)):
+    # Get all account IDs of this user's company
+    from db import engine, AccountDb, Session, select
+    with Session(engine) as session:
+        stmt = query_allowed_accounts(session, user)
+        allowed_account_ids = {a.id for a in filter_executable_accounts_for_task(session.exec(stmt).all())}
+
+    # 1. Get first authorized client
+    client = None
+    for account_id, c in list(active_clients.items()):
+        if account_id in allowed_account_ids and c.is_connected() and await c.is_user_authorized():
+            client = c
+            break
+            
+    if not client:
+        # Check list of accounts to see if any can be connected and verified
+        from account_manager import list_accounts
+        accounts = list_accounts()
+        for path in accounts:
+            account_id = path.stem
+            if account_id not in allowed_account_ids:
+                continue
+            try:
+                c = await get_client(account_id)
+                if c.is_connected() and await c.is_user_authorized():
+                    client = c
+                    break
+            except Exception:
+                continue
+
+    if not client:
+        raise HTTPException(
+            status_code=400, 
+            detail="检测到未登录任何电报账号。请先到“账号登录”页面成功登录一个账号后重试。"
+        )
+
+    link = req.link.strip()
+    if not link:
+        raise HTTPException(status_code=400, detail="群组链接不能为空")
+
+    import re
+    invite_hash = None
+    private_match = re.search(r'(?:t\.me|telegram\.me)/(?:joinchat/|\+)?([a-zA-Z0-9_\-]{5,32})', link)
+    if private_match and ("joinchat/" in link or "+" in link):
+        invite_hash = private_match.group(1)
+
+    if invite_hash:
+        try:
+            invite = await client(functions.messages.CheckChatInviteRequest(hash=invite_hash))
+            if isinstance(invite, types.ChatInviteAlready):
+                chat = invite.chat
+                chat_type = "channel" if getattr(chat, "broadcast", False) else "group"
+                member_count = getattr(chat, "participants_count", 0) or 0
+                res_data = {
+                    "id": str(chat.id),
+                    "title": chat.title,
+                    "username": getattr(chat, "username", "") or "",
+                    "type": chat_type,
+                    "memberCount": member_count,
+                    "enabled": True,
+                    "category": req.category,
+                    "price": req.price or 0.0
+                }
+            else: # ChatInvite
+                chat_type = "channel" if invite.broadcast else "group"
+                res_data = {
+                    "id": f"invite_{invite_hash}",
+                    "title": invite.title,
+                    "username": "",
+                    "type": chat_type,
+                    "memberCount": invite.participants_count,
+                    "enabled": True,
+                    "category": req.category,
+                    "price": req.price or 0.0
+                }
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=map_telegram_error(e, "解析私有邀请链接失败"))
+    else:
+        # Public username, link, or ID
+        identifier = link
+        if identifier.startswith("https://t.me/"):
+            identifier = identifier.replace("https://t.me/", "")
+        elif identifier.startswith("http://t.me/"):
+            identifier = identifier.replace("http://t.me/", "")
+        elif identifier.startswith("t.me/"):
+            identifier = identifier.replace("t.me/", "")
+            
+        if identifier.startswith("@"):
+            identifier = identifier[1:]
+
+        # Handle numeric ID
+        if isinstance(identifier, str) and (identifier.isdigit() or (identifier.startswith("-") and identifier[1:].isdigit())):
+            identifier = int(identifier)
+
+        try:
+            entity = await client.get_entity(identifier)
+            if isinstance(entity, types.User):
+                raise HTTPException(status_code=400, detail="该链接指向的是个人账户，群组库只允许添加群组或频道。")
+
+            chat_type = "channel" if getattr(entity, "broadcast", False) else "group"
+            
+            # Get participant count
+            member_count = 0
+            try:
+                if isinstance(entity, types.Chat):
+                    full_chat = await client(functions.messages.GetFullChatRequest(chat_id=entity.id))
+                else:
+                    full_chat = await client(functions.channels.GetFullChannelRequest(channel=entity))
+                
+                if hasattr(full_chat, "full_chat") and hasattr(full_chat.full_chat, "participants_count"):
+                    member_count = full_chat.full_chat.participants_count
+                elif hasattr(full_chat, "chats") and len(full_chat.chats) > 0:
+                    member_count = getattr(full_chat.chats[0], "participants_count", 0) or 0
+            except Exception:
+                member_count = getattr(entity, "participants_count", 0) or 0
+
+            res_data = {
+                "id": str(entity.id),
+                "title": getattr(entity, "title", ""),
+                "username": getattr(entity, "username", "") or "",
+                "type": chat_type,
+                "memberCount": member_count,
+                "enabled": True,
+                "category": req.category,
+                "price": req.price or 0.0
+            }
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=map_telegram_error(e, "无法解析该群组/频道标识符"))
+
+    # 3. Add to database if not already there
+    from db import engine, GroupDb, Session, select
+    with Session(engine) as session:
+        if user["company"] == "admin":
+            db_group = session.exec(select(GroupDb).where(GroupDb.id == str(res_data["id"]))).first()
+        else:
+            db_group = session.get(GroupDb, (str(res_data["id"]), user["company"]))
+        if db_group:
+            raise HTTPException(status_code=400, detail=f"群组/频道 '{res_data['title']}' 已在列表中，无需重复添加")
+        
+        new_db_group = GroupDb(
+            id=str(res_data["id"]),
+            company=user["company"],
+            title=res_data.get("title", ""),
+            username=res_data.get("username", ""),
+            type=res_data.get("type", "group"),
+            enabled=res_data.get("enabled", True),
+            memberCount=res_data.get("memberCount", 0),
+            category=res_data.get("category", "中文广告"),
+            price=res_data.get("price", 0.0),
+            created_by=user["username"],
+            updated_by=user["username"]
+        )
+        session.add(new_db_group)
+        session.commit()
+    return res_data
+
+async def update_account_name_from_tg(account_id: str, client):
+    """Automatically updates AccountDb.account_name with the Telegram profile name if it is currently just a phone number or empty."""
+    try:
+        if await client.is_user_authorized():
+            me = await client.get_me()
+            if me:
+                first_name = me.first_name or ''
+                last_name = me.last_name or ''
+                tg_name = f"{first_name} {last_name}".strip()
+                if not tg_name:
+                    tg_name = me.username or "未命名电报号"
+                
+                from db import engine, AccountDb, Session
+                with Session(engine) as session:
+                    db_account = session.get(AccountDb, account_id)
+                    if db_account:
+                        curr_name = db_account.account_name.strip() if db_account.account_name else ""
+                        username_changed = False
+                        name_changed = False
+                        
+                        if curr_name != tg_name:
+                            db_account.account_name = tg_name
+                            name_changed = True
+                            
+                        # Keep profile_modified_name in sync with tg_name if different
+                        if db_account.profile_modified_name != tg_name:
+                            db_account.profile_modified_name = tg_name
+                            name_changed = True
+                            
+                        # Save the current username in DB (even if deleted on TG)
+                        clean_username = me.username.strip() if me.username else ""
+                        current_db_username = db_account.profile_modified_username or ""
+                        if current_db_username != clean_username:
+                            db_account.profile_modified_username = clean_username if clean_username else None
+                            username_changed = True
+                            
+                        if name_changed or username_changed:
+                            
+                            session.add(db_account)
+                            session.commit()
+                            
+                            # Also sync to disk JSON config
+                            try:
+                                path = account_config_path(account_id)
+                                if path.exists():
+                                    config = db_account.to_dict()
+                                    save_json(path, config)
+                            except Exception as ex:
+                                print(f"Failed to sync updated name to config file: {ex}")
+                            print(f"Updated account {account_id} cache fields to: Name='{tg_name}', Username='@{clean_username}'")
+    except Exception as e:
+        print(f"Failed to update account name from TG for {account_id}: {e}")
+
+# --- TELEGRAM INTERACTIVE LOGIN APIs ---
+
+async def get_spambot_status(client) -> dict:
+    """Sends /start to @SpamBot and checks its response for account restrictions."""
+    try:
+        # Resolve spambot entity
+        entity = await client.get_input_entity('spambot')
+        # Send /start
+        await client.send_message(entity, '/start')
+        
+        # Wait a short moment for response to arrive
+        import asyncio
+        await asyncio.sleep(1.5)
+        
+        # Fetch the latest message from @SpamBot
+        messages = await client.get_messages(entity, limit=1)
+        if messages:
+            msg = messages[0]
+            if not msg.out:
+                text = msg.message
+                lower_text = text.lower()
+                # Parse the response text
+                if "no limits" in lower_text or "no restrictions" in lower_text or "free as a bird" in lower_text:
+                    return {"status": "free", "details": text}
+                else:
+                    return {"status": "restricted", "details": text}
+        return {"status": "unknown", "details": "没有收到 SpamBot 响应"}
+    except Exception as e:
+        return {"status": "unknown", "details": f"SpamBot 检测失败: {str(e)}"}
+
+@app.get("/api/login/status/{account_id}")
+@account_api_operation("login_status", label="检测登录状态")
+async def get_login_status(account_id: str, force: bool = False, user: dict = Depends(get_current_user)):
+    """Checks the connection and authorization status of a Telegram account."""
+    check_account_company(account_id, user)
+    try:
+        client = await asyncio.wait_for(get_client(account_id), timeout=15)
+        is_connected = client.is_connected()
+        is_authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=8) if is_connected else False
+        me_info = None
+        spambot_status = "unknown"
+        spambot_details = ""
+        spambot_time = None
+        db_acc = None
+        check_warnings = []
+        
+        if is_authorized:
+            try:
+                me = await asyncio.wait_for(client.get_me(), timeout=8)
+                if me:
+                    username = f"@{me.username}" if me.username else ""
+                    me_info = f"{me.first_name or ''} {me.last_name or ''} {username} (ID: {me.id})".strip()
+                    # 只有在 force=True 时才才去同步账号名到 TG（或更新数据库），日常同步避免该重型操作
+                    if force:
+                        try:
+                            await asyncio.wait_for(update_account_name_from_tg(account_id, client), timeout=5)
+                        except asyncio.TimeoutError:
+                            warning = "账号名同步超时，登录状态已确认"
+                            check_warnings.append(warning)
+                            print(f"[LoginStatus] update_account_name timeout for {account_id}")
+            except Exception as e:
+                warning = f"读取账号资料失败，登录状态已确认: {e}"
+                check_warnings.append(warning)
+                print(f"[LoginStatus] get_me failed for {account_id}: {e}")
+
+            # Check and update translation bot status (只有 force=True 时才执行重型检测)
+            if force:
+                try:
+                    from db import engine, AccountDb, Session
+                    with Session(engine) as db_session:
+                        db_acc = db_session.get(AccountDb, account_id)
+                        if db_acc and db_acc.bot_setup_status != "approved":
+                            await asyncio.wait_for(check_and_update_bot_approval_status(account_id, client, db_session), timeout=8)
+                except Exception as e:
+                    warning = f"Bot 授权状态检查失败，登录状态已确认: {e}"
+                    check_warnings.append(warning)
+                    print(f"Error checking bot status in login/status check: {e}")
+
+            # Fetch or use cached spambot status (日常 force=False 的检测不重新查 SpamBot 以规避限流)
+            import time
+            cached = spambot_cache.get(account_id)
+            if cached and not force:
+                # 日常同步直接复用历史缓存，不查 SpamBot
+                spambot_status = cached["status"]
+                spambot_details = cached["details"]
+                spambot_time = cached["timestamp"]
+            elif cached and force and (time.time() - cached["timestamp"] < 300):
+                # 即使 force=True，如果 5 分钟内刚查过，也复用缓存，防止频率过高被限流
+                spambot_status = cached["status"]
+                spambot_details = cached["details"]
+                spambot_time = cached["timestamp"]
+            else:
+                # 只有没有缓存，或 force=True 且缓存过期时才去查重型的 get_spambot_status
+                try:
+                    res = await asyncio.wait_for(get_spambot_status(client), timeout=12)
+                    spambot_status = res["status"]
+                    spambot_details = res["details"]
+                    spambot_time = time.time()
+                    spambot_cache[account_id] = {
+                        "status": spambot_status,
+                        "details": spambot_details,
+                        "timestamp": spambot_time
+                    }
+                    save_spambot_cache(spambot_cache)
+                except Exception as e:
+                    warning = f"SpamBot 检测失败，登录状态已确认: {e}"
+                    check_warnings.append(warning)
+                    if cached:
+                        spambot_status = cached.get("status", "unknown")
+                        spambot_details = cached.get("details", "")
+                        spambot_time = cached.get("timestamp")
+                    print(f"[LoginStatus] spambot check failed for {account_id}: {e}")
+
+        status_res = {
+            "is_connected": is_connected,
+            "is_authorized": is_authorized,
+            "me": me_info,
+            "spambot_status": spambot_status,
+            "spambot_details": spambot_details,
+            "spambot_time": spambot_time,
+            "bot_setup_status": db_acc.bot_setup_status if db_acc and is_authorized else "not_started",
+            "error": "; ".join(check_warnings) if check_warnings else None,
+            "last_error": "; ".join(check_warnings) if check_warnings else None,
+            "status_check_failed": bool(check_warnings),
+            "status_check_warnings": check_warnings,
+        }
+        status_res = set_account_status(account_id, status_res, source="login-status")
+        if is_authorized and spambot_status == "restricted":
+            send_ops_bot_notification(
+                "\n".join([
+                    "🚨 <b>账号可能被限制</b>",
+                    html_line("账号", get_account_notify_label(account_id)),
+                    html_line("状态", "SpamBot restricted"),
+                    html_line("详情", spambot_details[:800] if spambot_details else "未知"),
+                    html_line("时间", ops_event_time()),
+                ]),
+                dedup_key=f"spambot_restricted:{account_id}",
+                cooldown_seconds=1800,
+            )
+        return status_res
+    except asyncio.TimeoutError:
+        return set_login_status_check_failed(
+            account_id,
+            "检测登录状态超时，已保留上一次登录状态；请稍后重试，或检查代理/Telegram 限流。",
+            source="login-status-timeout",
+            is_connected=bool(active_clients.get(account_id) and active_clients[account_id].is_connected()),
+        )
+    except Exception as e:
+        err_msg = str(e).lower()
+        is_deactivated = False
+        if "deactivated" in err_msg or "deleted" in err_msg or "deactive" in err_msg or isinstance(e, UserDeactivatedError):
+            is_deactivated = True
+        is_auth_lost = any(
+            marker in err_msg
+            for marker in [
+                "auth key unregistered",
+                "authkeyunregistered",
+                "session revoked",
+                "user deactivated",
+                "unauthorized",
+                "not authorized",
+            ]
+        )
+        if not is_deactivated and not is_auth_lost:
+            return set_login_status_check_failed(
+                account_id,
+                f"检测登录状态失败，已保留上一次登录状态: {str(e)}",
+                source="login-status-error",
+                is_connected=bool(active_clients.get(account_id) and active_clients[account_id].is_connected()),
+            )
+        status_res = {
+            "is_connected": False,
+            "is_authorized": False,
+            "is_deactivated": is_deactivated,
+            "error": str(e),
+            "last_error": str(e),
+            "status_check_failed": True,
+        }
+        status_res = set_account_status(account_id, status_res, source="login-status-error")
+        if is_deactivated:
+            send_ops_bot_notification(
+                "\n".join([
+                    "⛔ <b>账号疑似被封禁/注销</b>",
+                    html_line("账号", get_account_notify_label(account_id)),
+                    html_line("错误", str(e)[:800]),
+                    html_line("时间", ops_event_time()),
+                ]),
+                dedup_key=f"deactivated:{account_id}",
+                cooldown_seconds=1800,
+            )
+        return status_res
+
+@app.post("/api/login/send-code")
+async def login_send_code(req: LoginStartRequest, user: dict = Depends(get_current_user)):
+    """Initializes connection and requests login verification code."""
+    account_id = req.account_id
+    phone = req.phone.strip()
+    if not phone:
+        raise HTTPException(status_code=400, detail="Phone number is required")
+
+    try:
+        # Check if config exists in DB first
+        from db import engine, AccountDb, Session
+        with Session(engine) as session:
+            db_account = session.get(AccountDb, account_id)
+            
+        config_path = account_config_path(account_id)
+        if not db_account:
+            # Create config in DB and sync to disk
+            template_path = Path(__file__).resolve().parent / "config.json"
+            if not template_path.exists():
+                template_path = Path(__file__).resolve().parent / "config.example.json"
+
+            if not template_path.exists():
+                template = {
+                    "auth_mode": "builtin_telegram_desktop",
+                    "folder_name": "广告",
+                    "connection_timeout_seconds": 12,
+                    "connection_retries": 2,
+                    "proxy": {"enabled": False, "type": "http", "host": "127.0.0.1", "port": 8800, "username": "", "password": ""}
+                }
+            else:
+                template = load_json(template_path)
+            
+            config = build_account_config(account_id, phone, template)
+            config["company"] = user["company"]
+            config["created_by"] = user["username"]
+            config["updated_by"] = user["username"]
+            config["owner_username"] = user["username"]
+            if req.page_id:
+                config["page_id"] = req.page_id
+            
+            with Session(engine) as session:
+                new_db_acc = AccountDb.from_dict(account_id, config)
+                session.add(new_db_acc)
+                session.commit()
+                # sync
+                save_json(config_path, new_db_acc.to_dict())
+        else:
+            if user["role"] != "admin":
+                if db_account.owner_username != user["username"] and db_account.created_by != user["username"]:
+                    raise HTTPException(status_code=403, detail="该账号已被其他用户绑定，无权操作")
+            with Session(engine) as session:
+                db_acc = session.get(AccountDb, account_id)
+                if req.page_id:
+                    db_acc.page_id = req.page_id
+                db_acc.created_by = user["username"]
+                db_acc.company = user["company"]
+                db_acc.updated_by = user["username"]
+                session.add(db_acc)
+                session.commit()
+                save_json(config_path, db_acc.to_dict())
+
+        client = await get_client(account_id)
+        is_authorized = await client.is_user_authorized()
+        if is_authorized:
+            return {"status": "authorized", "message": "Already authorized"}
+
+        result = await client.send_code_request(phone)
+        login_states[account_id] = {
+            "phone": phone,
+            "phone_code_hash": result.phone_code_hash
+        }
+        return {"status": "code_sent", "message": "Verification code sent successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send code: {str(e)}")
+
+@app.post("/api/login/submit-code")
+async def login_submit_code(req: LoginSubmitRequest, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
+    """Submits the code and 2fa password to sign in."""
+    account_id = req.account_id
+    code = req.code.strip()
+    pass2fa = req.pass2fa.strip() if req.pass2fa else None
+
+    if account_id not in login_states:
+        raise HTTPException(status_code=400, detail="Login session not initialized. Send code first.")
+
+    state = login_states[account_id]
+    phone = state["phone"]
+    phone_code_hash = state["phone_code_hash"]
+
+    try:
+        client = await get_client(account_id)
+        try:
+            await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
+            # Login successful
+            login_states.pop(account_id, None)
+            await update_account_name_from_tg(account_id, client)
+            try:
+                me = await client.get_me()
+                me_info = f"{me.first_name or ''} {me.last_name or ''}".strip()
+                if not me_info:
+                    me_info = me.username or "已登录"
+                if me.username:
+                    me_info += f" (@{me.username})"
+                set_account_status(account_id, {
+                    "is_connected": True,
+                    "is_authorized": True,
+                    "me": me_info,
+                    "spambot_status": "unknown",
+                    "spambot_details": "",
+                    "spambot_time": None
+                }, source="login-submit")
+            except Exception:
+                pass
+
+            # Check and update translation bot status
+            try:
+                from db import engine, AccountDb, Session
+                with Session(engine) as db_session:
+                    await check_and_update_bot_approval_status(account_id, client, db_session)
+            except Exception as e:
+                print(f"Error checking bot status in submit-code: {e}")
+
+            # Automatically trigger BOT setup in background
+            background_tasks.add_task(auto_trigger_bot_setup_for_account, account_id, client)
+
+            return {"status": "success", "message": "Logged in successfully"}
+        except SessionPasswordNeededError:
+            if not pass2fa:
+                return {"status": "2fa_required", "message": "Two-factor authentication (2FA) password is required"}
+            
+            # Submit 2FA password
+            await client.sign_in(password=pass2fa)
+            login_states.pop(account_id, None)
+
+            # Save the 2FA password to the database and config json
+            from db import engine, AccountDb, Session
+            with Session(engine) as session:
+                db_account = session.get(AccountDb, account_id)
+                if db_account:
+                    db_account.pass2fa = pass2fa
+                    db_account.updated_by = user["username"]
+                    db_account.profile_modified = (pass2fa != "" and pass2fa != "0000")
+                    session.add(db_account)
+                    session.commit()
+                    
+                    # Sync back to json config file
+                    path = account_config_path(account_id)
+                    save_json(path, db_account.to_dict())
+
+            await update_account_name_from_tg(account_id, client)
+            try:
+                me = await client.get_me()
+                me_info = f"{me.first_name or ''} {me.last_name or ''}".strip()
+                if not me_info:
+                    me_info = me.username or "已登录"
+                if me.username:
+                    me_info += f" (@{me.username})"
+                set_account_status(account_id, {
+                    "is_connected": True,
+                    "is_authorized": True,
+                    "me": me_info,
+                    "spambot_status": "unknown",
+                    "spambot_details": "",
+                    "spambot_time": None
+                }, source="login-submit")
+            except Exception:
+                pass
+
+            # Check and update translation bot status
+            try:
+                from db import engine, AccountDb, Session
+                with Session(engine) as db_session:
+                    await check_and_update_bot_approval_status(account_id, client, db_session)
+            except Exception as e:
+                print(f"Error checking bot status in submit-code (2fa): {e}")
+
+            # Automatically trigger BOT setup in background
+            background_tasks.add_task(auto_trigger_bot_setup_for_account, account_id, client)
+
+            return {"status": "success", "message": "Logged in successfully with 2FA"}
+            
+    except Exception as e:
+        set_account_status(
+            account_id,
+            {"error": str(e), "last_error": str(e), "status_check_failed": True},
+            source="login-submit-error",
+        )
+        raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
+
+@app.post("/api/login/quick-import")
+async def login_quick_import(req: QuickImportRequest, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
+    import_str = req.import_string.strip()
+    if "----" not in import_str:
+        raise HTTPException(status_code=400, detail="导入格式不正确。应为: 手机号----接码网址或UUID")
+        
+    parts = import_str.split("----")
+    phone = parts[0].strip()
+    page_id = parts[1].strip()
+    
+    # Clean phone number
+    if phone.startswith("+"):
+        phone_clean = "+" + "".join([c for c in phone[1:] if c.isdigit()])
+    else:
+        phone_clean = "".join([c for c in phone if c.isdigit()])
+        if not phone_clean.startswith("+"):
+            phone_clean = "+" + phone_clean
+            
+    phone = phone_clean
+
+    from account_manager import account_id_from_name
+    account_id = account_id_from_name(phone)
+    
+    # Check if exists in DB first
+    from db import engine, AccountDb, Session
+    with Session(engine) as session:
+        db_account = session.get(AccountDb, account_id)
+        
+    config_path = account_config_path(account_id)
+
+    if not db_account:
+        # Create default config for this phone number
+        template_path = Path(__file__).resolve().parent / "config.json"
+        if not template_path.exists():
+            template_path = Path(__file__).resolve().parent / "config.example.json"
+
+        if not template_path.exists():
+            template = {
+                "auth_mode": "builtin_telegram_desktop",
+                "folder_name": "广告",
+                "connection_timeout_seconds": 12,
+                "connection_retries": 2,
+                "proxy": {"enabled": False, "type": "http", "host": "127.0.0.1", "port": 8800, "username": "", "password": ""}
+            }
+        else:
+            template = load_json(template_path)
+        
+        config = build_account_config(account_id, phone, template)
+        config["company"] = user["company"]
+        config["page_id"] = page_id
+        config["created_by"] = user["username"]
+        config["updated_by"] = user["username"]
+        config["owner_username"] = user["username"]
+        with Session(engine) as session:
+            new_db_acc = AccountDb.from_dict(account_id, config)
+            session.add(new_db_acc)
+            session.commit()
+            # sync to disk
+            save_json(config_path, new_db_acc.to_dict())
+    else:
+        if user["role"] != "admin" and db_account.owner_username != user["username"] and db_account.created_by != user["username"]:
+            raise HTTPException(status_code=403, detail="该账号已被其他用户绑定，无权操作")
+        with Session(engine) as session:
+            db_acc = session.get(AccountDb, account_id)
+            db_acc.page_id = page_id
+            db_acc.created_by = user["username"]
+            db_acc.company = user["company"]
+            db_acc.updated_by = user["username"]
+            session.add(db_acc)
+            session.commit()
+            save_json(config_path, db_acc.to_dict())
+
+    try:
+        client = await get_client(account_id)
+        is_authorized = await client.is_user_authorized()
+        if is_authorized:
+            # Check and update translation bot status
+            try:
+                from db import engine, AccountDb, Session
+                with Session(engine) as db_session:
+                    await check_and_update_bot_approval_status(account_id, client, db_session)
+            except Exception as e:
+                print(f"Error checking bot status in quick-import: {e}")
+
+            # Automatically trigger BOT setup in background
+            background_tasks.add_task(auto_trigger_bot_setup_for_account, account_id, client)
+
+            return {
+                "status": "authorized",
+                "account_id": account_id,
+                "phone": phone,
+                "page_id": page_id,
+                "message": "Already authorized"
+            }
+
+        result = await client.send_code_request(phone)
+        login_states[account_id] = {
+            "phone": phone,
+            "phone_code_hash": result.phone_code_hash
+        }
+        return {
+            "status": "code_sent",
+            "account_id": account_id,
+            "phone": phone,
+            "page_id": page_id,
+            "message": "Verification code sent successfully"
+        }
+    except Exception as e:
+        set_account_status(
+            account_id,
+            {"error": str(e), "last_error": str(e), "status_check_failed": True},
+            source="quick-import-error",
+        )
+        raise HTTPException(status_code=500, detail=f"Failed to send code during quick import: {str(e)}")
+
+# Global storage for background client connection tasks and errors
+bg_connect_tasks = {}
+connection_errors = {}
+
+async def fetch_recent_official_codes(account_id: str, client: TelegramClient):
+    """Proactively retrieves recent official login code messages from 777000 history."""
+    add_login_log(account_id, "正在获取官方通知 (777000) 历史消息...")
+    try:
+        if not client.is_connected():
+            add_login_log(account_id, "获取历史消息失败：客户端未连接")
+            return
+        if not await client.is_user_authorized():
+            add_login_log(account_id, "获取历史消息失败：账号未授权")
+            return
+        
+        # Get messages from official sender 777000
+        messages = await client.get_messages(777000, limit=5)
+        if not messages:
+            add_login_log(account_id, "未发现官方通知历史消息")
+            return
+            
+        import datetime
+        added_count = 0
+        for msg in messages:
+            if msg and msg.message:
+                text = msg.message
+                msg_date = msg.date
+                if isinstance(msg_date, datetime.datetime):
+                    timestamp = msg_date.timestamp()
+                else:
+                    timestamp = time.time()
+                    
+                if account_id not in official_messages_store:
+                    official_messages_store[account_id] = []
+                    
+                # Avoid duplicates
+                exists = any(m["text"] == text and abs(m["timestamp"] - timestamp) < 5 for m in official_messages_store[account_id])
+                if not exists:
+                    official_messages_store[account_id].append({
+                        "text": text,
+                        "timestamp": timestamp
+                    })
+                    added_count += 1
+                    
+                # Also check for codes
+                match = re.search(r"Login code\s*:?\s*(\d+)", text, re.IGNORECASE)
+                if not match:
+                    match = re.search(r"(?:code|验证码)[:：\s]+(\d+)", text, re.IGNORECASE)
+                if not match:
+                    match = re.search(r"\b(\d{5,6})\b", text)
+                    
+                if match:
+                    code = match.group(1)
+                    if account_id not in captured_login_codes:
+                        captured_login_codes[account_id] = []
+                    
+                    exists_code = any(c["code"] == code and abs(c["timestamp"] - timestamp) < 10 for c in captured_login_codes[account_id])
+                    if not exists_code:
+                        captured_login_codes[account_id].append({
+                            "code": code,
+                            "timestamp": timestamp,
+                            "text": text
+                        })
+                        # Keep last 10 codes
+                        captured_login_codes[account_id] = captured_login_codes[account_id][-10:]
+                        
+        if account_id in official_messages_store:
+            official_messages_store[account_id] = sorted(
+                official_messages_store[account_id],
+                key=lambda x: x["timestamp"],
+                reverse=True
+            )[:5]
+            
+        add_login_log(account_id, f"成功同步官方历史通知消息，共加载 {len(official_messages_store[account_id])} 条。")
+    except Exception as e:
+        error_msg = str(e)
+        add_login_log(account_id, f"获取历史消息失败: {error_msg}")
+
+async def bg_connect_client(account_id: str):
+    try:
+        connection_errors.pop(account_id, None)
+        login_connection_logs[account_id] = []
+        add_login_log(account_id, "开始连接电报客户端 (后台任务启动)...")
+        
+        client = await get_client(account_id)
+        add_login_log(account_id, "连接电报服务成功！")
+        
+        # Fetch the official codes once connected in case the event listener was offline
+        await fetch_recent_official_codes(account_id, client)
+        add_login_log(account_id, "已开启实时新消息监听，等待接收验证码...")
+    except Exception as e:
+        error_msg = str(e)
+        add_login_log(account_id, f"后台连接失败: {error_msg}")
+        connection_errors[account_id] = error_msg
+
+@app.get("/api/accounts/{account_id}/login-code")
+async def get_captured_login_code(account_id: str, user: dict = Depends(get_current_user)):
+    """Fetches captured Telegram official login codes for an account."""
+    check_account_company(account_id, user)
+    
+    is_connected = False
+    client = None
+    
+    # Initialize logs if not present
+    if account_id not in login_connection_logs:
+        login_connection_logs[account_id] = []
+        
+    # Ensure client is connected and listening in the background if authorized
+    try:
+        from db import engine, AccountDb, Session
+        with Session(engine) as session:
+            db_account = session.get(AccountDb, account_id)
+            
+        if db_account:
+            session_name = db_account.session_name
+            from sync_folder_groups import resolve_path
+            from pathlib import Path
+            config_path = account_config_path(account_id)
+            base_dir = config_path.parent.parent
+            session_path = resolve_path(base_dir, session_name)
+            
+            session_file = Path(f"{session_path}.session")
+            if not session_file.exists():
+                session_file = Path(session_path)
+                
+            if session_file.exists() and session_file.stat().st_size > 0:
+                # Account is authorized, check if client is already connected
+                if account_id in active_clients:
+                    client = active_clients[account_id]
+                    if client.is_connected():
+                        is_connected = True
+                
+                # If not connected and no task is running, start connection task
+                if not is_connected:
+                    task = bg_connect_tasks.get(account_id)
+                    if not task or task.done():
+                        bg_connect_tasks[account_id] = asyncio.create_task(bg_connect_client(account_id))
+            else:
+                add_login_log(account_id, "错误: 未找到该账号的在线Session文件 (可能已注销或文件丢失)。请重新登录。")
+        else:
+            add_login_log(account_id, "错误: 数据库中不存在此账号。")
+    except Exception as e:
+        add_login_log(account_id, f"触发后台连接失败: {e}")
+        
+    # If client is connected and logs are empty, log that it is connected
+    if is_connected and not login_connection_logs[account_id]:
+        add_login_log(account_id, "客户端已在线连接。")
+        
+    # If the client is already connected, proactively trigger history check in background
+    if is_connected and client:
+        asyncio.create_task(fetch_recent_official_codes(account_id, client))
+        
+    # Get official messages
+    raw_msgs = official_messages_store.get(account_id, [])
+    sorted_msgs = sorted(raw_msgs, key=lambda x: x["timestamp"], reverse=True)[:5]
+    
+    # Get error if any
+    error = connection_errors.get(account_id, None)
+    
+    # Check if currently connecting
+    is_connecting = False
+    task = bg_connect_tasks.get(account_id)
+    if task and not task.done():
+        is_connecting = True
+        
+    return {
+        "status": "success",
+        "raw_messages": sorted_msgs,
+        "logs": login_connection_logs.get(account_id, []),
+        "error": error,
+        "is_connecting": is_connecting
+    }
+
+async def clean_idle_clients_loop():
+    """Periodically disconnects inactive Telethon clients to save memory and socket resources."""
+    while True:
+        await asyncio.sleep(60)
+        now = time.time()
+        for account_id, client in list(active_clients.items()):
+            last_time = active_clients_last_accessed.get(account_id, 0)
+            if now - last_time > 300:
+                if account_id in auto_private_listener_accounts:
+                    active_clients_last_accessed[account_id] = now
+                    continue
+
+                is_campaign_running = account_id in active_processes and active_processes[account_id].poll() is None
+                if not is_campaign_running:
+                    is_campaign_running = find_campaign_process(account_id) is not None
+                
+                if not is_campaign_running and not is_account_busy_with_task(account_id):
+                    try:
+                        print(f"Disconnecting idle client {account_id} to free resources...")
+                        active_clients.pop(account_id, None)
+                        registered_listeners.discard(account_id)
+                        active_clients_last_accessed.pop(account_id, None)
+                        set_account_status(account_id, {"is_connected": False}, source="idle-disconnect")
+                        if client.is_connected():
+                            await client.disconnect()
+                    except Exception as e:
+                        print(f"Error disconnecting client {account_id}: {e}")
+
+def account_has_session_file(account_id: str, acc=None) -> bool:
+    try:
+        config = acc.to_dict() if acc is not None else load_json(account_config_path(account_id))
+        session_name = config.get("session_name", f"sessions/{account_id}/telegram_user")
+        from sync_folder_groups import resolve_path
+        config_path = account_config_path(account_id)
+        base_dir = config_path.parent.parent
+        session_path = resolve_path(base_dir, session_name)
+        candidates = [Path(f"{session_path}.session"), Path(session_path)]
+        return any(path.exists() and path.stat().st_size > 0 for path in candidates)
+    except Exception:
+        return False
+
+
+async def ensure_private_listener_for_account(account_id: str, account_label: str = "") -> bool:
+    if get_private_poll_skip_reason(account_id):
+        return False
+    client = await get_client(account_id)
+    if not await client.is_user_authorized():
+        return False
+    auto_private_listener_accounts.add(account_id)
+    active_clients_last_accessed[account_id] = time.time()
+    set_account_status(
+        account_id,
+        {
+            "is_connected": True,
+            "is_authorized": True,
+            "private_listener": True,
+            "private_listener_source": "auto",
+        },
+        source="private-listener-auto",
+    )
+    print(f"[PrivateListener] Auto listener active for {account_label or account_id}.")
+    return True
+
+
+async def auto_private_listener_loop():
+    """Keeps idle authorized accounts online so private DMs can be received without a manual button."""
+    from db import engine, AccountDb, Session, select
+    await asyncio.sleep(AUTO_PRIVATE_LISTENER_STARTUP_DELAY_SECONDS)
+    last_heartbeat_check = {}  # account_id -> timestamp
+    while True:
+        try:
+            with Session(engine) as session:
+                accounts = session.exec(select(AccountDb)).all()
+
+            now = time.time()
+            async def process_single_account(acc):
+                account_id = acc.id
+                if getattr(acc, "is_available", True) is False:
+                    return
+                if is_account_busy_with_task(account_id):
+                    return
+                if active_account_operations.get(account_id):
+                    return
+                if not account_has_session_file(account_id, acc):
+                    return
+
+                live_client = active_clients.get(account_id)
+                if live_client and live_client.is_connected():
+                    # 每 5 分钟 (300 秒) 进行一次轻量级心跳自愈检测，避免 session 在线状态挂死
+                    last_check = last_heartbeat_check.get(account_id, 0)
+                    if now - last_check > 300:
+                        try:
+                            # 尝试获取自身信息，设置 15 秒超时防止因代理瞬时延迟导致误判
+                            await asyncio.wait_for(live_client.get_me(), timeout=15)
+                            last_heartbeat_check[account_id] = now
+                        except Exception as heartbeat_exc:
+                            print(f"[Heartbeat] Account {acc.account_name or account_id} failed heartbeat: {heartbeat_exc}. Disconnecting for self-healing...")
+                            try:
+                                await _disconnect_client_safely(account_id, live_client)
+                            except Exception:
+                                pass
+                            active_clients.pop(account_id, None)
+                            registered_listeners.discard(account_id)
+                            
+                            # Set cooldown on heartbeat exception to prevent infinite reconnect loop
+                            wait_time = getattr(heartbeat_exc, "seconds", AUTO_PRIVATE_LISTENER_FAILURE_COOLDOWN_SECONDS) or AUTO_PRIVATE_LISTENER_FAILURE_COOLDOWN_SECONDS
+                            auto_private_listener_cooldowns[account_id] = time.time() + wait_time
+                            
+                            set_account_status(
+                                account_id,
+                                {
+                                    "private_listener": False,
+                                    "last_error": f"连接心跳异常，正在自动重建监听: {heartbeat_exc}",
+                                },
+                                source="private-listener-heartbeat-fail",
+                            )
+                        else:
+                            auto_private_listener_accounts.add(account_id)
+                            active_clients_last_accessed[account_id] = now
+                    else:
+                        auto_private_listener_accounts.add(account_id)
+                        active_clients_last_accessed[account_id] = now
+                    return
+
+                cooldown_until = auto_private_listener_cooldowns.get(account_id, 0)
+                if cooldown_until > now:
+                    return
+
+                try:
+                    await ensure_private_listener_for_account(account_id, acc.account_name or account_id)
+                except Exception as exc:
+                    # Dynamically extract wait_time if it is a FloodWaitError
+                    wait_time = getattr(exc, "seconds", AUTO_PRIVATE_LISTENER_FAILURE_COOLDOWN_SECONDS) or AUTO_PRIVATE_LISTENER_FAILURE_COOLDOWN_SECONDS
+                    auto_private_listener_cooldowns[account_id] = time.time() + wait_time
+                    set_account_status(
+                        account_id,
+                        {
+                            "private_listener": False,
+                            "last_error": f"自动私聊监听连接失败: {exc}",
+                        },
+                        source="private-listener-auto-error",
+                    )
+                    print(f"[PrivateListener] Failed to auto-connect {account_id}: {exc}")
+
+            # 并发执行所有账号的连接与自愈
+            tasks = [process_single_account(acc) for acc in accounts]
+            if tasks:
+                await asyncio.gather(*tasks)
+        except Exception as exc:
+            print(f"[PrivateListener] Auto listener loop error: {exc}")
+
+        await asyncio.sleep(AUTO_PRIVATE_LISTENER_INTERVAL_SECONDS)
+
+async def auto_connect_bg_task():
+    """Background task to initialize account status store without blocking server startup or connecting to Telegram."""
+    from db import engine, AccountDb, Session, select
+    await asyncio.sleep(0.5)
+    print("Initializing account status store locally...")
+    
+    try:
+        with Session(engine) as session:
+            db_accounts = session.exec(select(AccountDb)).all()
+    except Exception as e:
+        print(f"Error loading accounts on startup: {e}")
+        return
+
+    for acc in db_accounts:
+        account_id = acc.id
+        try:
+            config = acc.to_dict()
+            session_name = config.get("session_name", f"sessions/{account_id}/telegram_user")
+            
+            from sync_folder_groups import resolve_path
+            from pathlib import Path
+            config_path = account_config_path(account_id)
+            base_dir = config_path.parent.parent
+            session_path = resolve_path(base_dir, session_name)
+            
+            session_file = Path(f"{session_path}.session")
+            if not session_file.exists():
+                session_file = Path(session_path)
+
+            cached = spambot_cache.get(account_id)
+            default_spambot_status = cached.get("status", "unknown") if cached else "unknown"
+            default_spambot_details = cached.get("details", "") if cached else ""
+            default_spambot_time = cached.get("timestamp", None) if cached else None
+
+            if session_file.exists() and session_file.stat().st_size > 0:
+                name = acc.profile_modified_name or acc.account_name or "已保存"
+                username = f" (@{acc.profile_modified_username})" if acc.profile_modified_username else ""
+                display_me = f"{name}{username}".strip()
+                set_account_status(account_id, {
+                    "is_connected": False,
+                    "is_authorized": True,
+                    "me": display_me,
+                    "spambot_status": default_spambot_status,
+                    "spambot_details": default_spambot_details,
+                    "spambot_time": default_spambot_time
+                }, source="startup")
+            else:
+                set_account_status(account_id, {
+                    "is_connected": False,
+                    "is_authorized": False,
+                    "me": "未登录",
+                    "spambot_status": default_spambot_status,
+                    "spambot_details": default_spambot_details,
+                    "spambot_time": default_spambot_time
+                }, source="startup")
+        except Exception as e:
+            print(f"Failed to check session for account {account_id}: {e}")
+
+
+async def account_status_monitor_loop():
+    """Publishes lightweight status changes without actively connecting to Telegram."""
+    last_fingerprint: Dict[str, tuple] = {}
+    while True:
+        try:
+            from db import engine, AccountDb, Session, select
+            with Session(engine) as session:
+                accounts = session.exec(select(AccountDb)).all()
+            for acc in accounts:
+                account_id = acc.id
+                live_client = active_clients.get(account_id)
+                try:
+                    live_connected = bool(live_client and live_client.is_connected())
+                except Exception:
+                    live_connected = False
+                busy_status = get_account_busy_status(account_id)
+                fingerprint = (
+                    live_connected,
+                    busy_status,
+                    bool(acc.is_available),
+                    acc.bot_setup_status or "not_started",
+                    account_id in auto_private_listener_accounts,
+                )
+                if last_fingerprint.get(account_id) != fingerprint:
+                    last_fingerprint[account_id] = fingerprint
+                    set_account_status(
+                        account_id,
+                        {
+                            "is_connected": live_connected,
+                            "busy_status": busy_status,
+                            "is_busy": busy_status != "idle",
+                            "is_available": acc.is_available,
+                            "bot_setup_status": acc.bot_setup_status or "not_started",
+                            "private_listener": (account_id in auto_private_listener_accounts and live_connected) if ENABLE_REALTIME_PRIVATE_DM else False,
+                            "private_listener_source": ("auto" if account_id in auto_private_listener_accounts and live_connected else None) if ENABLE_REALTIME_PRIVATE_DM else None,
+                        },
+                        source="status-monitor"
+                    )
+        except Exception as exc:
+            print(f"Account status monitor error: {exc}")
+        await asyncio.sleep(5)
+
+
+background_tasks = set()
+
+@app.on_event("startup")
+async def startup_event():
+    """Backgrounds auto-connection and online loop on startup to complete startup instantly."""
+    t1 = asyncio.create_task(auto_connect_bg_task())
+    background_tasks.add(t1)
+    t1.add_done_callback(background_tasks.discard)
+
+    t2 = asyncio.create_task(clean_idle_clients_loop())
+    background_tasks.add(t2)
+    t2.add_done_callback(background_tasks.discard)
+
+    t3 = asyncio.create_task(account_status_monitor_loop())
+    background_tasks.add(t3)
+    t3.add_done_callback(background_tasks.discard)
+
+    if ENABLE_REALTIME_PRIVATE_DM:
+        t4 = asyncio.create_task(auto_private_listener_loop())
+        background_tasks.add(t4)
+        t4.add_done_callback(background_tasks.discard)
+    else:
+        print("[Startup] Realtime private DM listener is DISABLED.")
+    load_pending_private_sends_from_db()
+    resume_persistent_tasks_on_startup()
+    
+    # 0. Migrate predefined_ads table to support group_type column
+    try:
+        import sqlite3
+        from db import DB_PATH
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(predefined_ads)")
+            cols = [col[1] for col in cursor.fetchall()]
+            if "group_type" not in cols:
+                cursor.execute("ALTER TABLE predefined_ads ADD COLUMN group_type TEXT DEFAULT '英文短';")
+                conn.commit()
+                print("[Startup Migration] Successfully added 'group_type' column to 'predefined_ads' table.")
+    except Exception as em:
+        print(f"[Startup Migration] Failed to migrate predefined_ads table: {em}")
+    
+    # Perform startup database sync: Category auto-fill and Channel deletion
+    try:
+        from db import engine, GroupDb, GroupCategoryDb, Session, select
+        with Session(engine) as session:
+            # 1. Scan the current group list, and if there are channels, delete them.
+            stmt_channels = select(GroupDb).where(GroupDb.type == "channel")
+            channels_to_delete = session.exec(stmt_channels).all()
+            if channels_to_delete:
+                print(f"[Startup Cleanup] Found {len(channels_to_delete)} channels in groups library. Deleting them...")
+                for ch in channels_to_delete:
+                    session.delete(ch)
+                session.commit()
+                
+            # 2. Compare all current group categories to see if any are not in the category list, and automatically add them.
+            stmt_groups = select(GroupDb)
+            all_groups = session.exec(stmt_groups).all()
+            
+            stmt_categories = select(GroupCategoryDb)
+            all_categories = session.exec(stmt_categories).all()
+            
+            # GroupCategoryDb.name is globally unique in the current schema.
+            # Keep startup sync aligned with that constraint instead of trying
+            # to create the same category name once per company.
+            existing_category_names = {
+                cat.name.strip().lower()
+                for cat in all_categories
+                if cat.name and cat.name.strip()
+            }
+                
+            for g in all_groups:
+                if not g.category:
+                    continue
+                g_cat_clean = g.category.strip()
+                g_cat_lower = g_cat_clean.lower()
+                
+                if g_cat_lower not in existing_category_names:
+                    new_cat = GroupCategoryDb(name=g_cat_clean, company=g.company)
+                    session.add(new_cat)
+                    try:
+                        session.commit()
+                        existing_category_names.add(g_cat_lower)
+                        print(f"[Startup Category Sync] Added missing category '{g_cat_clean}' for company '{g.company}'")
+                    except Exception as insert_err:
+                        session.rollback()
+                        if "UNIQUE constraint failed" in str(insert_err):
+                            existing_category_names.add(g_cat_lower)
+                        else:
+                            raise
+                    
+    except Exception as se:
+        print(f"[Startup Sync] Error running category/channel sync: {se}")
+
+# --- TELEGRAM FOLDER LISTING API ---
+
+@app.get("/api/accounts/{account_id}/folders")
+@account_api_operation("read_folders", label="读取文件夹")
+async def get_account_folders(account_id: str, user: dict = Depends(get_current_user)):
+    """Lists all Telegram folders (dialog filters) for an authorized account."""
+    check_account_company(account_id, user)
+    try:
+        client = await get_client(account_id)
+        is_authorized = await client.is_user_authorized()
+        if not is_authorized:
+            raise HTTPException(status_code=401, detail="Account is not authorized")
+
+        result = await client(functions.messages.GetDialogFiltersRequest())
+        raw_filters = getattr(result, "filters", result)
+        folders = [
+            normalize_title(item.title)
+            for item in raw_filters
+            if isinstance(item, (types.DialogFilter, types.DialogFilterChatlist))
+        ]
+        return folders
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch folders: {str(e)}")
+
+# --- DYNAMIC CAMPAIGN TASK SYSTEM ---
+
+active_campaign_tasks: Dict[str, asyncio.Task] = {}
+
+def parse_campaign_account_ids(task_record) -> List[str]:
+    """Return all accounts bound to a campaign task, preserving legacy tasks."""
+    raw = getattr(task_record, "account_ids_json", "") or ""
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            ids = [str(x).strip() for x in parsed if str(x).strip()]
+            if ids:
+                return ids
+        except Exception:
+            pass
+    return [str(task_record.account_id)]
+
+def parse_campaign_phones(task_record) -> Dict[str, str]:
+    raw = getattr(task_record, "phones_json", "") or ""
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return {str(k): str(v) for k, v in parsed.items()}
+        except Exception:
+            pass
+    return {str(task_record.account_id): str(task_record.phone)}
+
+def campaign_task_uses_account(task_record, account_id: str) -> bool:
+    return account_id in parse_campaign_account_ids(task_record)
+
+async def campaign_worker_task(task_id: str):
+    from db import engine, CampaignTaskDb, CampaignLogDb, Session, select
+    import json
+    import random
+    from datetime import datetime
+    
+    with Session(engine) as session:
+        task_record = session.get(CampaignTaskDb, task_id)
+        if not task_record:
+            return
+        account_id = task_record.account_id
+        account_ids = parse_campaign_account_ids(task_record)
+        phones_by_id = parse_campaign_phones(task_record)
+        message = task_record.message
+        target_groups = json.loads(task_record.target_groups_json)
+        max_cycles = task_record.max_cycles
+        round_interval = task_record.round_interval_minutes
+        group_interval = task_record.group_interval_seconds
+        is_safety = task_record.is_safety
+        phone = task_record.phone
+        task_company = task_record.company
+        config_payload = {}
+        try:
+            config_payload = json.loads(getattr(task_record, "task_config_json", "") or "{}")
+            if not isinstance(config_payload, dict):
+                config_payload = {}
+        except Exception:
+            config_payload = {}
+        multi_account_safety_enabled = bool(config_payload.get("multi_account_safety_enabled", False))
+        strategy_enabled = bool(config_payload.get("strategy_enabled", False))
+        safe_group_interval = max(5, int(group_interval or 5))
+        account_pool_size = max(1, len(account_ids))
+        dynamic_cooldown_seconds = max(3, min(90, int(safe_group_interval * max(1, min(account_pool_size - 1, 4)) * random.uniform(0.65, 1.35))))
+        
+        # Parse message pool
+        msg_pool = []
+        try:
+            parsed = json.loads(message)
+            if isinstance(parsed, list):
+                msg_pool = [str(x) for x in parsed if str(x).strip()]
+        except Exception:
+            pass
+            
+        if not msg_pool:
+            msg_pool = [message]
+        register_account_task_usage(
+            "campaign",
+            task_id,
+            account_ids,
+            {"company": task_company, "phone": phone},
+        )
+
+    try:
+        clients: Dict[str, TelegramClient] = {}
+        account_cooldowns: Dict[str, float] = {}
+        last_selected_account_id = ""
+        consecutive_send_count = 0
+        round_robin_index = 0
+        account_send_counts: Dict[str, int] = {}
+        blocked_group_keys: Dict[str, str] = {}
+
+        def campaign_group_key(raw_group: Dict[str, Any]) -> str:
+            username = str(raw_group.get("username") or "").lstrip("@").strip().lower()
+            if username:
+                return f"u:{username}"
+            chat_id = str(raw_group.get("chat_id") or "").strip()
+            if chat_id and chat_id != "0":
+                return f"id:{chat_id}"
+            return f"title:{str(raw_group.get('title') or '').strip().lower()}"
+
+        def is_campaign_permission_or_invalid_error(exc: Exception) -> bool:
+            if isinstance(exc, (errors.ChatAdminRequiredError, errors.ChatWriteForbiddenError, errors.UserBannedInChannelError)):
+                return True
+            text = str(exc).lower()
+            return any(token in text for token in [
+                "forbidden",
+                "write forbidden",
+                "chat_write_forbidden",
+                "user_banned",
+                "banned in channel",
+                "private",
+                "deleted",
+                "deactivated",
+                "restricted",
+                "not enough rights",
+                "spam",
+                "bot warning",
+                "machine warning",
+                "自动化",
+                "机器",
+                "警告",
+            ])
+
+        async def get_campaign_client(selected_account_id: str) -> TelegramClient:
+            client = clients.get(selected_account_id)
+            if client and client.is_connected():
+                return client
+            client = await get_client(selected_account_id)
+            if not await client.is_user_authorized():
+                raise Exception(f"账号未授权登录，任务无法执行: {phones_by_id.get(selected_account_id, selected_account_id)}")
+            clients[selected_account_id] = client
+            return client
+
+        async def choose_account_for_send() -> str:
+            nonlocal last_selected_account_id, consecutive_send_count, round_robin_index
+            if len(account_ids) <= 1:
+                selected = account_ids[0]
+                consecutive_send_count = consecutive_send_count + 1 if selected == last_selected_account_id else 1
+                last_selected_account_id = selected
+                return selected
+
+            if not multi_account_safety_enabled:
+                selected = account_ids[round_robin_index % len(account_ids)]
+                round_robin_index += 1
+                consecutive_send_count = consecutive_send_count + 1 if selected == last_selected_account_id else 1
+                last_selected_account_id = selected
+                return selected
+
+            now_ts = time.time()
+            ready_ids = [
+                acc_id for acc_id in account_ids
+                if account_cooldowns.get(acc_id, 0) <= now_ts
+            ]
+            if last_selected_account_id and len(ready_ids) > 1:
+                ready_ids = [acc_id for acc_id in ready_ids if acc_id != last_selected_account_id]
+            if ready_ids:
+                weights = []
+                for acc_id in ready_ids:
+                    sent_count = account_send_counts.get(acc_id, 0)
+                    weights.append(1 / (1 + sent_count))
+                selected = random.choices(ready_ids, weights=weights, k=1)[0]
+                consecutive_send_count = consecutive_send_count + 1 if selected == last_selected_account_id else 1
+                last_selected_account_id = selected
+                return selected
+            # If all accounts are cooling down, do not deadlock the task.
+            # Pick the account with the closest release time and least usage.
+            selected = min(
+                account_ids,
+                key=lambda acc_id: (
+                    max(0, account_cooldowns.get(acc_id, 0) - now_ts),
+                    account_send_counts.get(acc_id, 0),
+                    random.random(),
+                ),
+            )
+            wait_seconds = max(0, min(5, int(account_cooldowns.get(selected, 0) - now_ts)))
+            if wait_seconds:
+                await asyncio.sleep(wait_seconds)
+            consecutive_send_count = consecutive_send_count + 1 if selected == last_selected_account_id else 1
+            last_selected_account_id = selected
+            return selected
+
+        async def build_campaign_candidate_order() -> List[str]:
+            if len(account_ids) <= 1 or not multi_account_safety_enabled:
+                return [await choose_account_for_send()]
+
+            primary = await choose_account_for_send()
+            remaining = [acc_id for acc_id in account_ids if acc_id != primary]
+            random.shuffle(remaining)
+            remaining.sort(key=lambda acc_id: (account_send_counts.get(acc_id, 0), random.random()))
+            return [primary, *remaining]
+
+        async def resolve_campaign_target_for_account(client: TelegramClient, raw_group: Dict[str, Any]) -> Tuple[Any, int, str, bool]:
+            group_chat_id = raw_group.get("chat_id") or 0
+            group_title = raw_group.get("title") or ""
+            username = raw_group.get("username")
+            target_entity = None
+            joined_now = False
+
+            raw_target = username or group_title
+            if raw_target:
+                cleaned = str(raw_target).strip()
+                if "t.me/" in cleaned:
+                    cleaned = cleaned.split("t.me/", 1)[1]
+                elif "telegram.me/" in cleaned:
+                    cleaned = cleaned.split("telegram.me/", 1)[1]
+                cleaned = cleaned.split("?", 1)[0].strip()
+
+                if "joinchat/" in cleaned or cleaned.startswith("+"):
+                    invite_hash = cleaned.replace("joinchat/", "").replace("+", "").strip()
+                    try:
+                        from telethon.tl.functions.messages import ImportChatInviteRequest
+                        updates = await client(ImportChatInviteRequest(invite_hash))
+                        joined_now = True
+                        if updates and hasattr(updates, "chats") and updates.chats:
+                            target_entity = updates.chats[0]
+                            group_chat_id = target_entity.id
+                            group_title = getattr(target_entity, "title", group_title)
+                    except errors.UserAlreadyParticipantError:
+                        try:
+                            from telethon.tl.functions.messages import CheckChatInviteRequest
+                            from telethon.tl.types import ChatInviteAlready
+                            invite_info = await client(CheckChatInviteRequest(invite_hash))
+                            if isinstance(invite_info, ChatInviteAlready) and invite_info.chat:
+                                target_entity = invite_info.chat
+                                group_chat_id = target_entity.id
+                                group_title = getattr(target_entity, "title", group_title)
+                        except Exception as e:
+                            print(f"Error checking private chat invite: {e}")
+                    except Exception as e:
+                        raise Exception(f"加入私密群组失败: {str(e)}")
+                else:
+                    pub_username = cleaned.lstrip("@").strip()
+                    from telethon.tl.types import Channel
+                    from telethon.tl.functions.channels import JoinChannelRequest
+
+                    try:
+                        entity = await client.get_entity(pub_username)
+                        target_entity = entity
+                        group_title = getattr(entity, "title", group_title)
+                        group_chat_id = entity.id
+
+                        if isinstance(entity, Channel) and entity.left:
+                            await client(JoinChannelRequest(entity))
+                            joined_now = True
+                    except Exception as e:
+                        if not group_chat_id:
+                            raise Exception(f"解析公开群组失败: {str(e)}")
+
+            if not target_entity and group_chat_id:
+                try:
+                    entity = await client.get_entity(group_chat_id)
+                    target_entity = entity
+                    from telethon.tl.types import Channel
+                    from telethon.tl.functions.channels import JoinChannelRequest
+                    if isinstance(entity, Channel) and entity.left:
+                        await client(JoinChannelRequest(entity))
+                        joined_now = True
+                except Exception as e:
+                    if len(account_ids) <= 1 and not multi_account_safety_enabled:
+                        target_entity = group_chat_id
+                    else:
+                        raise Exception(f"无法确认账号是否已加入目标群组: {str(e)}")
+
+            if not target_entity and not group_chat_id:
+                raise Exception("无法解析目标群组用户名或ID")
+
+            return target_entity or group_chat_id, int(group_chat_id or 0), group_title, joined_now
+
+        async def write_campaign_log(
+            log_cycle: int,
+            log_group_title: str,
+            log_group_id: str,
+            log_account_id: str | None,
+            log_phone: str | None,
+            log_status: str,
+            log_detail: str,
+        ):
+            with Session(engine) as session:
+                new_log = CampaignLogDb(
+                    company=task_company,
+                    task_id=task_id,
+                    timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    cycle=log_cycle,
+                    group_title=log_group_title,
+                    group_id=str(log_group_id),
+                    account_id=log_account_id,
+                    phone=log_phone,
+                    status=log_status,
+                    detail=log_detail,
+                )
+                session.add(new_log)
+                session.commit()
+
+        cycle = max(1, int(task_record.current_cycle or 1))
+        while True:
+            # 1. Update status
+            with Session(engine) as session:
+                task = session.get(CampaignTaskDb, task_id)
+                if not task or task.status == "stopped":
+                    break
+                task.current_cycle = cycle
+                session.add(task)
+                session.commit()
+
+            # 2. Iterate through targets in this cycle
+            for idx, group in enumerate(target_groups):
+                # Check cancellation
+                with Session(engine) as session:
+                    task = session.get(CampaignTaskDb, task_id)
+                    if not task or task.status == "stopped":
+                        break
+
+                final_msg = ""
+                chat_id = group["chat_id"]
+                title = group["title"]
+                username = group.get("username")
+                
+                log_status = "success"
+                log_detail = ""
+                selected_account_id = ""
+                selected_phone = ""
+                group_key = campaign_group_key(group)
+
+                if group_key in blocked_group_keys:
+                    await write_campaign_log(
+                        cycle,
+                        title,
+                        str(chat_id),
+                        None,
+                        None,
+                        "skipped",
+                        f"本群上一轮已判定不可发言，本轮跳过。原因：{blocked_group_keys[group_key]}",
+                    )
+                    continue
+                
+                try:
+                    candidate_ids = await build_campaign_candidate_order()
+                    skipped_prepare_details: List[str] = []
+                    cannot_speak_details: List[str] = []
+                    invalid_or_warning_details: List[str] = []
+                    last_candidate_error = ""
+                    sent_this_group = False
+
+                    for candidate_account_id in candidate_ids:
+                        selected_account_id = candidate_account_id
+                        selected_phone = phones_by_id.get(selected_account_id, selected_account_id)
+                        client = await get_campaign_client(selected_account_id)
+
+                        if not client.is_connected():
+                            try:
+                                await client.connect()
+                            except Exception as conn_err:
+                                raise Exception(f"客户端连接已断开，尝试自动重连失败: {conn_err}")
+
+                        try:
+                            target_entity, resolved_chat_id, resolved_title, joined_now = await resolve_campaign_target_for_account(client, group)
+                            chat_id = resolved_chat_id or chat_id
+                            title = resolved_title or title
+                        except Exception as account_exc:
+                            last_candidate_error = f"{selected_phone} 检查群组失败：{account_exc}"
+                            if is_campaign_permission_or_invalid_error(account_exc):
+                                invalid_or_warning_details.append(last_candidate_error)
+                            if len(candidate_ids) > 1:
+                                await write_campaign_log(
+                                    cycle,
+                                    title,
+                                    str(chat_id),
+                                    selected_account_id,
+                                    selected_phone,
+                                    "skipped",
+                                    last_candidate_error,
+                                )
+                                continue
+                            raise
+
+                        if joined_now:
+                            prepare_detail = f"{selected_phone} 未加入该群，已先加入准备，本轮不发送，等待下一轮再判断"
+                            skipped_prepare_details.append(prepare_detail)
+                            await write_campaign_log(
+                                cycle,
+                                title,
+                                str(chat_id),
+                                selected_account_id,
+                                selected_phone,
+                                "skipped",
+                                prepare_detail,
+                            )
+                            if multi_account_safety_enabled:
+                                account_cooldowns[selected_account_id] = time.time() + max(10, min(60, safe_group_interval))
+                            continue
+
+                        try:
+                            if not isinstance(target_entity, int):
+                                can_speak = await check_can_speak(client, target_entity)
+                                if not can_speak:
+                                    no_speak_detail = f"{selected_phone} 已在群内但无发言权限，本轮换下一个账号尝试"
+                                    cannot_speak_details.append(no_speak_detail)
+                                    await write_campaign_log(
+                                        cycle,
+                                        title,
+                                        str(chat_id),
+                                        selected_account_id,
+                                        selected_phone,
+                                        "skipped",
+                                        no_speak_detail,
+                                    )
+                                    continue
+                        except Exception as speak_check_exc:
+                            last_candidate_error = f"{selected_phone} 发言权限检测失败：{speak_check_exc}"
+                            if is_campaign_permission_or_invalid_error(speak_check_exc):
+                                invalid_or_warning_details.append(last_candidate_error)
+                            await write_campaign_log(
+                                cycle,
+                                title,
+                                str(chat_id),
+                                selected_account_id,
+                                selected_phone,
+                                "skipped",
+                                last_candidate_error,
+                            )
+                            continue
+
+                        selected_msg = None
+                        if strategy_enabled:
+                            current_gtype = group.get("group_type")
+                            try:
+                                with Session(engine) as temp_session:
+                                    from db import GroupDb, ScrapedGroupDb
+                                    db_g = None
+                                    if chat_id:
+                                        g_ids = [str(chat_id), f"-{chat_id}", f"-100{chat_id}"]
+                                        db_g = temp_session.exec(select(GroupDb).where(GroupDb.id.in_(g_ids), GroupDb.company == task_company)).first()
+                                        if not db_g:
+                                            db_g = temp_session.exec(select(GroupDb).where(GroupDb.id.in_(g_ids))).first()
+                                    if not db_g and username:
+                                        db_g = temp_session.exec(select(GroupDb).where(GroupDb.username == username.lstrip("@").strip(), GroupDb.company == task_company)).first()
+                                        if not db_g:
+                                            db_g = temp_session.exec(select(GroupDb).where(GroupDb.username == username.lstrip("@").strip())).first()
+                                    
+                                    if db_g:
+                                        current_gtype = db_g.category
+                                    
+                                    db_sg = None
+                                    if chat_id:
+                                        g_ids = [str(chat_id), f"-{chat_id}", f"-100{chat_id}"]
+                                        db_sg = temp_session.exec(select(ScrapedGroupDb).where(ScrapedGroupDb.id.in_(g_ids))).first()
+                                    if not db_sg and username:
+                                        db_sg = temp_session.exec(select(ScrapedGroupDb).where(ScrapedGroupDb.username == username.lstrip("@").strip())).first()
+                                    if not db_sg and title:
+                                        db_sg = temp_session.exec(select(ScrapedGroupDb).where(ScrapedGroupDb.title == title)).first()
+                                    if db_sg and db_sg.group_type:
+                                        current_gtype = db_sg.group_type
+                            except Exception as gtype_err:
+                                print(f"Error resolving group type: {gtype_err}")
+                            if not current_gtype:
+                                current_gtype = "英文短"
+                            
+                            try:
+                                with Session(engine) as temp_session:
+                                    from db import PredefinedAdDb
+                                    stmt = select(PredefinedAdDb).where(
+                                        PredefinedAdDb.group_type == current_gtype,
+                                        PredefinedAdDb.company == task_company
+                                    )
+                                    matching_ads = temp_session.exec(stmt).all()
+                                    if not matching_ads:
+                                        stmt_admin = select(PredefinedAdDb).where(
+                                            PredefinedAdDb.group_type == current_gtype,
+                                            PredefinedAdDb.company == "admin"
+                                        )
+                                        matching_ads = temp_session.exec(stmt_admin).all()
+                                    if matching_ads:
+                                        selected_msg = random.choice(matching_ads).content
+                            except Exception as e:
+                                print(f"Error fetching strategy ad: {e}")
+
+                        if not selected_msg:
+                            if msg_pool:
+                                selected_msg = random.choice(msg_pool)
+                            else:
+                                selected_msg = "🌹 RosePay 广告投放中"
+
+                        emojis = ['👍', '🔥', '👏', '🎉', '🌟', '❤️', '😊', '🚀', '✨', '🎈', '📢', '💎', '💡', '✅', '⚡', '🏆', '🔔', '📣', '🎯', '🍀', '🌸', '🎁']
+                        emoji = random.choice(emojis)
+                        position = random.choice(['prefix', 'suffix'])
+                        final_msg = f"{emoji} {selected_msg}" if position == 'prefix' else f"{selected_msg} {emoji}"
+
+                        try:
+                            await client.send_message(target_entity or chat_id, final_msg)
+                        except (errors.ChatAdminRequiredError, errors.ChatWriteForbiddenError, errors.UserBannedInChannelError) as send_perm_exc:
+                            no_speak_detail = f"{selected_phone} 发送失败：无发言权限或账号被群限制 ({type(send_perm_exc).__name__})"
+                            cannot_speak_details.append(no_speak_detail)
+                            await write_campaign_log(
+                                cycle,
+                                title,
+                                str(chat_id),
+                                selected_account_id,
+                                selected_phone,
+                                "skipped",
+                                no_speak_detail,
+                            )
+                            continue
+                        except Exception as send_exc:
+                            if is_campaign_permission_or_invalid_error(send_exc):
+                                warn_detail = f"{selected_phone} 发送失败：群组不可发言/已删除/触发限制警告 ({send_exc})"
+                                invalid_or_warning_details.append(warn_detail)
+                                await write_campaign_log(
+                                    cycle,
+                                    title,
+                                    str(chat_id),
+                                    selected_account_id,
+                                    selected_phone,
+                                    "skipped",
+                                    warn_detail,
+                                )
+                                continue
+                            raise
+                        account_send_counts[selected_account_id] = account_send_counts.get(selected_account_id, 0) + 1
+                        try:
+                            await drain_pending_private_sends(selected_account_id, client, max_items=3)
+                        except Exception as drain_exc:
+                            print(f"[PrivateSendQueue] Drain after campaign send failed for {selected_account_id}: {drain_exc}")
+                        if multi_account_safety_enabled and selected_account_id:
+                            dynamic_cooldown_seconds = max(
+                                3,
+                                min(
+                                    90,
+                                    int(safe_group_interval * max(1, min(account_pool_size - 1, 4)) * random.uniform(0.65, 1.35)),
+                                ),
+                            )
+                            account_cooldowns[selected_account_id] = time.time() + dynamic_cooldown_seconds
+
+                        with Session(engine) as session:
+                            task = session.get(CampaignTaskDb, task_id)
+                            if task:
+                                task.success_count += 1
+                                session.add(task)
+                                session.commit()
+                        log_status = "success"
+                        log_detail = f"{selected_phone} 消息发送成功"
+                        sent_this_group = True
+                        break
+
+                    if not sent_this_group:
+                        log_status = "skipped"
+                        if cannot_speak_details and len(cannot_speak_details) >= len(candidate_ids):
+                            log_detail = "所有候选账号均无该群发言权限，本群后续轮次不再尝试。"
+                            blocked_group_keys[group_key] = log_detail
+                        elif invalid_or_warning_details and len(invalid_or_warning_details) >= len(candidate_ids):
+                            log_detail = "所有候选账号均无法访问/被限制/疑似被机器警告，本群后续轮次不再尝试。"
+                            blocked_group_keys[group_key] = log_detail
+                        elif len(candidate_ids) == 1 and (cannot_speak_details or invalid_or_warning_details):
+                            log_detail = (cannot_speak_details or invalid_or_warning_details)[0] + "；单账号任务后续轮次不再尝试该群。"
+                            blocked_group_keys[group_key] = log_detail
+                        elif skipped_prepare_details:
+                            log_detail = "所有候选账号本轮都未确认可直接发送，已执行入群准备，本群本轮跳过"
+                        else:
+                            log_detail = last_candidate_error or "没有可用于该群本轮发送的账号，本群本轮跳过"
+                except errors.FloodWaitError as exc:
+                    log_status = "failed"
+                    log_detail = f"触发 Telegram 限流，需要等待 {exc.seconds} 秒"
+                    with Session(engine) as session:
+                        task = session.get(CampaignTaskDb, task_id)
+                        if task:
+                            task.fail_count += 1
+                            session.add(task)
+                            session.commit()
+                    # Log failure
+                    with Session(engine) as session:
+                        new_log = CampaignLogDb(
+                            company=task_company,
+                            task_id=task_id,
+                            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            cycle=cycle,
+                            group_title=title,
+                            group_id=str(chat_id),
+                            account_id=selected_account_id,
+                            phone=selected_phone,
+                            status=log_status,
+                            detail=log_detail
+                        )
+                        session.add(new_log)
+                        session.commit()
+                    # Cool down only the account that triggered FloodWait.
+                    if selected_account_id:
+                        account_cooldowns[selected_account_id] = time.time() + int(exc.seconds)
+                    await asyncio.sleep(min(int(exc.seconds), max(5, group_interval)))
+                    continue
+                except (errors.ChatAdminRequiredError, errors.ChatWriteForbiddenError, errors.UserBannedInChannelError) as exc:
+                    log_status = "failed"
+                    log_detail = f"{selected_phone or '未知账号'} 发送失败：无发言权限 ({type(exc).__name__})"
+                    with Session(engine) as session:
+                        task = session.get(CampaignTaskDb, task_id)
+                        if task:
+                            task.fail_count += 1
+                            session.add(task)
+                            session.commit()
+                except Exception as exc:
+                    log_status = "failed"
+                    log_detail = f"{selected_phone or '未知账号'} 发送失败：{str(exc)}"
+                    with Session(engine) as session:
+                        task = session.get(CampaignTaskDb, task_id)
+                        if task:
+                            task.fail_count += 1
+                            session.add(task)
+                            session.commit()
+
+                # Write sending log to db
+                with Session(engine) as session:
+                    new_log = CampaignLogDb(
+                        company=task_company,
+                        task_id=task_id,
+                        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        cycle=cycle,
+                        group_title=title,
+                        group_id=str(chat_id),
+                        account_id=selected_account_id or None,
+                        phone=selected_phone or None,
+                        status=log_status,
+                        detail=log_detail if log_detail else f"{selected_phone} 消息发送成功"
+                    )
+                    session.add(new_log)
+                    session.commit()
+
+                # Group Delay
+                if idx < len(target_groups) - 1:
+                    for queued_account_id in list(account_ids):
+                        try:
+                            queued_client = clients.get(queued_account_id)
+                            if queued_client and queued_client.is_connected():
+                                await drain_pending_private_sends(queued_account_id, queued_client, max_items=3)
+                        except Exception as drain_exc:
+                            print(f"[PrivateSendQueue] Drain before campaign sleep failed for {queued_account_id}: {drain_exc}")
+                    delay = group_interval
+                    if is_safety:
+                        # Safety Blasting: random delay between 5 and group_interval
+                        delay = random.randint(5, max(5, group_interval))
+                    await asyncio.sleep(delay)
+
+            # Cycle complete check
+            if max_cycles > 0 and cycle >= max_cycles:
+                with Session(engine) as session:
+                    task = session.get(CampaignTaskDb, task_id)
+                    if task and task.status == "running":
+                        task.status = "completed"
+                        task.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        session.add(task)
+                        session.commit()
+                break
+
+            # Round Interval Sleep
+            cycle += 1
+            for queued_account_id in list(account_ids):
+                try:
+                    queued_client = clients.get(queued_account_id)
+                    if queued_client and queued_client.is_connected():
+                        await drain_pending_private_sends(queued_account_id, queued_client, max_items=5)
+                except Exception as drain_exc:
+                    print(f"[PrivateSendQueue] Drain before round sleep failed for {queued_account_id}: {drain_exc}")
+            # Sleep round_interval minutes
+            await asyncio.sleep(round_interval * 60)
+
+    except asyncio.CancelledError:
+        with Session(engine) as session:
+            task = session.get(CampaignTaskDb, task_id)
+            if task and task.status == "running":
+                task.status = "stopped"
+                task.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                session.add(task)
+                session.commit()
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        with Session(engine) as session:
+            task = session.get(CampaignTaskDb, task_id)
+            if task and task.status == "running":
+                task.status = "failed"
+                task.error_detail = str(e)
+                task.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                session.add(task)
+                session.commit()
+    finally:
+        try:
+            with Session(engine) as session:
+                task = session.get(CampaignTaskDb, task_id)
+                if task:
+                    task_account_ids = parse_campaign_account_ids(task)
+                    account_lines = "\n".join(
+                        f"• {html.escape(get_account_notify_label(acc_id))}"
+                        for acc_id in task_account_ids[:10]
+                    )
+                    if len(task_account_ids) > 10:
+                        account_lines += f"\n• ... +{len(task_account_ids) - 10}"
+                    status_label = {
+                        "completed": "已完成",
+                        "failed": "失败",
+                        "stopped": "已停止",
+                        "running": "结束处理中",
+                    }.get(task.status, task.status)
+                    logs = session.exec(
+                        select(CampaignLogDb).where(CampaignLogDb.task_id == task_id)
+                    ).all()
+                    cycle_stats: Dict[int, Dict[str, int]] = {}
+                    for log in logs:
+                        cycle = int(getattr(log, "cycle", 0) or 0)
+                        bucket = cycle_stats.setdefault(cycle, {"total": 0, "success": 0, "failed": 0})
+                        bucket["total"] += 1
+                        if getattr(log, "status", "") == "success":
+                            bucket["success"] += 1
+                        elif getattr(log, "status", "") == "failed":
+                            bucket["failed"] += 1
+                    total_rounds = len(cycle_stats) or int(task.current_cycle or 0) or 1
+                    total_logs = sum(item["total"] for item in cycle_stats.values()) or len(logs)
+                    avg_success_rate = (
+                        sum((item["success"] / item["total"]) for item in cycle_stats.values() if item["total"]) / max(1, len(cycle_stats)) * 100
+                    ) if cycle_stats else 0
+                    avg_failed_rate = (
+                        sum((item["failed"] / item["total"]) for item in cycle_stats.values() if item["total"]) / max(1, len(cycle_stats)) * 100
+                    ) if cycle_stats else 0
+                    owner_username = task.owner_username or ""
+                    target_mention = get_ops_target_mention(owner_username)
+                    event = {
+                        "type": "campaign",
+                        "task_id": task_id,
+                        "owner_username": owner_username,
+                        "allowed_username": get_user_telegram_contact(owner_username).lstrip("@"),
+                        "company": task.company or "",
+                        "status": task.status,
+                        "account_labels": [get_account_notify_label(acc_id) for acc_id in task_account_ids],
+                        "summary": {
+                            "rounds": total_rounds,
+                            "groups": len(json.loads(task.target_groups_json or "[]")),
+                            "log_rows": total_logs,
+                            "success": task.success_count,
+                            "failed": task.fail_count,
+                            "avg_success_rate": round(avg_success_rate, 2),
+                            "avg_failed_rate": round(avg_failed_rate, 2),
+                        },
+                    }
+                    send_ops_bot_notification_with_buttons(
+                        "\n".join([
+                            f"{html.escape(target_mention)} 后台执行广告轰炸完毕",
+                            html_line("状态", status_label),
+                            html_line("轰炸轮数", total_rounds),
+                            html_line("目标群数", len(json.loads(task.target_groups_json or "[]"))),
+                            html_line("成功", task.success_count),
+                            html_line("失败", task.fail_count),
+                            html_line("每轮平均成功率", f"{avg_success_rate:.1f}%"),
+                            "请点击下方按钮查看详细日志。",
+                            html_line("时间", ops_event_time()),
+                        ]),
+                        event,
+                        [[{"text": "检查日志", "callback_data": "opslog:{event_id}"}]],
+                    )
+        except Exception as exc:
+            print(f"[OpsNotify] Failed to send campaign completion notification: {exc}")
+        try:
+            release_account_task_usage(task_id, account_ids, source="campaign-task-finish")
+        except Exception as exc:
+            print(f"Failed to release campaign task usage {task_id}: {exc}")
+        active_campaign_tasks.pop(task_id, None)
+
+@app.get("/api/accounts/{account_id}/folders-groups")
+@account_api_operation("read_folder_groups", label="读取文件夹群组")
+async def get_account_folders_groups(account_id: str, user: dict = Depends(get_current_user)):
+    """Fetches Telegram folders and retrieves list of group chats inside each folder in real-time."""
+    check_account_company(account_id, user)
+    from sync_folder_groups import normalize_title, entity_type
+    from telethon.tl.types import DialogFilter, DialogFilterChatlist
+    from telethon import utils
+    
+    try:
+        client = await get_client(account_id)
+        if not await client.is_user_authorized():
+            raise HTTPException(status_code=401, detail="Account is not authorized")
+            
+        # 1. Fetch filters (folders)
+        result = await client(functions.messages.GetDialogFiltersRequest())
+        raw_filters = getattr(result, "filters", result)
+        filters = [
+            item
+            for item in raw_filters
+            if isinstance(item, (DialogFilter, DialogFilterChatlist))
+        ]
+        
+        # 2. Fetch dialogs once to lookup
+        dialogs = await client.get_dialogs()
+        
+        # 3. Scan
+        include_types = {"group", "supergroup"}
+        folders_groups = {}
+        for folder in filters:
+            folder_title = normalize_title(folder.title)
+            folder_groups = []
+            
+            explicit_peers = list(getattr(folder, "include_peers", []) or []) + list(getattr(folder, "pinned_peers", []) or [])
+            exclude_peers = list(getattr(folder, "exclude_peers", []) or [])
+            
+            exclude_ids = set()
+            for p in exclude_peers:
+                try:
+                    exclude_ids.add(utils.get_peer_id(p))
+                except Exception:
+                    pass
+            
+            seen_ids = set()
+            
+            # Resolve explicit peers
+            for peer in explicit_peers:
+                peer_id = None
+                try:
+                    peer_id = utils.get_peer_id(peer)
+                except Exception:
+                    pass
+                if not peer_id or peer_id in seen_ids or peer_id in exclude_ids:
+                    continue
+                    
+                dlg = next((d for d in dialogs if utils.get_peer_id(d.entity) == peer_id), None)
+                if dlg:
+                    t = entity_type(dlg.entity)
+                    if t in include_types:
+                        seen_ids.add(peer_id)
+                        folder_groups.append({
+                            "chat_id": peer_id,
+                            "title": dlg.name or "未命名群组",
+                            "username": getattr(dlg.entity, "username", None) or ""
+                        })
+            
+            # Dynamic rules
+            has_dynamic_groups = bool(getattr(folder, "groups", False))
+            if has_dynamic_groups:
+                for dlg in dialogs:
+                    peer_id = utils.get_peer_id(dlg.entity)
+                    if peer_id in seen_ids or peer_id in exclude_ids:
+                        continue
+                    t = entity_type(dlg.entity)
+                    if t in include_types:
+                        seen_ids.add(peer_id)
+                        folder_groups.append({
+                            "chat_id": peer_id,
+                            "title": dlg.name or "未命名群组",
+                            "username": getattr(dlg.entity, "username", None) or ""
+                        })
+            
+            folders_groups[folder_title] = folder_groups
+            
+        # Build virtual folders for all groups and non-folder groups
+        all_groups = []
+        for dlg in dialogs:
+            peer_id = utils.get_peer_id(dlg.entity)
+            t = entity_type(dlg.entity)
+            if t in include_types:
+                all_groups.append({
+                    "chat_id": peer_id,
+                    "title": dlg.name or "未命名群组",
+                    "username": getattr(dlg.entity, "username", None) or ""
+                })
+
+        all_folder_group_ids = set()
+        for folder_groups in folders_groups.values():
+            for g in folder_groups:
+                all_folder_group_ids.add(g["chat_id"])
+
+        uncategorized_groups = [g for g in all_groups if g["chat_id"] not in all_folder_group_ids]
+
+        final_folders = {}
+        if all_groups:
+            final_folders["所有群组"] = all_groups
+
+        for k, v in folders_groups.items():
+            final_folders[k] = v
+
+        if uncategorized_groups:
+            final_folders["非文件夹群组"] = uncategorized_groups
+
+        return final_folders
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"获取文件夹及群组失败: {str(e)}")
+
+@app.post("/api/campaign/tasks")
+async def create_campaign_task(req: MessageCampaignTaskRequest, user: dict = Depends(get_current_user)):
+    requested_account_ids = req.account_ids or [req.account_id]
+    requested_account_ids = [str(x).strip() for x in requested_account_ids if str(x).strip()]
+    requested_account_ids = list(dict.fromkeys(requested_account_ids))
+    if not requested_account_ids:
+        raise HTTPException(status_code=400, detail="请选择至少一个执行账号。")
+
+    for selected_account_id in requested_account_ids:
+        if is_account_busy_with_task(selected_account_id):
+            raise HTTPException(status_code=400, detail=f"账号 {selected_account_id} 有未完成的任务，无法启动新任务。")
+        
+    if req.group_interval_seconds < 5:
+        raise HTTPException(status_code=400, detail="单个群发送间隔不能小于 5 秒，以防触发 Telegram 风控锁定！")
+
+    selected_accounts = []
+    for selected_account_id in requested_account_ids:
+        db_account = check_account_company(selected_account_id, user)
+        if getattr(db_account, "is_available", True) is False:
+            raise HTTPException(status_code=400, detail=f"账号 {db_account.account_name or selected_account_id} 当前为占用/禁用状态，无法启动轰炸任务。")
+        selected_accounts.append(db_account)
+
+    primary_account = selected_accounts[0]
+    primary_account_id = primary_account.id
+    phone = primary_account.account_name or primary_account_id
+    phones_by_id = {
+        acc.id: (acc.account_name or acc.id)
+        for acc in selected_accounts
+    }
+    
+    from db import engine, CampaignTaskDb, Session
+    import uuid
+    import json
+    from datetime import datetime
+
+    # Save last params
+    try:
+        last_params_path = Path("data/campaign_last_params.json")
+        last_params_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        last_params = {}
+        if last_params_path.exists():
+            try:
+                last_params = json.loads(last_params_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+                
+        for selected_account_id in requested_account_ids:
+            last_params[selected_account_id] = {
+            "max_cycles": req.max_cycles,
+            "round_interval_minutes": req.round_interval_minutes,
+            "group_interval_seconds": req.group_interval_seconds,
+            "is_safety": req.is_safety,
+            "message": req.message,
+            "target_groups": [g.model_dump() for g in req.target_groups],
+            "account_ids": requested_account_ids,
+            "multi_account_safety_enabled": req.multi_account_safety_enabled,
+            "strategy_enabled": req.strategy_enabled
+            }
+        last_params_path.write_text(json.dumps(last_params, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"Failed to save last campaign params: {e}")
+
+    task_id = str(uuid.uuid4())
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    with Session(engine) as session:
+        new_task = CampaignTaskDb(
+            id=task_id,
+            owner_username=user["username"],
+            company=user["company"],
+            account_id=primary_account_id,
+            phone=phone,
+            account_ids_json=json.dumps(requested_account_ids, ensure_ascii=False),
+            phones_json=json.dumps(phones_by_id, ensure_ascii=False),
+            status="running",
+            max_cycles=req.max_cycles,
+            current_cycle=0,
+            round_interval_minutes=req.round_interval_minutes,
+            group_interval_seconds=req.group_interval_seconds,
+            is_safety=req.is_safety,
+            message=req.message,
+            target_groups_json=json.dumps([g.model_dump() for g in req.target_groups], ensure_ascii=False),
+            task_config_json=json.dumps({
+                "multi_account_safety_enabled": req.multi_account_safety_enabled,
+                "strategy_enabled": req.strategy_enabled
+            }, ensure_ascii=False),
+            success_count=0,
+            fail_count=0,
+            created_at=now_str,
+            updated_at=now_str,
+            created_by=user["username"],
+            updated_by=user["username"]
+        )
+        session.add(new_task)
+        session.commit()
+
+    t = asyncio.create_task(campaign_worker_task(task_id))
+    active_campaign_tasks[task_id] = t
+    register_account_task_usage(
+        "campaign",
+        task_id,
+        requested_account_ids,
+        {"company": user["company"], "created_by": user["username"]},
+    )
+    
+    return {"status": "success", "task_id": task_id}
+
+@app.get("/api/campaign/tasks")
+def list_campaign_tasks(user: dict = Depends(get_current_user)):
+    from db import engine, AccountDb, CampaignTaskDb, Session, select
+    with Session(engine) as session:
+        if user["role"] == "admin":
+            stmt = select(CampaignTaskDb).order_by(CampaignTaskDb.created_at.desc())
+            results = session.exec(stmt).all()
+        else:
+            stmt_acc = query_allowed_accounts(session, user)
+            allowed_ids = {acc.id for acc in session.exec(stmt_acc).all()}
+            stmt = select(CampaignTaskDb).order_by(CampaignTaskDb.created_at.desc())
+            results = [
+                task for task in session.exec(stmt).all()
+                if any(acc_id in allowed_ids for acc_id in parse_campaign_account_ids(task))
+            ]
+        return [task.model_dump() for task in results]
+
+@app.post("/api/campaign/tasks/{task_id}/stop")
+async def stop_campaign_task(task_id: str, user: dict = Depends(get_current_user)):
+    from db import engine, CampaignTaskDb, Session, AccountDb
+    from datetime import datetime
+    
+    with Session(engine) as session:
+        task = session.get(CampaignTaskDb, task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if user["role"] != "admin":
+            allowed_ids = {acc.id for acc in session.exec(query_allowed_accounts(session, user)).all()}
+            if not any(acc_id in allowed_ids for acc_id in parse_campaign_account_ids(task)):
+                raise HTTPException(status_code=403, detail="没有权限操作此任务")
+        affected_account_ids = parse_campaign_account_ids(task)
+
+        t = active_campaign_tasks.get(task_id)
+        if t:
+            t.cancel()
+            
+        if task.status == "running":
+            task.status = "stopped"
+            task.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            task.updated_by = user["username"]
+            session.add(task)
+            session.commit()
+        release_account_task_usage(task_id, affected_account_ids, source="campaign-task-stop")
+            
+    return {"status": "success"}
+
+@app.post("/api/campaign/stop-all")
+async def stop_all_campaigns(user: dict = Depends(get_current_user)):
+    from db import engine, AccountDb, CampaignTaskDb, Session, select
+    from datetime import datetime
+    
+    with Session(engine) as session:
+        if user["role"] == "admin":
+            stmt = select(CampaignTaskDb).where(CampaignTaskDb.status == "running")
+            running_tasks = session.exec(stmt).all()
+        else:
+            stmt_acc = query_allowed_accounts(session, user)
+            allowed_ids = {acc.id for acc in session.exec(stmt_acc).all()}
+            stmt = select(CampaignTaskDb).where(CampaignTaskDb.status == "running")
+            running_tasks = [
+                task for task in session.exec(stmt).all()
+                if any(acc_id in allowed_ids for acc_id in parse_campaign_account_ids(task))
+            ]
+        stopped_task_accounts = []
+        for task in running_tasks:
+            t = active_campaign_tasks.get(task.id)
+            if t:
+                t.cancel()
+                try:
+                    del active_campaign_tasks[task.id]
+                except KeyError:
+                    pass
+            task.status = "stopped"
+            task.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            task.updated_by = user["username"]
+            stopped_task_accounts.append((task.id, parse_campaign_account_ids(task)))
+            session.add(task)
+        session.commit()
+    for stopped_task_id, account_ids in stopped_task_accounts:
+        release_account_task_usage(stopped_task_id, account_ids, source="campaign-stop-all")
+
+    return {"status": "success"}
+
+@app.get("/api/campaign/tasks/{task_id}/logs")
+def get_campaign_task_logs(task_id: str, limit: int = 200, user: dict = Depends(get_current_user)):
+    from db import engine, CampaignLogDb, CampaignTaskDb, Session, select, AccountDb
+    with Session(engine) as session:
+        task = session.get(CampaignTaskDb, task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if user["role"] != "admin":
+            allowed_ids = {acc.id for acc in session.exec(query_allowed_accounts(session, user)).all()}
+            if not any(acc_id in allowed_ids for acc_id in parse_campaign_account_ids(task)):
+                raise HTTPException(status_code=403, detail="没有权限操作此任务")
+            
+        stmt = select(CampaignLogDb).where(CampaignLogDb.task_id == task_id).order_by(CampaignLogDb.id.desc()).limit(limit)
+        results = session.exec(stmt).all()
+        return [log.model_dump() for log in results]
+
+@app.get("/api/campaign/accounts/{account_id}/last-params")
+def get_campaign_last_params(account_id: str, user: dict = Depends(get_current_user)):
+    check_account_company(account_id, user)
+    import json
+    last_params_path = Path("data/campaign_last_params.json")
+    if last_params_path.exists():
+        try:
+            last_params = json.loads(last_params_path.read_text(encoding="utf-8"))
+            if account_id in last_params:
+                return last_params[account_id]
+        except Exception:
+            pass
+    return {"status": "none"}
+
+class PredefinedAdRequest(BaseModel):
+    description: str
+    content: str
+    group_type: str = "英文短"
+
+@app.get("/api/predefined-ads")
+def list_predefined_ads(user: dict = Depends(get_current_user)):
+    from db import engine, PredefinedAdDb, Session, select
+    with Session(engine) as session:
+        if user["username"] in ("eason", "admin"):
+            stmt = select(PredefinedAdDb)
+        else:
+            stmt = select(PredefinedAdDb).where(PredefinedAdDb.company == user["company"])
+        results = session.exec(stmt).all()
+        return [item.model_dump() for item in results]
+
+@app.post("/api/predefined-ads")
+def create_predefined_ad(req: PredefinedAdRequest, user: dict = Depends(get_current_user)):
+    from db import engine, PredefinedAdDb, Session
+    desc = req.description.strip()
+    cnt = req.content.strip()
+    gtype = req.group_type.strip()
+    if not desc:
+        raise HTTPException(status_code=400, detail="描述不能为空")
+    if not cnt:
+        raise HTTPException(status_code=400, detail="内容不能为空")
+    if gtype not in ("中文长", "中文短", "英文长", "英文短"):
+        raise HTTPException(status_code=400, detail="非法的群组类型")
+        
+    content_len = len(cnt)
+    if "短" in gtype:
+        if content_len >= 200:
+            raise HTTPException(status_code=400, detail=f"短广告内容长度必须在 200 字以下（当前 {content_len} 字）")
+    elif "长" in gtype:
+        if content_len < 200:
+            raise HTTPException(status_code=400, detail=f"长广告内容长度必须在 200 字及以上（当前 {content_len} 字）")
+        
+    with Session(engine) as session:
+        new_ad = PredefinedAdDb(
+            description=desc,
+            content=cnt,
+            group_type=gtype,
+            company=user["company"],
+            created_by=user["username"],
+            updated_by=user["username"]
+        )
+        session.add(new_ad)
+        session.commit()
+        session.refresh(new_ad)
+        return new_ad.model_dump()
+
+@app.put("/api/predefined-ads/{ad_id}")
+def update_predefined_ad(ad_id: int, req: PredefinedAdRequest, user: dict = Depends(get_current_user)):
+    from db import engine, PredefinedAdDb, Session
+    desc = req.description.strip()
+    cnt = req.content.strip()
+    gtype = req.group_type.strip()
+    if not desc:
+        raise HTTPException(status_code=400, detail="描述不能为空")
+    if not cnt:
+        raise HTTPException(status_code=400, detail="内容不能为空")
+    if gtype not in ("中文长", "中文短", "英文长", "英文短"):
+        raise HTTPException(status_code=400, detail="非法的群组类型")
+
+    content_len = len(cnt)
+    if "短" in gtype and content_len >= 200:
+        raise HTTPException(status_code=400, detail=f"短广告内容长度必须在 200 字以下（当前 {content_len} 字）")
+    if "长" in gtype and content_len < 200:
+        raise HTTPException(status_code=400, detail=f"长广告内容长度必须在 200 字及以上（当前 {content_len} 字）")
+
+    with Session(engine) as session:
+        ad_item = session.get(PredefinedAdDb, ad_id)
+        if not ad_item:
+            raise HTTPException(status_code=404, detail="广告内容未找到")
+        if user["username"] not in ("eason", "admin") and user["company"] != "admin" and ad_item.company != user["company"]:
+            raise HTTPException(status_code=404, detail="广告内容未找到")
+        ad_item.description = desc
+        ad_item.content = cnt
+        ad_item.group_type = gtype
+        ad_item.updated_by = user["username"]
+        session.add(ad_item)
+        session.commit()
+        session.refresh(ad_item)
+        return ad_item.model_dump()
+
+@app.delete("/api/predefined-ads/{ad_id}")
+def delete_predefined_ad(ad_id: int, user: dict = Depends(get_current_user)):
+    from db import engine, PredefinedAdDb, Session
+    with Session(engine) as session:
+        ad_item = session.get(PredefinedAdDb, ad_id)
+        if not ad_item:
+            raise HTTPException(status_code=404, detail="广告内容未找到")
+        if user["username"] not in ("eason", "admin") and user["company"] != "admin" and ad_item.company != user["company"]:
+            raise HTTPException(status_code=404, detail="广告内容未找到")
+        session.delete(ad_item)
+        session.commit()
+        return {"status": "success"}
+
+class SendStrategyMessageRequest(BaseModel):
+    chat_id: str
+    gtype: str
+    fallback_message: str
+    company: str
+
+@app.post("/api/internal/send-strategy-message")
+async def send_strategy_message(req: SendStrategyMessageRequest):
+    """
+    Internal API called by ad_sender.py to send a strategy message to a group.
+    It selects a random online account and a random matched ad template.
+    """
+    from db import engine, PredefinedAdDb, Session, select
+    import random
+    
+    chat_id = req.chat_id
+    gtype = req.gtype
+    fallback_message = req.fallback_message
+    company = req.company
+    
+    # 1. Find all logged-in and active accounts for this company
+    allowed_clients = []
+    for account_id, client in list(active_clients.items()):
+        try:
+            if client.is_connected() and await client.is_user_authorized():
+                # Verify if this account belongs to the user's company or is admin
+                from db import AccountDb
+                with Session(engine) as session:
+                    db_acc = session.get(AccountDb, account_id)
+                    if db_acc and (db_acc.company == company or company in ("admin", "rosepay")):
+                        allowed_clients.append((account_id, client, db_acc.account_name or account_id))
+        except Exception:
+            continue
+            
+    if not allowed_clients:
+        raise HTTPException(status_code=400, detail="没有可用的在线电报账号")
+        
+    # Randomly pick an account client
+    selected_account_id, selected_client, selected_account_name = random.choice(allowed_clients)
+    
+    # 2. Select a random ad matching the gtype from predefined_ads
+    selected_message = fallback_message
+    try:
+        with Session(engine) as session:
+            stmt = select(PredefinedAdDb).where(
+                PredefinedAdDb.group_type == gtype,
+                PredefinedAdDb.company == company
+            )
+            ads = session.exec(stmt).all()
+            if ads:
+                selected_message = random.choice(ads).content
+            else:
+                # Fallback to admin global ads of this gtype
+                stmt_admin = select(PredefinedAdDb).where(
+                    PredefinedAdDb.group_type == gtype,
+                    PredefinedAdDb.company == "admin"
+                )
+                ads_admin = session.exec(stmt_admin).all()
+                if ads_admin:
+                    selected_message = random.choice(ads_admin).content
+    except Exception as e:
+        print(f"Error fetching predefined ads in internal API: {e}")
+        
+    # 3. Perform sending message using the selected client
+    try:
+        try:
+            peer = int(chat_id)
+        except ValueError:
+            peer = chat_id
+            
+        await selected_client.send_message(peer, selected_message)
+        
+        # Log this send operation
+        try:
+            from db import AdLogDb
+            from datetime import datetime, timezone
+            with Session(engine) as session:
+                new_log = AdLogDb(
+                    time=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    folder=gtype,
+                    chat_id=str(chat_id),
+                    title=f"[策略] {gtype}",
+                    action="发送",
+                    status="成功",
+                    detail=f"执行账号: {selected_account_name} ({selected_account_id})",
+                    company=company
+                )
+                session.add(new_log)
+                session.commit()
+        except Exception as log_err:
+            print(f"Failed to write strategy ad log: {log_err}")
+            
+        return {
+            "status": "success",
+            "account_id": selected_account_id,
+            "account_name": selected_account_name,
+            "message_sent": selected_message
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"发送失败(使用账号 {selected_account_name}): {str(exc)}")
+
+# --- CAMPAIGN MANAGEMENT APIs ---
+
+@app.post("/api/campaign/start")
+async def start_campaign(req: CampaignStartRequest, user: dict = Depends(get_current_user)):
+    """Configures and runs a subprocess campaign task for an account using SQLite config."""
+    account_id = req.account_id
+    if is_account_busy_with_task(account_id):
+        raise HTTPException(status_code=400, detail="该账号有未完成的任务，无法启动新任务。")
+        
+    folder_name = req.folder_name.strip()
+    message_text = req.message_text.strip()
+    task_interval_minutes = req.task_interval_minutes
+    group_interval_seconds = req.group_interval_seconds
+    is_strategy = getattr(req, "is_strategy", False)
+
+    if not folder_name:
+        raise HTTPException(status_code=400, detail="Folder name is required")
+    if not is_strategy and not message_text:
+        raise HTTPException(status_code=400, detail="Message text is required")
+
+    # Stop any active process for this account first
+    if account_id in active_processes:
+        process = active_processes[account_id]
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except Exception:
+                process.kill()
+
+    # 1. Update SQLite AccountDb settings
+    db_account = check_account_company(account_id, user)
+    if getattr(db_account, "is_available", True) is False:
+        raise HTTPException(status_code=400, detail="该账号当前为禁用状态，无法启动任务。")
+    from db import engine, AccountDb, Session
+    with Session(engine) as session:
+        # Re-fetch in local session context to write changes safely
+        db_account = session.get(AccountDb, account_id)
+        
+        db_account.campaign_folder = folder_name
+        db_account.campaign_message = message_text
+        db_account.campaign_interval_minutes = task_interval_minutes
+        db_account.campaign_group_interval_seconds = group_interval_seconds
+        
+        session.add(db_account)
+        session.commit()
+        
+        # Sync the .json file so that CLI scripts can also run if needed
+        path = account_config_path(account_id)
+        save_json(path, db_account.to_dict())
+
+    # Disconnect active client in web server to prevent SQLite session locks
+    if account_id in active_clients:
+        try:
+            client = active_clients.pop(account_id, None)
+            registered_listeners.discard(account_id)
+            active_clients_last_accessed.pop(account_id, None)
+            set_account_status(account_id, {"is_connected": False}, source="campaign-disconnect")
+            if client and client.is_connected():
+                print(f"Disconnecting active client {account_id} before starting campaign to prevent database lock...")
+                await client.disconnect()
+        except Exception as e:
+            print(f"Error disconnecting client {account_id} before campaign: {e}")
+
+    # 2. Launch subprocess using --account parameter (DB config)
+    root_dir = Path(__file__).resolve().parent
+    python_exe = str(root_dir / ".venv" / "Scripts" / "python.exe")
+    if not os.path.exists(python_exe):
+        python_exe = str(root_dir / ".venv" / "bin" / "python")
+        if not os.path.exists(python_exe):
+            python_exe = sys.executable
+            
+    script_path = str(root_dir / "ad_sender.py")
+
+    command = [
+        python_exe,
+        script_path,
+        "--account", account_id,
+        "--folder", folder_name,
+        "--send",
+        "--no-confirm"
+    ]
+    if is_strategy:
+        command.append("--strategy")
+
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(root_dir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        active_processes[account_id] = process
+        return {"status": "started", "pid": process.pid}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start campaign: {str(e)}")
+
+@app.post("/api/campaign/stop")
+def stop_campaign(account_id: str = Body(..., embed=True), user: dict = Depends(get_current_user)):
+    """Stops the active campaign task for an account."""
+    check_account_company(account_id, user)
+    stopped = False
+    if account_id in active_processes:
+        process = active_processes[account_id]
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        active_processes.pop(account_id, None)
+        stopped = True
+
+    # OS level fallback
+    pid = find_campaign_process(account_id)
+    if pid:
+        try:
+            import os, signal
+            os.kill(pid, signal.SIGTERM)
+            stopped = True
+        except Exception:
+            try:
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                stopped = True
+            except Exception:
+                pass
+
+    if stopped:
+        return {"status": "stopped", "message": "Campaign stopped successfully"}
+    else:
+        return {"status": "stopped", "message": "No campaign running for this account"}
+
+@app.get("/api/campaign/status/{account_id}")
+def get_campaign_status(account_id: str, user: dict = Depends(get_current_user)):
+    """Checks whether a campaign is currently running for an account."""
+    check_account_company(account_id, user)
+    is_running = account_id in active_processes and active_processes[account_id].poll() is None
+    if not is_running:
+        is_running = find_campaign_process(account_id) is not None
+    return {"is_running": is_running}
+
+@app.get("/api/campaign/logs")
+def get_campaign_logs(limit: int = 50, user: dict = Depends(get_current_user)):
+    from db import engine, AdLogDb, Session, select
+    try:
+        with Session(engine) as session:
+            if user["username"] in ("eason", "admin") or user["company"] == "admin":
+                stmt = select(AdLogDb).order_by(AdLogDb.id.desc()).limit(limit)
+            else:
+                stmt = select(AdLogDb).where(AdLogDb.company == user["company"]).order_by(AdLogDb.id.desc()).limit(limit)
+            results = session.exec(stmt).all()
+            return [log.model_dump() for log in results]
+    except Exception as e:
+        print(f"Failed to read logs from SQLite: {e}")
+        return []
+
+# --- AUTO JOIN GROUP API & ENGINE ---
+
+class JoinTaskRequest(BaseModel):
+    account_ids: List[str]
+    links: List[str]
+    mode: str  # "simultaneous" or "sequential"
+    strategy: str  # "fixed" or "safety"
+    fixed_delay: int = 30
+    safety_groups: int = 5
+    safety_minutes: int = 30
+    move_to_folder: Optional[bool] = False
+    target_folder_name: Optional[str] = ""
+    folder_by_type: Optional[bool] = False
+    max_rounds: Optional[int] = None
+    groups_per_round: int = 10
+    round_interval_minutes: int = 5
+
+class LogList(list):
+    def __init__(self, seq=()):
+        super().__init__(seq)
+
+    def append(self, item):
+        from datetime import datetime
+        time_str = datetime.now().strftime("%H:%M:%S")
+        if isinstance(item, str) and not re.match(r"^\[\d{2}:\d{2}:\d{2}\]", item):
+            super().append(f"[{time_str}] {item}")
+        else:
+            super().append(item)
+
+active_join_tasks = {}
+last_join_task_id = None
+
+def persistent_task_resume_enabled() -> bool:
+    return os.getenv("RESUME_PERSISTENT_TASKS", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+def normalize_loaded_join_task(task_id: str, task_data: dict, reason: str = "历史入群任务已暂停。") -> dict:
+    """Loaded task history must not be treated as an active worker when auto-resume is disabled."""
+    if not isinstance(task_data.get("logs"), LogList):
+        task_data["logs"] = LogList(task_data.get("logs", []))
+    if not persistent_task_resume_enabled() and task_data.get("status") == "running":
+        task_data["status"] = "paused"
+        task_data["logs"].append(reason)
+    return task_data
+
+def get_account_busy_status(account_id: str) -> str:
+    """Checks globally if a Telegram account is busy in an account-consuming task."""
+    registered_task = get_registered_account_task(account_id)
+    if registered_task:
+        return registered_task.get("kind", "busy")
+
+    # 1. Check active join tasks in memory
+    for t in active_join_tasks.values():
+        if t.get("status") == "running" and account_id in t.get("params", {}).get("account_ids", []):
+            return "join"
+            
+    # 2. Check active campaign tasks in database and memory
+    from db import engine, CampaignTaskDb, Session, select
+    with Session(engine) as session:
+        stmt = select(CampaignTaskDb).where(CampaignTaskDb.status == "running")
+        running_tasks = session.exec(stmt).all()
+        for task in running_tasks:
+            if task.id in active_campaign_tasks and campaign_task_uses_account(task, account_id):
+                return "campaign"
+
+    # 3. Check legacy campaign subprocesses
+    try:
+        process = active_processes.get(account_id)
+        if process and process.poll() is None:
+            return "campaign"
+        if find_campaign_process(account_id) is not None:
+            return "campaign"
+    except Exception:
+        pass
+
+    # 4. Check automatic account-consuming discovery tasks
+    for t in active_scraper_tasks.values():
+        if t.get("status") == "running" and t.get("account_id") == account_id:
+            return "scraper"
+    for t in active_expansion_tasks.values():
+        if t.get("status") == "running" and t.get("account_id") == account_id:
+            return "expansion"
+    return "idle"
+
+def is_account_busy_with_task(account_id: str) -> bool:
+    """Checks globally if a Telegram account is currently busy in a join or campaign task."""
+    return get_account_busy_status(account_id) != "idle"
+
+def is_account_executable_for_task(account) -> bool:
+    """True only when an account may be used by Telegram-running tasks."""
+    if getattr(account, "is_available", True) is False:
+        return False
+    return not is_account_busy_with_task(account.id)
+
+def filter_executable_accounts_for_task(accounts):
+    return [acc for acc in accounts if is_account_executable_for_task(acc)]
+
+def cleanup_campaign_tasks_on_startup():
+    """Legacy no-op. Running campaign tasks are resumed on startup."""
+    try:
+        return
+    except Exception as e:
+        print(f"Failed to cleanup campaign tasks on startup: {e}")
+
+def serialize_join_task(task_id: str, task_data: dict) -> dict:
+    if "created_at" not in task_data:
+        import datetime
+        task_data["created_at"] = datetime.datetime.now().isoformat()
+
+    return {
+        "task_id": task_id,
+        "company": task_data.get("company", "admin"),
+        "owner_username": task_data.get("owner_username", "admin"),
+        "created_at": task_data.get("created_at"),
+        "status": task_data.get("status"),
+        "progress": task_data.get("progress"),
+        "results": task_data.get("results"),
+        "logs": list(task_data.get("logs", [])),
+        "params": task_data.get("params")
+    }
+
+def save_join_task_file(task_id: str, task_data: dict):
+    tasks_dir = Path("data/join_tasks")
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    with open(tasks_dir / f"{task_id}.json", "w", encoding="utf-8") as f:
+        json.dump(serialize_join_task(task_id, task_data), f, ensure_ascii=False, indent=2)
+
+def save_last_join_task(task_id: str):
+    global active_join_tasks
+    try:
+        task_data = active_join_tasks.get(task_id)
+        if task_data:
+            serializable_task = serialize_join_task(task_id, task_data)
+            save_join_task_file(task_id, task_data)
+
+            data_dir = Path("data")
+            data_dir.mkdir(exist_ok=True)
+            with open(data_dir / "last_join_task.json", "w", encoding="utf-8") as f:
+                json.dump({
+                    "last_task_id": task_id,
+                    "task_data": serializable_task
+                }, f, ensure_ascii=False, indent=2)
+
+            company = serializable_task.get("company", "admin")
+            sanitized_company = "".join(c for c in company if c.isalnum() or c in "._-")
+            with open(data_dir / f"last_join_task_{sanitized_company}.json", "w", encoding="utf-8") as f:
+                json.dump({
+                    "last_task_id": task_id,
+                    "task_data": serializable_task
+                }, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Failed to save join task {task_id}: {e}")
+
+def cleanup_running_tasks_on_startup():
+    try:
+        return
+    except Exception as e:
+        print(f"Failed to execute cleanup_running_tasks_on_startup: {e}")
+
+def load_last_join_task_on_startup():
+    global last_join_task_id, active_join_tasks
+    try:
+        tasks_dir = Path("data/join_tasks")
+        if tasks_dir.exists():
+            for f in tasks_dir.glob("*.json"):
+                try:
+                    with open(f, "r", encoding="utf-8") as file:
+                        task_data = json.load(file)
+                    task_id = task_data.get("task_id") or f.stem
+                    task_data = normalize_loaded_join_task(
+                        task_id,
+                        task_data,
+                        "服务器启动恢复已关闭，历史入群任务已暂停。"
+                    )
+                    active_join_tasks[task_id] = task_data
+                    if task_data.get("status") == "paused":
+                        save_join_task_file(task_id, task_data)
+                except Exception as ex:
+                    print(f"Failed to load join task file {f.name}: {ex}")
+
+        task_file = Path("data/last_join_task.json")
+        if task_file.exists():
+            with open(task_file, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            last_join_task_id = state.get("last_task_id")
+            task_data = state.get("task_data")
+            if last_join_task_id and task_data:
+                if last_join_task_id not in active_join_tasks:
+                    task_data = normalize_loaded_join_task(
+                        last_join_task_id,
+                        task_data,
+                        "服务器启动恢复已关闭，历史入群任务已暂停。"
+                    )
+                    active_join_tasks[last_join_task_id] = task_data
+                else:
+                    task_data = active_join_tasks[last_join_task_id]
+                if task_data.get("status") == "paused":
+                    save_last_join_task(last_join_task_id)
+    except Exception as e:
+        print(f"Failed to load last join task: {e}")
+
+load_last_join_task_on_startup()
+
+def resume_persistent_tasks_on_startup():
+    """Resume durable tasks that were running before a server restart."""
+    if not persistent_task_resume_enabled():
+        paused_count = 0
+        for task_id, task_data in list(active_join_tasks.items()):
+            if task_data.get("status") == "running":
+                if not isinstance(task_data.get("logs"), LogList):
+                    task_data["logs"] = LogList(task_data.get("logs", []))
+                task_data["status"] = "paused"
+                task_data["logs"].append("服务器启动恢复已关闭，历史入群任务已暂停。")
+                save_last_join_task(task_id)
+                paused_count += 1
+        print(f"[Startup Resume] Disabled by RESUME_PERSISTENT_TASKS=0; paused {paused_count} loaded join task(s).")
+        return
+
+    try:
+        from db import engine, CampaignTaskDb, Session, select
+        with Session(engine) as session:
+            stmt = select(CampaignTaskDb).where(CampaignTaskDb.status == "running")
+            running_campaigns = session.exec(stmt).all()
+            for task in running_campaigns:
+                if task.id not in active_campaign_tasks:
+                    active_campaign_tasks[task.id] = asyncio.create_task(campaign_worker_task(task.id))
+                    print(f"[Startup Resume] Resumed campaign task {task.id} for account {task.account_id}")
+    except Exception as e:
+        print(f"[Startup Resume] Failed to resume campaign tasks: {e}")
+
+    for task_id, task_data in list(active_join_tasks.items()):
+        try:
+            if task_data.get("status") != "running":
+                continue
+            params = task_data.get("params") or {}
+            if not params.get("account_ids") or not params.get("links"):
+                task_data["status"] = "failed"
+                task_data.setdefault("logs", LogList()).append("服务器启动恢复失败：任务参数不完整。")
+                save_last_join_task(task_id)
+                continue
+            if not isinstance(task_data.get("logs"), LogList):
+                task_data["logs"] = LogList(task_data.get("logs", []))
+            task_data["logs"].append("服务器启动，自动恢复入群任务。")
+            req = JoinTaskRequest(**params)
+            asyncio.create_task(join_worker_task(task_id, req))
+            print(f"[Startup Resume] Resumed join task {task_id}")
+        except Exception as e:
+            task_data["status"] = "failed"
+            task_data.setdefault("logs", LogList()).append(f"服务器启动恢复失败：{e}")
+            save_last_join_task(task_id)
+            print(f"[Startup Resume] Failed to resume join task {task_id}: {e}")
+
+
+async def check_can_speak(client, entity) -> bool:
+    try:
+        from telethon.tl import types
+        if isinstance(entity, types.User):
+            return True
+        if isinstance(entity, types.Channel):
+            if entity.broadcast:
+                try:
+                    participant = await client(functions.channels.GetParticipantRequest(
+                        channel=entity,
+                        participant='me'
+                    ))
+                    if isinstance(participant.participant, (types.ChannelParticipantAdmin, types.ChannelParticipantCreator)):
+                        return True
+                except Exception:
+                    pass
+                return False
+        try:
+            participant_info = await client(functions.channels.GetParticipantRequest(
+                channel=entity,
+                participant='me'
+            ))
+            part = participant_info.participant
+            if isinstance(part, (types.ChannelParticipantCreator, types.ChannelParticipantAdmin)):
+                return True
+            if isinstance(part, types.ChannelParticipantBanned):
+                if part.banned_rights.send_messages:
+                    return False
+        except Exception:
+            return False
+        try:
+            full_chat = await client(functions.channels.GetFullChannelRequest(entity))
+            default_rights = full_chat.chats[0].default_banned_rights
+            if default_rights and default_rights.send_messages:
+                return False
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        print(f"Error checking speaking permissions: {e}")
+        return False
+
+async def join_group_or_channel_get_entity_only(client, link: str):
+    import re
+    from telethon.tl import functions
+    link = link.strip()
+    private_match = re.search(r'(?:t\.me|telegram\.me)/(?:joinchat/|\+)([a-zA-Z0-9\-_]+)', link)
+    if private_match:
+        invite_hash = private_match.group(1)
+        invite = await client(functions.messages.CheckChatInviteRequest(hash=invite_hash))
+        if hasattr(invite, 'chat'):
+            return invite.chat
+        elif hasattr(invite, 'chats') and invite.chats:
+            return invite.chats[0]
+    public_match = re.search(r'(?:t\.me|telegram\.me)/([a-zA-Z0-9_]{5,32})', link)
+    username = public_match.group(1) if public_match else link.replace("@", "").strip()
+    return await client.get_entity(username)
+
+async def join_group_or_channel(client, link: str):
+    from telethon.tl import functions, types
+    import re
+    link = link.strip()
+    if not link:
+        raise ValueError("链接为空")
+    private_match = re.search(r'(?:t\.me|telegram\.me)/(?:joinchat/|\+)([a-zA-Z0-9\-_]+)', link)
+    if private_match:
+        invite_hash = private_match.group(1)
+        updates = await client(functions.messages.ImportChatInviteRequest(hash=invite_hash))
+        if hasattr(updates, 'chats') and updates.chats:
+            return updates.chats[0]
+        dialogs = await client.get_dialogs(limit=5)
+        return dialogs[0].entity
+    public_match = re.search(r'(?:t\.me|telegram\.me)/([a-zA-Z0-9_]{5,32})', link)
+    username = public_match.group(1) if public_match else link.replace("@", "").strip()
+    entity = await client.get_entity(username)
+    await client(functions.channels.JoinChannelRequest(channel=entity))
+    return entity
+
+# --- HELPER FUNCTIONS FOR CHAT FOLDER MANAGEMENT ---
+
+async def try_create_folder_early(client, folder_name: str):
+    from telethon.tl import functions, types
+    try:
+        result = await client(functions.messages.GetDialogFiltersRequest())
+        raw_filters = getattr(result, "filters", result) or []
+
+        folder = next((item for item in raw_filters if hasattr(item, "title") and normalize_title(item.title) == folder_name), None)
+        if folder:
+            return
+
+        existing_ids = {item.id for item in raw_filters if hasattr(item, "id")}
+        next_id = 2
+        while next_id in existing_ids:
+            next_id += 1
+
+        # Try to find a group to seed the folder (Telegram requires at least one peer)
+        include_peers = []
+        try:
+            dialogs = await client.get_dialogs(limit=50)
+            for d in dialogs:
+                if d.is_group or d.is_channel:
+                    try:
+                        peer = await client.get_input_entity(d.entity)
+                        include_peers = [peer]
+                        break
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        if not include_peers:
+            # Cannot seed folder without a peer - skip creation, will be created on first join
+            return
+
+        new_filter = types.DialogFilter(
+            id=next_id,
+            title=types.TextWithEntities(text=folder_name, entities=[]),
+            pinned_peers=[],
+            include_peers=include_peers,
+            exclude_peers=[],
+            contacts=False,
+            non_contacts=False,
+            groups=False,
+            broadcasts=False,
+            bots=False
+        )
+        await client(functions.messages.UpdateDialogFilterRequest(
+            id=next_id,
+            filter=new_filter
+        ))
+    except Exception as e:
+        print(f"Failed to create folder early: {e}")
+
+async def determine_group_folder_name(client, entity, link: str, company: str) -> str:
+    import re
+    from db import engine, GroupDb, Session, select
+    
+    # 1. 优先从数据库中匹配
+    db_cat = None
+    username = None
+    public_match = re.search(r'(?:t\.me|telegram\.me)/([a-zA-Z0-9_]{5,32})', link)
+    if public_match:
+        username = public_match.group(1)
+    else:
+        username = link.replace("@", "").strip()
+        
+    try:
+        with Session(engine) as session:
+            stmt = select(GroupDb)
+            if entity and hasattr(entity, "id"):
+                stmt = stmt.where(GroupDb.id == str(entity.id))
+            elif username:
+                stmt = stmt.where(GroupDb.username.ilike(username))
+            
+            db_group = session.exec(stmt).first()
+            if db_group and db_group.category:
+                if db_group.category in ["中文长", "中文短", "英文长", "英文短"]:
+                    db_cat = db_group.category
+    except Exception as dbe:
+        print(f"Failed to query database for group category: {dbe}")
+        
+    if db_cat:
+        return db_cat
+        
+    # 2. 数据库查不到，则拉取最近 10 条消息进行判定
+    try:
+        input_peer = await client.get_input_entity(entity)
+        msgs = await client.get_messages(input_peer, limit=10)
+        
+        msg_lengths = [len(m.message) for m in msgs if m.message]
+        is_short_ad = False
+        if msg_lengths:
+            max_len = max(msg_lengths)
+            if max_len < 200:
+                is_short_ad = True
+                
+        has_chinese_name = False
+        g_title = getattr(entity, "title", "") or ""
+        if g_title:
+            has_chinese_name = bool(re.search(r"[\u4e00-\u9fa5]", g_title)) or "🇨🇳" in g_title
+            
+        text_messages = [m.message for m in msgs if m.message]
+        has_messages = len(text_messages) > 0
+        combined_text = "".join(text_messages)
+        has_chinese_messages = bool(re.search(r"[\u4e00-\u9fa5]", combined_text))
+        
+        is_chinese = False
+        if has_messages:
+            if has_chinese_messages:
+                is_chinese = True
+        else:
+            if has_chinese_name:
+                is_chinese = True
+                
+        if is_chinese:
+            if is_short_ad:
+                new_cat = "中文短"
+            else:
+                new_cat = "中文长"
+        else:
+            if is_short_ad:
+                new_cat = "英文短"
+            else:
+                new_cat = "英文长"
+        return new_cat
+    except Exception as err:
+        # 3. 优雅退化使用名字判定
+        g_title = getattr(entity, "title", "") or ""
+        has_chinese_name = bool(re.search(r"[\u4e00-\u9fa5]", g_title)) or "🇨🇳" in g_title
+        return "中文长" if has_chinese_name else "英文长"
+
+async def clean_and_convert_peers_async(client, peers_list) -> list:
+    from telethon.tl import types
+    clean_list = []
+    if not peers_list:
+        return clean_list
+    for p in peers_list:
+        try:
+            inp = await client.get_input_entity(p)
+            clean_list.append(inp)
+        except Exception:
+            pass
+    return clean_list
+
+async def add_peer_to_folder(client, entity, folder_name: str):
+    from telethon.tl import functions, types
+    try:
+        peer = await client.get_input_entity(entity)
+    except Exception as e:
+        print(f"Failed to get input entity for folder: {e}")
+        return
+
+    result = await client(functions.messages.GetDialogFiltersRequest())
+    raw_filters = getattr(result, "filters", result) or []
+    
+    folder = next((item for item in raw_filters if hasattr(item, "title") and normalize_title(item.title) == folder_name), None)
+    
+    if folder:
+        if not isinstance(folder, types.DialogFilter):
+            print(f"Folder '{folder_name}' exists but is not a standard DialogFilter (type: {type(folder).__name__}), skipping peer add.")
+            return
+            
+        if not hasattr(folder, "include_peers") or folder.include_peers is None:
+            folder.include_peers = []
+        
+        def get_peer_id(p):
+            return getattr(p, "channel_id", getattr(p, "chat_id", getattr(p, "user_id", None)))
+            
+        new_peer_id = get_peer_id(peer)
+        if new_peer_id is None:
+            return
+            
+        already_exists = False
+        for p in folder.include_peers:
+            if get_peer_id(p) == new_peer_id:
+                already_exists = True
+                break
+        
+        if not already_exists:
+            updated_peers = list(folder.include_peers) + [peer]
+            clean_include = await clean_and_convert_peers_async(client, updated_peers)
+            clean_pinned = await clean_and_convert_peers_async(client, getattr(folder, "pinned_peers", []) or [])
+            clean_exclude = await clean_and_convert_peers_async(client, getattr(folder, "exclude_peers", []) or [])
+            
+            new_filter = types.DialogFilter(
+                id=folder.id,
+                title=folder.title if not isinstance(folder.title, str) else types.TextWithEntities(text=folder.title, entities=[]),
+                pinned_peers=clean_pinned,
+                include_peers=clean_include,
+                exclude_peers=clean_exclude,
+                contacts=getattr(folder, "contacts", False),
+                non_contacts=getattr(folder, "non_contacts", False),
+                groups=getattr(folder, "groups", False),
+                broadcasts=getattr(folder, "broadcasts", False),
+                bots=getattr(folder, "bots", False)
+            )
+            await client(functions.messages.UpdateDialogFilterRequest(
+                id=folder.id,
+                filter=new_filter
+            ))
+    else:
+        existing_ids = {item.id for item in raw_filters if hasattr(item, "id")}
+        next_id = 2
+        while next_id in existing_ids:
+            next_id += 1
+            
+        new_filter = types.DialogFilter(
+            id=next_id,
+            title=types.TextWithEntities(text=folder_name, entities=[]),
+            pinned_peers=[],
+            include_peers=[peer],
+            exclude_peers=[],
+            contacts=False,
+            non_contacts=False,
+            groups=False,
+            broadcasts=False,
+            bots=False
+        )
+        await client(functions.messages.UpdateDialogFilterRequest(
+            id=next_id,
+            filter=new_filter
+        ))
+
+async def join_worker_task(task_id: str, req: JoinTaskRequest):
+    import random
+    import traceback
+    import asyncio
+    task = active_join_tasks[task_id]
+    task["status"] = "running"
+    task["logs"].append("入群任务已启动...")
+    save_last_join_task(task_id)
+    register_account_task_usage(
+        "join",
+        task_id,
+        req.account_ids,
+        {"company": task.get("company"), "owner_username": task.get("owner_username")},
+    )
+    
+    results = task["results"]
+    
+    try:
+        account_ids = req.account_ids
+        links = req.links
+        mode = req.mode
+        strategy = req.strategy
+        
+        # New parameters
+        max_rounds = req.max_rounds
+        groups_per_round = req.groups_per_round if req.groups_per_round > 0 else 10
+        round_interval_minutes = req.round_interval_minutes if req.round_interval_minutes > 0 else 5
+        
+        if strategy == "fixed":
+            base_delay = req.fixed_delay
+        else:
+            base_delay = (req.safety_minutes * 60) / req.safety_groups
+            
+        task["logs"].append(f"基准延迟设为: {base_delay:.1f} 秒")
+        
+        from db import engine, AccountDb, Session, GroupDb, select
+        accounts_info = []
+        with Session(engine) as session:
+            for acc_id in req.account_ids:
+                db_acc = session.get(AccountDb, acc_id)
+                if db_acc:
+                    accounts_info.append((acc_id, db_acc.account_name))
+                    
+        task["logs"].append("开始执行账号已入群检测排重...")
+        accounts_todo_links = {}
+        
+        async def check_account_todo(acc_id, phone):
+            import re
+            from telethon.tl import functions, types
+            try:
+                client = await get_client(acc_id)
+                is_auth = await client.is_user_authorized()
+                if not is_auth:
+                    return acc_id, [], 0
+                
+                dialogs = await client.get_dialogs(limit=None)
+                joined_usernames = {d.entity.username.lower() for d in dialogs if getattr(d.entity, 'username', None)}
+                joined_ids = {d.entity.id for d in dialogs}
+                
+                todo_links = []
+                skipped_count = 0
+                for link in links:
+                    is_joined = False
+                    private_match = re.search(r'(?:t\.me|telegram\.me)/(?:joinchat/|\+)([a-zA-Z0-9\-_]+)', link)
+                    if private_match:
+                        invite_hash = private_match.group(1)
+                        try:
+                            invite = await client(functions.messages.CheckChatInviteRequest(hash=invite_hash))
+                            if type(invite).__name__ == 'ChatInviteAlready':
+                                is_joined = True
+                            elif hasattr(invite, 'chat') and invite.chat:
+                                if invite.chat.id in joined_ids:
+                                    is_joined = True
+                        except Exception:
+                            pass
+                    else:
+                        public_match = re.search(r'(?:t\.me|telegram\.me)/([a-zA-Z0-9_]{5,32})', link)
+                        username = public_match.group(1) if public_match else link.replace("@", "").strip()
+                        if username and username.lower() in joined_usernames:
+                            is_joined = True
+                            
+                    if is_joined:
+                        skipped_count += 1
+                    else:
+                        todo_links.append(link)
+                        
+                if skipped_count > 0:
+                    task["logs"].append(f"账号 {phone} 检测到已加入其中 {skipped_count} 个群组，已自动跳过，不占任务数。")
+                return acc_id, todo_links, skipped_count
+            except Exception as ex:
+                task["logs"].append(f"账号 {phone} 检查已加入群组失败: {ex}")
+                return acc_id, links, 0
+
+        results_precheck = await asyncio.gather(*(check_account_todo(acc_id, phone) for acc_id, phone in accounts_info))
+        precheck_skipped_total = 0
+        for acc_id, todo, skipped_count in results_precheck:
+            accounts_todo_links[acc_id] = todo
+            precheck_skipped_total += int(skipped_count or 0)
+            
+        task["progress"]["total"] = sum(len(todo) for todo in accounts_todo_links.values())
+        task["precheck"] = {
+            "target_groups": len(links),
+            "dedup_skipped": precheck_skipped_total,
+            "todo_total": task["progress"]["total"],
+        }
+        
+        if req.move_to_folder:
+            target_folders = []
+            if req.folder_by_type:
+                target_folders = ["中文长", "中文短", "英文长", "英文短"]
+            elif req.target_folder_name and req.target_folder_name.strip():
+                target_folders = [req.target_folder_name.strip()]
+                
+            if target_folders:
+                task["logs"].append(f"开始执行前置检测并创建聊天文件夹: {target_folders}...")
+                for acc_id, phone in accounts_info:
+                    try:
+                        client = await get_client(acc_id)
+                        is_authorized = await client.is_user_authorized()
+                        if is_authorized:
+                            mark_account_runtime_status(acc_id, is_connected=True, is_authorized=True)
+                            for folder_name_clean in target_folders:
+                                await try_create_folder_early(client, folder_name_clean)
+                    except Exception as ex:
+                        print(f"Failed early folder check/creation for {phone}: {ex}")
+                        
+        # Keep track of links index per account
+        accounts_link_index = {acc_id: 0 for acc_id, _ in accounts_info}
+        
+        async def join_single_account_links_this_round(account_id: str, phone: str):
+            from db import engine, GroupDb, Session, select
+            import re
+            from telethon import errors as telethon_errors
+            
+            def find_group_id_by_link_or_entity(session, link: str, entity=None) -> tuple[Optional[str], Optional[str]]:
+                if entity:
+                    stmt = select(GroupDb).where(GroupDb.id == str(entity.id))
+                    if task.get("company") != "admin":
+                        stmt = stmt.where(GroupDb.company == task.get("company"))
+                    db_group = session.exec(stmt).first()
+                    if db_group:
+                        return db_group.id, db_group.title
+                
+                public_match = re.search(r'(?:t\.me|telegram\.me)/([a-zA-Z0-9_]{5,32})', link)
+                username = public_match.group(1) if public_match else link.replace("@", "").strip()
+                if username:
+                    stmt = select(GroupDb).where(GroupDb.username.ilike(username))
+                    db_group = session.exec(stmt).first()
+                    if db_group:
+                        return db_group.id, db_group.title
+                return None, None
+
+            todo_links = accounts_todo_links.get(account_id, [])
+            start_idx = accounts_link_index.get(account_id, 0)
+            
+            added_this_round = 0
+            idx = start_idx
+            
+            while idx < len(todo_links) and added_this_round < groups_per_round:
+                if task["status"] == "stopped":
+                    task["logs"].append(f"账号 {phone} 的入群任务已被手动停止。")
+                    break
+                    
+                link = todo_links[idx]
+                idx += 1
+                accounts_link_index[account_id] = idx # Update pointer
+                
+                task["logs"].append(f"账号 {phone} 正在处理链接 ({idx}/{len(todo_links)}): {link} ...")
+                
+                # Not a duplicate, proceed with joining
+                task["logs"].append(f"账号 {phone} 正在尝试加入: {link} ...")
+                
+                async def join_link_logic():
+                    nonlocal added_this_round
+                    try:
+                        client = await get_client(account_id)
+                        is_authorized = await client.is_user_authorized()
+                        if not is_authorized:
+                            mark_account_runtime_status(account_id, is_connected=client.is_connected(), is_authorized=False)
+                            raise Exception("账号未登录")
+                        mark_account_runtime_status(account_id, is_connected=True, is_authorized=True)
+                            
+                        # Pre-check entity restriction
+                        entity = None
+                        try:
+                            entity = await join_group_or_channel_get_entity_only(client, link)
+                        except Exception:
+                            pass
+                            
+                        is_restricted = False
+                        restriction_reason_str = ""
+                        is_channel = False
+                        if entity:
+                            if getattr(entity, 'restricted', False):
+                                is_restricted = True
+                                reasons = getattr(entity, 'restriction_reason', []) or []
+                                reasons_text = [getattr(r, 'text', '') for r in reasons]
+                                restriction_reason_str = "; ".join(filter(None, reasons_text)) or "该群组已被屏蔽限制 (restricted)"
+                            
+                            from telethon.tl.types import Channel, ChatInvite
+                            if isinstance(entity, Channel) and getattr(entity, 'broadcast', False):
+                                is_channel = True
+                            elif isinstance(entity, ChatInvite) and getattr(entity, 'broadcast', False):
+                                is_channel = True
+                                
+                        if is_channel:
+                            task["logs"].append(f"账号 {phone} 检测到 {link} 是频道，触发‘频道不自动加入’规则，跳过。")
+                            results.append({
+                                "account_id": account_id,
+                                "phone": phone,
+                                "link": link,
+                                "status": "skipped",
+                                "error": "频道不自动加入",
+                                "group_id": str(entity.id) if hasattr(entity, 'id') else None,
+                                "title": getattr(entity, 'title', link)
+                            })
+                            task["progress"]["current"] += 1
+                            save_last_join_task(task_id)
+                            return
+                            
+                        if is_restricted:
+                            with Session(engine) as session:
+                                db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link, entity)
+                            task["logs"].append(f"账号 {phone} 检测到 {link} 是无效限制群组: {restriction_reason_str}")
+                            results.append({
+                                "account_id": account_id,
+                                "phone": phone,
+                                "link": link,
+                                "status": "invalid",
+                                "error": restriction_reason_str,
+                                "group_id": db_group_id,
+                                "title": db_group_title or getattr(entity, 'title', '')
+                            })
+                            task["progress"]["current"] += 1
+                            save_last_join_task(task_id)
+                            return
+                        
+                        # Try to join
+                        entity = await join_group_or_channel(client, link)
+                        
+                        # Check restriction after join
+                        if getattr(entity, 'restricted', False):
+                            is_restricted = True
+                            reasons = getattr(entity, 'restriction_reason', []) or []
+                            reasons_text = [getattr(r, 'text', '') for r in reasons]
+                            restriction_reason_str = "; ".join(filter(None, reasons_text)) or "该群组已被屏蔽限制 (restricted)"
+                            
+                        if is_restricted:
+                            with Session(engine) as session:
+                                db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link, entity)
+                            task["logs"].append(f"账号 {phone} 检测到 {link} 是无效限制群组: {restriction_reason_str}")
+                            results.append({
+                                "account_id": account_id,
+                                "phone": phone,
+                                "link": link,
+                                "status": "invalid",
+                                "error": restriction_reason_str,
+                                "group_id": db_group_id,
+                                "title": db_group_title or getattr(entity, 'title', '')
+                            })
+                            task["progress"]["current"] += 1
+                            save_last_join_task(task_id)
+                            return
+                            
+                        can_speak = await check_can_speak(client, entity)
+                        status_str = "success" if can_speak else "restricted"
+                        err_msg = ""
+                        if not can_speak:
+                            err_msg = "成功加入但无法直接发言（属于频道或被禁言限制）"
+                            task["logs"].append(f"账号 {phone} 成功加入 {link}，但检测到无法直接发言。")
+                        else:
+                            task["logs"].append(f"账号 {phone} 成功加入 {link} 并确认可以直接发言！")
+                            
+                        with Session(engine) as session:
+                            db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link, entity)
+                        results.append({
+                            "account_id": account_id,
+                            "phone": phone,
+                            "link": link,
+                            "status": status_str,
+                            "error": err_msg,
+                            "group_id": db_group_id,
+                            "title": db_group_title or getattr(entity, 'title', '')
+                        })
+                        added_this_round += 1
+                        
+                        if req.move_to_folder:
+                            folder_name_clean = ""
+                            if req.folder_by_type:
+                                try:
+                                    company = task.get("company", "rosepay")
+                                    folder_name_clean = await determine_group_folder_name(client, entity, link, company)
+                                    task["logs"].append(f"根据群组类型自动分类，判定该群归属文件夹: '{folder_name_clean}'")
+                                except Exception as de:
+                                    task["logs"].append(f"判定群组类型失败，退回默认分类 '中文长': {de}")
+                                    folder_name_clean = "中文长"
+                            elif req.target_folder_name and req.target_folder_name.strip():
+                                folder_name_clean = req.target_folder_name.strip()
+                                
+                            if folder_name_clean:
+                                try:
+                                    await add_peer_to_folder(client, entity, folder_name_clean)
+                                    task["logs"].append(f"已成功将群组移入文件夹: '{folder_name_clean}'")
+                                except Exception as fe:
+                                    task["logs"].append(f"移动群组到文件夹 '{folder_name_clean}' 失败: {str(fe)}")
+                        
+                    except errors.UserAlreadyParticipantError:
+                        try:
+                            client = await get_client(account_id)
+                            entity = await join_group_or_channel_get_entity_only(client, link)
+                            
+                            is_restricted = getattr(entity, 'restricted', False) if entity else False
+                            restriction_reason_str = ""
+                            if is_restricted:
+                                reasons = getattr(entity, 'restriction_reason', []) or []
+                                reasons_text = [getattr(r, 'text', '') for r in reasons]
+                                restriction_reason_str = "; ".join(filter(None, reasons_text)) or "该群组已被屏蔽限制 (restricted)"
+                                
+                            if is_restricted:
+                                with Session(engine) as session:
+                                    db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link, entity)
+                                task["logs"].append(f"账号 {phone} 检测到已加入的 {link} 变为无效限制群组: {restriction_reason_str}")
+                                results.append({
+                                    "account_id": account_id,
+                                    "phone": phone,
+                                    "link": link,
+                                    "status": "invalid",
+                                    "error": restriction_reason_str,
+                                    "group_id": db_group_id,
+                                    "title": db_group_title or getattr(entity, 'title', '')
+                                })
+                            else:
+                                can_speak = await check_can_speak(client, entity)
+                                status_str = "success" if can_speak else "restricted"
+                                err_msg = "已在群组中" if can_speak else "已在群组中但无法直接发言"
+                                with Session(engine) as session:
+                                    db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link, entity)
+                                results.append({
+                                    "account_id": account_id,
+                                    "phone": phone,
+                                    "link": link,
+                                    "status": status_str,
+                                    "error": err_msg,
+                                    "group_id": db_group_id,
+                                    "title": db_group_title or getattr(entity, 'title', '')
+                                })
+                                task["logs"].append(f"账号 {phone} 已经在 {link} 中。是否可发言: {can_speak}")
+                                
+                                # Since we were already a participant, count as success added
+                                added_this_round += 1
+                                
+                                if req.move_to_folder:
+                                    folder_name_clean = ""
+                                    if req.folder_by_type:
+                                        try:
+                                            company = task.get("company", "rosepay")
+                                            folder_name_clean = await determine_group_folder_name(client, entity, link, company)
+                                            task["logs"].append(f"根据群组类型自动分类，判定该群归属文件夹: '{folder_name_clean}'")
+                                        except Exception as de:
+                                            task["logs"].append(f"判定群组类型失败，退回默认分类 '中文长': {de}")
+                                            folder_name_clean = "中文长"
+                                    elif req.target_folder_name and req.target_folder_name.strip():
+                                        folder_name_clean = req.target_folder_name.strip()
+                                        
+                                    if folder_name_clean:
+                                        try:
+                                            await add_peer_to_folder(client, entity, folder_name_clean)
+                                            task["logs"].append(f"已成功将群组移入文件夹: '{folder_name_clean}'")
+                                        except Exception as fe:
+                                            task["logs"].append(f"移动群组到文件夹 '{folder_name_clean}' 失败: {str(fe)}")
+                        except Exception as ex:
+                            err_msg = str(ex)
+                            err_msg_lower = err_msg.lower()
+                            is_invalid = False
+                            if "copyright" in err_msg_lower or "unavailable" in err_msg_lower or "forbidden" in err_msg_lower:
+                                is_invalid = True
+                            if isinstance(ex, (telethon_errors.ChannelPrivateError, telethon_errors.ChatForbiddenError, telethon_errors.ChannelInvalidError)):
+                                is_invalid = True
+                                
+                            with Session(engine) as session:
+                                db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link)
+                            results.append({
+                                "account_id": account_id,
+                                "phone": phone,
+                                "link": link,
+                                "status": "invalid" if is_invalid else "restricted",
+                                "error": f"已在群中但获取信息失败: {err_msg}",
+                                "group_id": db_group_id,
+                                "title": db_group_title
+                            })
+                    except errors.FloodWaitError as fwe:
+                        task["logs"].append(f"账号 {phone} 触发 FloodWait，必须等待 {fwe.seconds} 秒。跳过当前群组。")
+                        results.append({
+                            "account_id": account_id,
+                            "phone": phone,
+                            "link": link,
+                            "status": "failed",
+                            "error": f"触发电报 FloodWait 限制，需等待 {fwe.seconds} 秒"
+                        })
+                    except Exception as e:
+                        err_msg = str(e)
+                        err_msg_lower = err_msg.lower()
+                        is_invalid = False
+                        if "copyright" in err_msg_lower or "unavailable" in err_msg_lower or "forbidden" in err_msg_lower:
+                            is_invalid = True
+                        if isinstance(e, (telethon_errors.ChannelPrivateError, telethon_errors.ChatForbiddenError, telethon_errors.ChannelInvalidError)):
+                            is_invalid = True
+                            
+                        with Session(engine) as session:
+                            db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link)
+                        
+                        if is_invalid:
+                            task["logs"].append(f"账号 {phone} 检测到 {link} 为无效群组: {err_msg}")
+                            results.append({
+                                "account_id": account_id,
+                                "phone": phone,
+                                "link": link,
+                                "status": "invalid",
+                                "error": f"无效群组: {err_msg}",
+                                "group_id": db_group_id,
+                                "title": db_group_title
+                            })
+                        else:
+                            task["logs"].append(f"账号 {phone} 加入 {link} 失败: {err_msg}")
+                            results.append({
+                                "account_id": account_id,
+                                "phone": phone,
+                                "link": link,
+                                "status": "failed",
+                                "error": err_msg,
+                                "group_id": db_group_id,
+                                "title": db_group_title
+                            })
+
+                try:
+                    await asyncio.wait_for(join_link_logic(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    task["logs"].append(f"⚠️ 警告：账号 {phone} 加入 {link} 超时超过 10 秒，账号可能已被限制/假死！")
+                    with Session(engine) as session:
+                        db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link)
+                    results.append({
+                        "account_id": account_id,
+                        "phone": phone,
+                        "link": link,
+                        "status": "timeout",
+                        "error": "加群超时已超10秒，账号可能被限制或假死",
+                        "group_id": db_group_id,
+                        "title": db_group_title
+                    })
+                    
+                task["progress"]["current"] += 1
+                save_last_join_task(task_id)
+                
+                if idx < len(todo_links) and added_this_round < groups_per_round:
+                    delay = base_delay * random.uniform(0.85, 1.15)
+                    task["logs"].append(f"账号 {phone} 等待延迟 {delay:.1f} 秒...")
+                    slept_links = 0
+                    while slept_links < delay and task["status"] == "running":
+                        await asyncio.sleep(1)
+                        slept_links += 1
+            
+            task["logs"].append(f"账号 {phone} 本轮执行完毕，本轮成功加入 {added_this_round} 个群组。")
+
+        # Outer loop to run rounds
+        current_round = 1
+        while task["status"] == "running":
+            # Check if all links processed for all accounts
+            all_accounts_done = True
+            for acc_id, _ in accounts_info:
+                idx = accounts_link_index.get(acc_id, 0)
+                todo = accounts_todo_links.get(acc_id, [])
+                if idx < len(todo):
+                    all_accounts_done = False
+                    break
+                    
+            if all_accounts_done:
+                task["logs"].append("所有账号的所有目标链接均已处理完毕！")
+                break
+                
+            if max_rounds and current_round > max_rounds:
+                task["logs"].append(f"已达到设定的执行轮数上限 ({max_rounds} 轮)，任务结束。")
+                break
+                
+            task["logs"].append(f"--- 启动第 {current_round} 轮加群 ---")
+            
+            if mode == "simultaneous":
+                await asyncio.gather(*(join_single_account_links_this_round(acc_id, phone) for acc_id, phone in accounts_info))
+            else:
+                for acc_id, phone in accounts_info:
+                    if task["status"] == "stopped":
+                        break
+                    await join_single_account_links_this_round(acc_id, phone)
+            
+            if task["status"] == "stopped":
+                break
+                
+            # Verify again if we should run next round
+            all_accounts_done = True
+            for acc_id, _ in accounts_info:
+                idx = accounts_link_index.get(acc_id, 0)
+                todo = accounts_todo_links.get(acc_id, [])
+                if idx < len(todo):
+                    all_accounts_done = False
+                    break
+                    
+            if all_accounts_done:
+                task["logs"].append("所有链接处理完毕！")
+                break
+                
+            # Wait between rounds
+            if not max_rounds or current_round < max_rounds:
+                task["logs"].append(f"第 {current_round} 轮执行完毕。进入轮次休眠间隔，等待 {round_interval_minutes} 分钟开始下一轮...")
+                sleep_time_sec = round_interval_minutes * 60
+                slept_sec = 0
+                while slept_sec < sleep_time_sec and task["status"] == "running":
+                    await asyncio.sleep(5)
+                    slept_sec += 5
+                    
+                current_round += 1
+                
+        if task["status"] != "stopped":
+            task["status"] = "completed"
+        task["logs"].append("入群任务执行完毕！")
+    except Exception as e:
+        task["status"] = "failed"
+        task["logs"].append(f"任务执行出错: {str(e)}")
+        print(f"Error in join_worker_task: {e}")
+        traceback.print_exc()
+    finally:
+        task["results"] = results
+        save_last_join_task(task_id)
+        try:
+            status_label = {
+                "completed": "已完成",
+                "failed": "失败",
+                "stopped": "已停止",
+                "running": "结束处理中",
+            }.get(task.get("status"), task.get("status"))
+            result_counts: Dict[str, int] = {}
+            for item in results:
+                status = str(item.get("status") or "unknown")
+                result_counts[status] = result_counts.get(status, 0) + 1
+            success_count = (
+                result_counts.get("joined", 0)
+                + result_counts.get("already_joined", 0)
+                + result_counts.get("success", 0)
+            )
+            invalid_groups = []
+            for item in results:
+                if str(item.get("status") or "") == "invalid":
+                    group_id = str(item.get("group_id") or "").strip()
+                    if group_id:
+                        invalid_groups.append({
+                            "id": group_id,
+                            "title": item.get("title") or item.get("link") or group_id,
+                            "link": item.get("link") or "",
+                        })
+            dedup_invalid = {}
+            for item in invalid_groups:
+                dedup_invalid[item["id"]] = item
+            invalid_groups = list(dedup_invalid.values())
+            account_lines = "\n".join(
+                f"• {html.escape(get_account_notify_label(acc_id))}"
+                for acc_id in (req.account_ids or [])[:10]
+            )
+            if len(req.account_ids or []) > 10:
+                account_lines += f"\n• ... +{len(req.account_ids or []) - 10}"
+            owner_username = task.get("owner_username", "")
+            target_mention = get_ops_target_mention(owner_username)
+            event = {
+                "type": "join",
+                "task_id": task_id,
+                "owner_username": owner_username,
+                "allowed_username": get_user_telegram_contact(owner_username).lstrip("@"),
+                "company": task.get("company", ""),
+                "status": task.get("status"),
+                "account_labels": [get_account_notify_label(acc_id) for acc_id in (req.account_ids or [])],
+                "summary": {
+                    "target_groups": task.get("precheck", {}).get("target_groups", len(req.links or [])),
+                    "dedup_skipped": task.get("precheck", {}).get("dedup_skipped", 0),
+                    "todo_total": task.get("precheck", {}).get("todo_total", task.get("progress", {}).get("total", 0)),
+                    "account_count": len(req.account_ids or []),
+                    "success": success_count,
+                    "failed": result_counts.get("failed", 0),
+                    "invalid": len(invalid_groups),
+                    "timeout": result_counts.get("timeout", 0),
+                    "total": len(results),
+                },
+                "invalid_groups": invalid_groups,
+            }
+            buttons = [[{"text": "检查日志", "callback_data": "opslog:{event_id}"}]]
+            if invalid_groups:
+                buttons.append([{"text": f"删除无效群组 ({len(invalid_groups)})", "callback_data": "opsdel_invalid:{event_id}"}])
+            send_ops_bot_notification_with_buttons(
+                "\n".join([
+                    "📦 <b>加群任务完成</b>",
+                    f"<b>归属:</b> {html.escape(target_mention)}",
+                    html_line("状态", status_label),
+                    html_line("账号个数", len(req.account_ids or [])),
+                    html_line("目标群组", task.get("precheck", {}).get("target_groups", len(req.links or []))),
+                    html_line("排重个数", task.get("precheck", {}).get("dedup_skipped", 0)),
+                    html_line("成功/已在群", success_count),
+                    html_line("失败", result_counts.get("failed", 0)),
+                    html_line("失效群组", len(invalid_groups)),
+                    html_line("超时", result_counts.get("timeout", 0)),
+                    "",
+                    "👇 点击下方按钮查看详细日志。",
+                    html_line("时间", ops_event_time()),
+                ]),
+                event,
+                buttons,
+            )
+        except Exception as exc:
+            print(f"[OpsNotify] Failed to send join completion notification: {exc}")
+        release_account_task_usage(task_id, req.account_ids, source="join-task-finish")
+
+@app.post("/api/groups/join-task")
+def start_join_task(req: JoinTaskRequest, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
+    """Starts a new group joining task in the background."""
+    # Check if user has access to all account_ids
+    from db import AccountDb, Session, select, engine
+    with Session(engine) as session:
+        for acc_id in req.account_ids:
+            acc = check_account_company(acc_id, user)
+            if getattr(acc, "is_available", True) is False:
+                raise HTTPException(status_code=400, detail=f"账号 {acc_id} 当前为占用/禁用状态，无法启动入群任务。")
+            if is_account_busy_with_task(acc_id):
+                raise HTTPException(status_code=400, detail=f"账号 {acc_id} 有未完成的任务，无法启动新任务。")
+
+    # Check if there is already a running task for this company
+    for tid, t in active_join_tasks.items():
+        if t.get("status") == "running" and t.get("company") == user["company"]:
+            raise HTTPException(status_code=400, detail="当前已有正在运行的入群任务，请先手动停止当前任务，再启动新任务。")
+
+    # Safety Check: Reject if average interval is less than 30 seconds
+    if req.strategy == "fixed":
+        if req.fixed_delay < 30:
+            raise HTTPException(status_code=400, detail="时间间隔不能小于 30 秒，以防触发 Telegram 风控锁定！")
+    else:
+        # safety strategy: safety_minutes * 60 / safety_groups
+        avg_delay = (req.safety_minutes * 60) / req.safety_groups
+        if avg_delay < 30:
+            raise HTTPException(status_code=400, detail=f"安全模式的平均时间间隔 ({avg_delay:.1f} 秒) 小于 30 秒限额，已被系统拦截，请增加间隔分钟数或减少群组数量。")
+            
+    global last_join_task_id
+    import uuid
+    import datetime
+    task_id = str(uuid.uuid4())
+    last_join_task_id = task_id
+    active_join_tasks[task_id] = {
+        "status": "running",
+        "company": user["company"],
+        "owner_username": user["username"],
+        "created_at": datetime.datetime.now().isoformat(),
+        "progress": {"current": 0, "total": 0},
+        "results": [],
+        "logs": LogList(),
+        "params": {
+            "account_ids": req.account_ids,
+            "links": req.links,
+            "mode": req.mode,
+            "strategy": req.strategy,
+            "fixed_delay": req.fixed_delay,
+            "safety_groups": req.safety_groups,
+            "safety_minutes": req.safety_minutes,
+            "move_to_folder": req.move_to_folder,
+            "folder_by_type": req.folder_by_type,
+            "target_folder_name": req.target_folder_name,
+            "max_rounds": req.max_rounds,
+            "groups_per_round": req.groups_per_round,
+            "round_interval_minutes": req.round_interval_minutes
+        }
+    }
+    save_last_join_task(task_id)
+    register_account_task_usage(
+        "join",
+        task_id,
+        req.account_ids,
+        {"company": user["company"], "owner_username": user["username"]},
+    )
+    
+    background_tasks.add_task(join_worker_task, task_id, req)
+    return {"status": "started", "task_id": task_id}
+
+@app.get("/api/groups/join-task/status/{task_id}")
+def get_join_task_status(task_id: str, user: dict = Depends(get_current_user)):
+    """Retrieves progress, logs, and results of a joining task."""
+    if task_id not in active_join_tasks:
+        f = Path("data/join_tasks") / f"{task_id}.json"
+        if f.exists():
+            try:
+                with open(f, "r", encoding="utf-8") as file:
+                    task_data = json.load(file)
+                task_data = normalize_loaded_join_task(
+                    task_id,
+                    task_data,
+                    "读取历史任务时检测到无运行 worker，已暂停。"
+                )
+                active_join_tasks[task_id] = task_data
+                if task_data.get("status") == "paused":
+                    save_join_task_file(task_id, task_data)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to read task data: {e}")
+        else:
+            raise HTTPException(status_code=404, detail="Task not found")
+            
+    task = active_join_tasks[task_id]
+    if user["username"] not in ("eason", "admin") and user["company"] != "admin" and task.get("company") != user["company"]:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+@app.post("/api/groups/join-task/stop")
+def stop_join_task(task_id: str = Body(..., embed=True), user: dict = Depends(get_current_user)):
+    """Manually stops a running joining task."""
+    if task_id not in active_join_tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = active_join_tasks[task_id]
+    if user["username"] not in ("eason", "admin") and user["company"] != "admin" and task.get("company") != user["company"]:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task["status"] == "running":
+        task["status"] = "stopped"
+        task["logs"].append("入群任务已被手动停止！")
+        save_last_join_task(task_id)
+        release_account_task_usage(task_id, task.get("params", {}).get("account_ids", []), source="join-task-stop")
+    return {"status": "stopped", "message": "Task stopping initiated"}
+
+@app.get("/api/groups/join-task/last")
+def get_last_join_task(user: dict = Depends(get_current_user)):
+    """Retrieves the last created join task id and status."""
+    company = user["company"]
+    company_tasks = [
+        (tid, t) for tid, t in active_join_tasks.items()
+        if t.get("company") == company
+    ]
+    if company_tasks:
+        # Sort by created_at desc
+        company_tasks.sort(key=lambda x: x[1].get("created_at", ""), reverse=True)
+        latest_tid, latest_task = company_tasks[0]
+        return {
+            "task_id": latest_tid,
+            "status": latest_task.get("status"),
+            "progress": latest_task.get("progress"),
+            "results": latest_task.get("results"),
+            "logs": list(latest_task.get("logs")),
+            "params": latest_task.get("params")
+        }
+        
+    # Try reading from company-specific last file
+    sanitized_company = "".join(c for c in company if c.isalnum() or c in "._-")
+    task_file = Path("data") / f"last_join_task_{sanitized_company}.json"
+    if task_file.exists():
+        try:
+            with open(task_file, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            tid = state.get("last_task_id")
+            task_data = state.get("task_data")
+            if tid and task_data:
+                if tid not in active_join_tasks:
+                    task_data = normalize_loaded_join_task(
+                        tid,
+                        task_data,
+                        "读取历史任务时检测到无运行 worker，已暂停。"
+                    )
+                    active_join_tasks[tid] = task_data
+                    if task_data.get("status") == "paused":
+                        save_last_join_task(tid)
+                return {
+                    "task_id": tid,
+                    "status": task_data.get("status"),
+                    "progress": task_data.get("progress"),
+                    "results": task_data.get("results"),
+                    "logs": list(task_data.get("logs")),
+                    "params": task_data.get("params")
+                }
+        except Exception:
+            pass
+            
+    return {"status": "none"}
+
+@app.get("/api/groups/join-task/history")
+def get_join_task_history(user: dict = Depends(get_current_user)):
+    """Retrieves metadata of all saved join tasks."""
+    data_dir = Path("data/join_tasks")
+    if not data_dir.exists():
+        return []
+    history = []
+    for f in data_dir.glob("*.json"):
+        try:
+            with open(f, "r", encoding="utf-8") as file:
+                task = json.load(file)
+            task_id = task.get("task_id") or f.stem
+            task = normalize_loaded_join_task(
+                task_id,
+                task,
+                "读取历史任务列表时检测到无运行 worker，已暂停。"
+            )
+            if task.get("status") == "paused":
+                save_join_task_file(task_id, task)
+            if user["username"] not in ("eason", "admin") and user["company"] != "admin" and task.get("company") != user["company"]:
+                continue
+            history.append({
+                "task_id": task.get("task_id"),
+                "created_at": task.get("created_at"),
+                "status": task.get("status"),
+                "owner_username": task.get("owner_username", "rosepay"),
+                "account_count": len(task.get("params", {}).get("account_ids", [])),
+                "links_count": len(task.get("params", {}).get("links", [])),
+                "success_count": len([r for r in task.get("results", []) if r.get("status") == "success"]),
+                "total_count": task.get("progress", {}).get("total", 0),
+                "current_count": task.get("progress", {}).get("current", 0)
+            })
+        except Exception as e:
+            print(f"Failed to read task history file {f.name}: {e}")
+    history.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return history
+
+@app.get("/api/groups/join-task/history/{task_id}")
+def get_join_task_history_detail(task_id: str, user: dict = Depends(get_current_user)):
+    """Retrieves full details of a specific join task from disk or memory."""
+    if task_id in active_join_tasks:
+        task = active_join_tasks[task_id]
+        if user["username"] not in ("eason", "admin") and user["company"] != "admin" and task.get("company") != user["company"]:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return {
+            "task_id": task_id,
+            "created_at": task.get("created_at"),
+            "status": task.get("status"),
+            "progress": task.get("progress"),
+            "results": task.get("results"),
+            "logs": list(task.get("logs")),
+            "params": task.get("params")
+        }
+    f = Path("data/join_tasks") / f"{task_id}.json"
+    if not f.exists():
+        raise HTTPException(status_code=404, detail="Task not found")
+    try:
+        with open(f, "r", encoding="utf-8") as file:
+            task = json.load(file)
+        task = normalize_loaded_join_task(
+            task_id,
+            task,
+            "读取历史任务详情时检测到无运行 worker，已暂停。"
+        )
+        if task.get("status") == "paused":
+            save_join_task_file(task_id, task)
+        if user["username"] not in ("eason", "admin") and user["company"] != "admin" and task.get("company") != user["company"]:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return task
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load task file: {str(e)}")
+
+@app.get("/api/accounts/{account_id}/devices")
+@account_api_operation("read_devices", label="读取设备")
+async def get_account_devices(account_id: str, user: dict = Depends(get_current_user)):
+    """Fetches all active login sessions/devices for an account."""
+    check_account_company(account_id, user)
+    try:
+        client = await get_client(account_id)
+        is_authorized = await client.is_user_authorized()
+        if not is_authorized:
+            raise HTTPException(status_code=401, detail="Account is not authorized")
+            
+        authorizations = await client(functions.account.GetAuthorizationsRequest())
+        devices = []
+        for auth in authorizations.authorizations:
+            devices.append({
+                "hash": str(auth.hash),
+                "device_model": auth.device_model,
+                "platform": auth.platform,
+                "system_version": auth.system_version,
+                "api_id": auth.api_id,
+                "app_name": auth.app_name,
+                "app_version": auth.app_version,
+                "date_created": auth.date_created.isoformat() if hasattr(auth.date_created, 'isoformat') else str(auth.date_created),
+                "date_active": auth.date_active.isoformat() if hasattr(auth.date_active, 'isoformat') else str(auth.date_active),
+                "ip": auth.ip,
+                "country": auth.country,
+                "region": auth.region,
+                "current": bool(auth.current)
+            })
+        return {"devices": devices}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get active devices: {str(e)}")
+
+@app.post("/api/accounts/{account_id}/devices/kick")
+@account_api_operation("kick_device", label="移除设备")
+async def kick_account_device(account_id: str, req: KickDeviceRequest, user: dict = Depends(get_current_user)):
+    """Kicks/terminates a specific active session/device of the account."""
+    check_account_company(account_id, user)
+    try:
+        client = await get_client(account_id)
+        is_authorized = await client.is_user_authorized()
+        if not is_authorized:
+            raise HTTPException(status_code=401, detail="Account is not authorized")
+            
+        session_hash = int(req.hash)
+        await client(functions.account.ResetAuthorizationRequest(hash=session_hash))
+        return {"status": "success", "message": "Device terminated successfully"}
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid session hash format")
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "session is too new" in err_msg or "fresh_reset_authorisation_forbidden" in err_msg:
+            raise HTTPException(
+                status_code=400,
+                detail="新登录设备安全限制：您刚登录当前设备，电报官方安全策略规定，新会话必须持续在线满 24 小时后才能剔除其他活跃设备。请 24 小时后再试，或者直接在您手机/电脑客户端的“活跃会话”中将其下线。"
+            )
+        raise HTTPException(status_code=500, detail=f"Failed to terminate device session: {str(e)}")
+
+
+@app.post("/api/accounts/{account_id}/toggle-profile-modified")
+async def toggle_profile_modified(account_id: str, user: dict = Depends(get_current_user)):
+    """Toggles the profile_modified boolean status of the account."""
+    check_account_company(account_id, user)
+    block_reason = get_account_operation_block_reason(account_id, block_task_busy=True)
+    if block_reason:
+        raise HTTPException(status_code=409, detail=f"{block_reason}，请等待完成后再切换资料状态。")
+    try:
+        from db import engine, AccountDb, Session
+        from account_manager import account_config_path, save_json
+        with Session(engine) as session:
+            db_account = session.get(AccountDb, account_id)
+            if not db_account:
+                raise HTTPException(status_code=404, detail="Account not found")
+            
+            db_account.profile_modified = not db_account.profile_modified
+            db_account.updated_by = user["username"]
+            session.add(db_account)
+            session.commit()
+            
+            path = account_config_path(account_id)
+            if os.path.exists(path):
+                save_json(path, db_account.to_dict())
+                
+            return {
+                "status": "success", 
+                "profile_modified": db_account.profile_modified
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to toggle profile modified status: {str(e)}")
+
+
+# --- SMART FINDER / TELEGRAM GROUP SCRAPER & AI EVALUATOR ---
+
+from pydantic import BaseModel
+from typing import List, Optional
+import asyncio
+import re
+
+class GeminiApiKeyRequest(BaseModel):
+    api_key: str
+
+class DeepseekApiKeyRequest(BaseModel):
+    api_key: str
+
+class ScrapedGroupsSearchRequest(BaseModel):
+    keywords: List[str]
+    min_members: int = 1000
+    max_pages: int = 5
+    continuous: Optional[bool] = False
+    interval_minutes: Optional[int] = 30
+    auto_join: Optional[bool] = False
+    auto_join_min_score: Optional[int] = 70
+    max_rounds: Optional[int] = None
+    groups_per_round: Optional[int] = 10
+    round_interval_minutes: Optional[int] = 5
+
+class ScrapedGroupsBatchActionRequest(BaseModel):
+    ids: List[str]
+    action: str  # 'join', 'ignore', 'delete'
+    category_to_assign: Optional[str] = "中文广告"
+
+def load_scraper_config() -> tuple[List[str], int, int, bool, int]:
+    config_path = Path(__file__).resolve().parent / "config.json"
+    default_keywords = []
+    default_min_members = 1000
+    default_max_pages = 5
+    default_continuous = False
+    default_interval_minutes = 30
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            keywords = data.get("scraper_keywords", default_keywords)
+            min_members = data.get("scraper_min_members", default_min_members)
+            max_pages = data.get("scraper_max_pages", default_max_pages)
+            continuous = data.get("scraper_continuous", default_continuous)
+            interval_minutes = data.get("scraper_interval_minutes", default_interval_minutes)
+            return keywords, min_members, max_pages, continuous, interval_minutes
+        except Exception:
+            pass
+    return default_keywords, default_min_members, default_max_pages, default_continuous, default_interval_minutes
+
+def save_scraper_config(keywords: List[str], min_members: int, max_pages: int, continuous: bool, interval_minutes: int):
+    config_path = Path(__file__).resolve().parent / "config.json"
+    data = {}
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            pass
+    data["scraper_keywords"] = keywords
+    data["scraper_min_members"] = min_members
+    data["scraper_max_pages"] = max_pages
+    data["scraper_continuous"] = continuous
+    data["scraper_interval_minutes"] = interval_minutes
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Failed to save scraper config: {e}")
+
+init_keywords, init_min_members, init_max_pages, init_continuous, init_interval_minutes = load_scraper_config()
+
+# Global task states keyed by company
+active_scraper_tasks = {}
+
+def get_company_scraper_task(company: str) -> dict:
+    if company not in active_scraper_tasks:
+        init_keywords, init_min_members, init_max_pages, init_continuous, init_interval_minutes = load_scraper_config()
+        active_scraper_tasks[company] = {
+            "status": "idle",  # 'idle', 'running', 'completed', 'failed', 'stopped'
+            "progress": {"current": 0, "total": 0},
+            "logs": [],
+            "error": None,
+            "keywords": init_keywords,
+            "min_members": init_min_members,
+            "max_pages": init_max_pages,
+            "continuous": init_continuous,
+            "interval_minutes": init_interval_minutes,
+            "account_id": None
+        }
+    return active_scraper_tasks[company]
+
+class StartExpansionRequest(BaseModel):
+    target_desc: str
+    loop_interval_minutes: Optional[int] = 15
+    auto_join: Optional[bool] = False
+    auto_join_min_score: Optional[int] = 70
+    max_rounds: Optional[int] = None
+    groups_per_round: Optional[int] = 10
+    round_interval_minutes: Optional[int] = 5
+
+def load_expansion_config() -> tuple[str, int]:
+    config_path = Path(__file__).resolve().parent / "config.json"
+    default_target = "在印度当地的生活聊天群（交友、生活交流）以及 OTC/USDT/支付相关的专业群中拓展业务"
+    default_interval = 15
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            target = data.get("expansion_target", default_target)
+            interval = data.get("expansion_interval", default_interval)
+            return target, interval
+        except Exception:
+            pass
+    return default_target, default_interval
+
+def save_expansion_config(target: str, interval: int):
+    config_path = Path(__file__).resolve().parent / "config.json"
+    data = {}
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            pass
+    data["expansion_target"] = target
+    data["expansion_interval"] = interval
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Failed to save expansion config: {e}")
+
+init_target, init_interval = load_expansion_config()
+
+# Global expansion task states keyed by company
+active_expansion_tasks = {}
+
+def get_company_expansion_task(company: str) -> dict:
+    if company not in active_expansion_tasks:
+        init_target, init_interval = load_expansion_config()
+        active_expansion_tasks[company] = {
+            "status": "idle",  # 'idle', 'running', 'paused', 'failed'
+            "target_desc": init_target,
+            "current_keyword": "",
+            "logs": [],
+            "error": None,
+            "interval_minutes": init_interval,
+            "account_id": None
+        }
+    return active_expansion_tasks[company]
+
+
+def get_gemini_api_key() -> str:
+    config_path = Path(__file__).resolve().parent / "config.json"
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("gemini_api_key", "")
+        except Exception:
+            pass
+    return ""
+
+def save_gemini_api_key(key: str):
+    config_path = Path(__file__).resolve().parent / "config.json"
+    data = {}
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            pass
+    data["gemini_api_key"] = key
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Failed to save gemini_api_key: {e}")
+
+def get_deepseek_api_key() -> str:
+    config_path = Path(__file__).resolve().parent / "config.json"
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("deepseek_api_key", "")
+        except Exception:
+            pass
+    return ""
+
+def save_deepseek_api_key(key: str):
+    config_path = Path(__file__).resolve().parent / "config.json"
+    data = {}
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            pass
+    data["deepseek_api_key"] = key
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Failed to save deepseek_api_key: {e}")
+
+async def run_group_scraping_task(
+    keywords: List[str],
+    min_members: int,
+    max_pages: int,
+    company: str,
+    continuous: bool = False,
+    interval_minutes: int = 30,
+    auto_join: bool = False,
+    auto_join_min_score: int = 70,
+    max_rounds: Optional[int] = None,
+    groups_per_round: int = 10,
+    round_interval_minutes: int = 5,
+    owner_username: Optional[str] = None
+):
+    current_round = 1
+    from datetime import datetime
+    active_scraper_task = get_company_scraper_task(company)
+    scraper_task_id = f"scraper:{company}"
+    release_account_task_usage(scraper_task_id, source="scraper-task-reset")
+    active_scraper_task["status"] = "running"
+    active_scraper_task["progress"] = {"current": 0, "total": 0}
+    active_scraper_task["logs"] = []
+    active_scraper_task["error"] = None
+    
+    def log(msg):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        active_scraper_task["logs"].append(f"[{timestamp}] {msg}")
+        print(f"[ScrapeTask] {msg}")
+
+    try:
+        gemini_api_key = get_gemini_api_key()
+        deepseek_api_key = get_deepseek_api_key()
+        if not gemini_api_key and not deepseek_api_key:
+            log("错误: 未配置 AI API Key，请先在配置中保存您的 API Key（支持 Gemini 或 DeepSeek）。")
+            active_scraper_task["status"] = "failed"
+            active_scraper_task["error"] = "未配置 AI API Key"
+            return
+            
+        while active_scraper_task["status"] == "running":
+            log(f"开始搜群任务 [第 {current_round} 轮]。目标保存群组数: {groups_per_round} 个 | 最少成员数: {min_members}")
+            
+            added_this_round = 0
+            history_skip_count = 0
+            member_skip_count = 0
+            fetch_fail_count = 0
+            
+            # Step 1: Find a healthy, authorized Telegram account under this company
+            from db import engine, AccountDb, Session, select, ScrapedGroupDb, GroupDb, GroupCategoryDb
+            
+            authorized_account_id = None
+            authorized_phone = None
+            active_scraper_task["account_id"] = None
+            
+            with Session(engine) as session:
+                if owner_username:
+                    from sqlmodel import or_
+                    stmt_acc = select(AccountDb).where(
+                        or_(AccountDb.owner_username == owner_username, AccountDb.created_by == owner_username)
+                    )
+                else:
+                    stmt_acc = select(AccountDb).where(AccountDb.company == company)
+                accounts = filter_executable_accounts_for_task(session.exec(stmt_acc).all())
+                
+            for acc in accounts:
+                try:
+                    cl = await get_client(acc.id)
+                    if await cl.is_user_authorized():
+                        authorized_account_id = acc.id
+                        authorized_phone = acc.account_name
+                        break
+                except Exception:
+                    pass
+                    
+            if not authorized_account_id:
+                log("错误: 当前公司下没有可用的、已授权在线的电报账号，无法进行群消息获取。请至少登录一个账号！")
+                active_scraper_task["status"] = "failed"
+                active_scraper_task["error"] = "没有可在线 of 电报账号进行解析"
+                return
+                
+            active_scraper_task["account_id"] = authorized_account_id
+            register_account_task_usage(
+                "scraper",
+                scraper_task_id,
+                [authorized_account_id],
+                {"company": company, "owner_username": owner_username},
+            )
+            log(f"使用账号 [{authorized_phone}] 进行群组消息抓取 and 解析...")
+            client = await get_client(authorized_account_id)
+            
+            current_page = 0
+            max_safety_pages = 30
+            exhausted = False
+            
+            while added_this_round < groups_per_round and current_page < max_safety_pages:
+                if active_scraper_task["status"] != "running":
+                    break
+                    
+                log(f"正在搜寻第 {current_page + 1} 页的潜在公开群组链接 (当前本轮已保存: {added_this_round}/{groups_per_round}) ...")
+                from group_scraper import scrape_links_by_keywords_for_page, fetch_group_messages, analyze_group_with_gemini, analyze_group_with_deepseek, calculate_scraped_group_metrics
+                
+                links = scrape_links_by_keywords_for_page(keywords, current_page)
+                
+                if not links:
+                    log(f"第 {current_page + 1} 页未找到任何潜在链接，搜索引擎结果已耗尽。")
+                    exhausted = True
+                    break
+                    
+                log(f"第 {current_page + 1} 页搜寻结束，共找到 {len(links)} 个潜在链接。开始进行提取与分析...")
+                
+                active_scraper_task["progress"]["total"] = len(links)
+                
+                for idx, link in enumerate(links):
+                    if active_scraper_task["status"] != "running":
+                        break
+                    if added_this_round >= groups_per_round:
+                        break
+                        
+                    active_scraper_task["progress"]["current"] = idx + 1
+                    
+                    # Extract username
+                    public_match = re.search(r'(?:t\.me|telegram\.me)/(?:joinchat/|\+)?([a-zA-Z0-9_\+]{5,32})', link)
+                    if not public_match:
+                        continue
+                        
+                    username = public_match.group(1)
+                    
+                    # Deduplication check
+                    with Session(engine) as session:
+                        existing = session.get(ScrapedGroupDb, username)
+                    if existing:
+                        log(f"  [排重] 跳过历史已存在重复群组: @{username}")
+                        history_skip_count += 1
+                        continue
+                        
+                    # Check if this is a joinchat/private hash
+                    if "joinchat/" in link or "+" in link:
+                        log(f"  [过滤] 跳过私有加群链接: {link}")
+                        continue
+                        
+                    log(f"  正在免加群提取群组信息: @{username} ...")
+                    res = await fetch_group_messages(client, username)
+                    if not res.get("success"):
+                        err_msg = res.get("error", "")
+                        log(f"  获取群 @{username} 失败: {err_msg}")
+                        if "FloodWait" in err_msg or "wait of" in err_msg:
+                            log(f"⚠️ [限制警告] 检测到当前电报账号已触发限制 (FloodWait): {err_msg}。为防止封号，已自动暂停搜群任务，请稍后再试。")
+                            active_scraper_task["status"] = "paused"
+                            active_scraper_task["error"] = f"触发电报限制: {err_msg}"
+                            break
+                        fetch_fail_count += 1
+                        await asyncio.sleep(4)
+                        continue
+                        
+                    title = res["title"]
+                    member_count = res["member_count"]
+                    messages = res["messages"]
+                    
+                    log(f"  获取成功! 标题: '{title}' | 成员数: {member_count}。")
+                    
+                    if member_count < min_members:
+                        log(f"  群成员数 ({member_count}) 低于最低成员数限制 ({min_members})。跳过。")
+                        member_skip_count += 1
+                        await asyncio.sleep(4)
+                        continue
+                        
+                    # Perform AI analysis
+                    analysis = None
+                    if deepseek_api_key:
+                        log("  正在交由 DeepSeek 进行智能属性与业务粘合度评估...")
+                        analysis = analyze_group_with_deepseek(deepseek_api_key, title, res.get("description", ""), messages, target_keywords=keywords)
+                        if (not analysis or analysis.get("relevance_score") is None) and gemini_api_key:
+                            log("  DeepSeek 评估失败或受限，尝试使用 Gemini 进行评估...")
+                            analysis = analyze_group_with_gemini(gemini_api_key, title, res.get("description", ""), messages, target_keywords=keywords)
+                    elif gemini_api_key:
+                        log("  正在交由 Gemini 进行智能属性与业务粘合度评估...")
+                        analysis = analyze_group_with_gemini(gemini_api_key, title, res.get("description", ""), messages, target_keywords=keywords)
+                        
+                    if not analysis:
+                        analysis = {
+                            "category": "unknown",
+                            "relevance_score": None,
+                            "analysis_summary": "未配置或调用 AI 接口失败，使用本地兜底计算",
+                            "recommendation": "请在配置中保存有效的 AI 密钥"
+                        }
+                    
+                    category = analysis.get("category", "unknown")
+                    relevance = analysis.get("relevance_score")
+                    summary = analysis.get("analysis_summary", "")
+                    recom = analysis.get("recommendation", "")
+                    
+                    # Compute Python metrics and combined quality score
+                    metrics = calculate_scraped_group_metrics(member_count, messages, keywords, api_relevance_score=relevance, group_type=res.get("group_type", "group"), is_dead=res.get("is_dead", False))
+                    score = metrics["quality_score"]
+                    
+                    log(f"  AI/Python 评估结果 -> 分类: {category} | 综合评分: {score}")
+                    
+                    # Save/Update in DB
+                    with Session(engine) as session:
+                        db_group = session.get(ScrapedGroupDb, username)
+                        if not db_group:
+                            db_group = ScrapedGroupDb(
+                                id=username,
+                                title=title,
+                                link=f"https://t.me/{username}",
+                                member_count=member_count,
+                                category=category,
+                                quality_score=score,
+                                analysis_summary=f"{summary} | 建议: {recom}",
+                                keyword=keywords[0] if keywords else "",
+                                company=company,
+                                group_type=res.get("group_type", "group"),
+                                is_active=res.get("is_active", True),
+                                is_dead=res.get("is_dead", False),
+                                relevance_score=metrics["relevance_score"],
+                                activity_score=metrics["activity_score"],
+                                engagement_score=metrics["engagement_score"],
+                                spam_penalty=metrics["spam_penalty"]
+                            )
+                        else:
+                            db_group.title = title
+                            db_group.member_count = member_count
+                            db_group.category = category
+                            db_group.quality_score = score
+                            db_group.analysis_summary = f"{summary} | 建议: {recom}"
+                            db_group.keyword = keywords[0] if keywords else ""
+                            db_group.group_type = res.get("group_type", "group")
+                            db_group.is_active = res.get("is_active", True)
+                            db_group.is_dead = res.get("is_dead", False)
+                            db_group.relevance_score = metrics["relevance_score"]
+                            db_group.activity_score = metrics["activity_score"]
+                            db_group.engagement_score = metrics["engagement_score"]
+                            db_group.spam_penalty = metrics["spam_penalty"]
+                            db_group.created_at = datetime.utcnow()
+                        session.add(db_group)
+                        session.commit()
+
+                    # Save GroupDb record (Auto save)
+                    if auto_join and score >= auto_join_min_score and category != "spam":
+                        log(f"  [自动保存] 评分 {score} 符合门槛 {auto_join_min_score}，自动保存至群组库...")
+                        category_mapping = {
+                            "life": "生活聊天",
+                            "business": "广告同行",
+                            "spam": "垃圾/灌水",
+                            "unknown": "待测/私有"
+                        }
+                        group_category = category_mapping.get(category, "待测/私有")
+                        
+                        is_duplicate = False
+                        with Session(engine) as session:
+                            stmt_dup = select(GroupDb).where(GroupDb.company == company)
+                            for g_item in session.exec(stmt_dup).all():
+                                if g_item.username and g_item.username.strip('@').lower() == username.lower():
+                                    is_duplicate = True
+                                    break
+                                if g_item.title and g_item.title.strip() == title.strip():
+                                    is_duplicate = True
+                                    break
+                        
+                        if is_duplicate:
+                            log(f"  [自动保存] 触发排重：群组 @{username} 已存在于主群组库中，跳过。")
+                        else:
+                            try:
+                                with Session(engine) as session:
+                                    existing_cat = session.exec(
+                                        select(GroupCategoryDb)
+                                        .where(GroupCategoryDb.company == company)
+                                        .where(GroupCategoryDb.name == group_category)
+                                    ).first()
+                                    if not existing_cat:
+                                        new_cat = GroupCategoryDb(name=group_category, company=company)
+                                        session.add(new_cat)
+                                        session.commit()
+                                
+                                group_id_str = username
+                                group_type_str = res.get("group_type", "group")
+                                try:
+                                    entity = await client.get_entity(username)
+                                    if entity:
+                                        group_id_str = str(entity.id)
+                                        group_type_str = "channel" if getattr(entity, 'broadcast', False) else "group"
+                                except Exception as ee:
+                                    log(f"  [自动保存] 获取实体ID失败: {ee}")
+                                
+                                if group_type_str == "channel":
+                                    log(f"  [自动保存] 检测到 @{username} 是频道，触发‘频道不自动保存’规则，跳过。")
+                                else:
+                                    with Session(engine) as session:
+                                        db_g = GroupDb(
+                                            id=group_id_str,
+                                            company=company,
+                                            title=title,
+                                            username=username,
+                                            type=group_type_str,
+                                            enabled=True,
+                                            memberCount=member_count,
+                                            category=group_category
+                                        )
+                                        session.merge(db_g)
+                                        session.commit()
+                                    log(f"  [自动保存] 自动保存群组成功: @{username} (分类: {group_category})")
+                                    added_this_round += 1
+                                    
+                                    with Session(engine) as session:
+                                        db_group = session.get(ScrapedGroupDb, username)
+                                        if db_group:
+                                            db_group.status = "joined"
+                                            session.add(db_group)
+                                            session.commit()
+                            except Exception as se:
+                                log(f"  [自动保存] 自动保存失败: {str(se)}")
+                    else:
+                        if not auto_join:
+                            added_this_round += 1
+
+                    await asyncio.sleep(5)
+                
+                current_page += 1
+            
+            # Summary report at the end of each round
+            log("阶段性搜寻分析汇报：")
+            log(f"- 本轮已搜寻并处理的新增/更新群组: {added_this_round}/{groups_per_round} 个")
+            log(f"- 跳过历史已存在重复群组: {history_skip_count} 个")
+            log(f"- 跳过成员数不达标群组: {member_skip_count} 个")
+            log(f"- 跳过消息提取失败群组: {fetch_fail_count} 个")
+            
+            if exhausted:
+                log("由于所有搜索页面均已被穷尽，本轮搜寻提前结束。")
+                
+            if max_rounds is not None and current_round >= max_rounds:
+                log(f"已达到最大限制轮数 {max_rounds} 轮，任务正常结束。")
+                break
+                
+            if not continuous:
+                break
+                
+            log(f"本轮任务完成。休眠 {interval_minutes} 分钟后继续搜寻新群组...")
+            current_round += 1
+            for _ in range(interval_minutes * 60):
+                if active_scraper_task["status"] != "running":
+                    break
+                await asyncio.sleep(1)
+                
+        if active_scraper_task["status"] != "stopped":
+            log("搜群与分析任务全部完成！")
+            active_scraper_task["status"] = "completed"
+            
+    except Exception as e:
+        import traceback
+        err_msg = f"任务运行异常: {str(e)}\n{traceback.format_exc()}"
+        log(err_msg)
+        active_scraper_task["status"] = "failed"
+        active_scraper_task["error"] = str(e)
+    finally:
+        release_account_task_usage(scraper_task_id, source="scraper-task-finish")
+
+@app.post("/api/config/gemini")
+def update_gemini_config(req: GeminiApiKeyRequest, user: dict = Depends(get_current_user)):
+    """Saves the Gemini API Key globally in config.json."""
+    save_gemini_api_key(req.api_key)
+    return {"status": "success", "message": "Gemini API Key 保存成功"}
+
+@app.get("/api/config/gemini")
+def get_gemini_config(user: dict = Depends(get_current_user)):
+    """Gets the saved Gemini API Key (masked for security)."""
+    key = get_gemini_api_key()
+    masked_key = ""
+    if key:
+        if len(key) > 8:
+            masked_key = key[:4] + "..." + key[-4:]
+        else:
+            masked_key = "..."
+    return {"has_key": bool(key), "key_preview": masked_key}
+
+@app.post("/api/config/deepseek")
+def update_deepseek_config(req: DeepseekApiKeyRequest, user: dict = Depends(get_current_user)):
+    """Saves the DeepSeek API Key globally in config.json."""
+    save_deepseek_api_key(req.api_key)
+    return {"status": "success", "message": "DeepSeek API Key 保存成功"}
+
+@app.get("/api/config/deepseek")
+def get_deepseek_config(user: dict = Depends(get_current_user)):
+    """Gets the saved DeepSeek API Key (masked for security)."""
+    key = get_deepseek_api_key()
+    masked_key = ""
+    if key:
+        if len(key) > 8:
+            masked_key = key[:4] + "..." + key[-4:]
+        else:
+            masked_key = "..."
+    return {"has_key": bool(key), "key_preview": masked_key}
+
+@app.post("/api/scraped-groups/search-task")
+def start_scraped_groups_search_task(req: ScrapedGroupsSearchRequest, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
+    """Spawns the group scraper and AI analysis task in the background."""
+    active_scraper_task = get_company_scraper_task(user["company"])
+    if active_scraper_task["status"] == "running":
+        raise HTTPException(status_code=400, detail="当前已有正在运行的搜群任务")
+        
+    save_scraper_config(req.keywords, req.min_members, req.max_pages, req.continuous or False, req.interval_minutes or 30)
+    active_scraper_task["keywords"] = req.keywords
+    active_scraper_task["min_members"] = req.min_members
+    active_scraper_task["max_pages"] = req.max_pages
+    active_scraper_task["continuous"] = req.continuous or False
+    active_scraper_task["interval_minutes"] = req.interval_minutes or 30
+    
+    background_tasks.add_task(
+        run_group_scraping_task,
+        req.keywords,
+        req.min_members,
+        req.max_pages,
+        user["company"],
+        req.continuous or False,
+        req.interval_minutes or 30,
+        req.auto_join or False,
+        req.auto_join_min_score or 70,
+        req.max_rounds,
+        req.groups_per_round or 10,
+        req.round_interval_minutes or 5,
+        user["username"] if user["role"] != "admin" else None
+    )
+    return {"status": "started"}
+
+@app.get("/api/scraped-groups/task-status")
+def get_scraped_groups_task_status(user: dict = Depends(get_current_user)):
+    """Retrieves the current search task progress, status and logs."""
+    return get_company_scraper_task(user["company"])
+
+@app.post("/api/scraped-groups/search-task/stop")
+def stop_scraped_groups_search_task(user: dict = Depends(get_current_user)):
+    """Stops the current search task."""
+    active_scraper_task = get_company_scraper_task(user["company"])
+    if active_scraper_task["status"] == "running":
+        active_scraper_task["status"] = "stopped"
+        release_account_task_usage(f"scraper:{user['company']}", source="scraper-task-stop")
+        return {"status": "success", "message": "任务已停止"}
+    return {"status": "success", "message": "没有运行中的任务"}
+
+@app.get("/api/scraped-groups")
+def list_scraped_groups(
+    category: Optional[str] = None,
+    status: Optional[str] = None,
+    min_score: Optional[int] = None,
+    keyword: Optional[str] = None,
+    sort_by: Optional[str] = "default",
+    user: dict = Depends(get_current_user)
+):
+    """Retrieves all scraped group records from database with filters and sorting."""
+    from db import engine, ScrapedGroupDb, Session, select
+    with Session(engine) as session:
+        if user["username"] in ("eason", "admin") or user["company"] == "admin":
+            stmt = select(ScrapedGroupDb)
+        else:
+            stmt = select(ScrapedGroupDb).where(ScrapedGroupDb.company == user["company"])
+        if category:
+            stmt = stmt.where(ScrapedGroupDb.category == category)
+        if status:
+            stmt = stmt.where(ScrapedGroupDb.status == status)
+        if min_score is not None:
+            stmt = stmt.where(ScrapedGroupDb.quality_score >= min_score)
+        if keyword:
+            stmt = stmt.where(ScrapedGroupDb.keyword.contains(keyword))
+            
+        if sort_by == "score":
+            stmt = stmt.order_by(ScrapedGroupDb.quality_score.desc())
+        elif sort_by == "date":
+            stmt = stmt.order_by(ScrapedGroupDb.created_at.desc())
+        else:
+            # Default sorting: starred/important pinned first, then by created_at desc
+            stmt = stmt.order_by(ScrapedGroupDb.is_important.desc(), ScrapedGroupDb.created_at.desc())
+            
+        results = session.exec(stmt).all()
+        return results
+
+@app.post("/api/scraped-groups/{group_id}/toggle-important")
+def toggle_scraped_group_important(group_id: str, user: dict = Depends(get_current_user)):
+    """Toggles the is_important status of a scraped group."""
+    from db import engine, ScrapedGroupDb, Session
+    with Session(engine) as session:
+        db_group = session.get(ScrapedGroupDb, group_id)
+        is_admin = user["username"] in ("eason", "admin") or user["company"] == "admin"
+        if not db_group or (not is_admin and db_group.company != user["company"]):
+            raise HTTPException(status_code=404, detail="未找到该群组")
+        db_group.is_important = not db_group.is_important
+        session.add(db_group)
+        session.commit()
+        return {"status": "success", "is_important": db_group.is_important}
+
+@app.post("/api/scraped-groups/batch-action")
+def batch_action_scraped_groups(req: ScrapedGroupsBatchActionRequest, user: dict = Depends(get_current_user)):
+    """Applies action (join, ignore, delete) on multiple scraped groups."""
+    from db import engine, ScrapedGroupDb, GroupDb, Session, select
+    
+    with Session(engine) as session:
+        is_admin = user["username"] in ("eason", "admin") or user["company"] == "admin"
+        stmt = select(ScrapedGroupDb).where(ScrapedGroupDb.id.in_(req.ids))
+        if not is_admin:
+            stmt = stmt.where(ScrapedGroupDb.company == user["company"])
+        scraped_items = session.exec(stmt).all()
+        
+        if not scraped_items:
+            return {"status": "success", "count": 0}
+            
+        count = 0
+        for item in scraped_items:
+            if req.action == "delete":
+                session.delete(item)
+                count += 1
+            elif req.action == "ignore":
+                item.status = "ignored"
+                session.add(item)
+                count += 1
+            elif req.action == "unignore" or req.action == "pending":
+                item.status = "pending"
+                session.add(item)
+                count += 1
+            elif req.action == "join":
+                if getattr(item, 'group_type', '') == "channel":
+                    continue
+                # Check if group already in main GroupDb library
+                group_id_str = str(item.id)
+                existing = session.get(GroupDb, (group_id_str, user["company"]))
+                if not existing:
+                    # Ensure category exists in GroupCategoryDb
+                    if req.category_to_assign:
+                        from db import GroupCategoryDb
+                        cat_name = req.category_to_assign.strip()
+                        if cat_name:
+                            existing_cat = session.exec(
+                                select(GroupCategoryDb)
+                                .where(GroupCategoryDb.company == user["company"])
+                                .where(GroupCategoryDb.name == cat_name)
+                            ).first()
+                            if not existing_cat:
+                                existing_admin = session.exec(
+                                    select(GroupCategoryDb)
+                                    .where(GroupCategoryDb.company == "admin")
+                                    .where(GroupCategoryDb.name == cat_name)
+                                ).first()
+                                if not existing_admin:
+                                    new_cat = GroupCategoryDb(name=cat_name, company=user["company"])
+                                    session.add(new_cat)
+                                    
+                    # Insert new group to GroupDb
+                    new_group = GroupDb(
+                        id=group_id_str,
+                        company=user["company"],
+                        title=item.title or item.id,
+                        username=item.id,
+                        type="supergroup",  # default
+                        enabled=True,
+                        memberCount=item.member_count or 0,
+                        category=req.category_to_assign
+                    )
+                    session.add(new_group)
+                
+                # Mark scraped status as joined
+                item.status = "joined"
+                session.add(item)
+                count += 1
+                
+        session.commit()
+        return {"status": "success", "count": count}
+
+
+# --- BUSINESS EXPANSION AUTONOMOUS AGENT ---
+
+async def run_business_expansion_loop(
+    target_desc: str,
+    interval_minutes: int,
+    company: str,
+    auto_join: bool = False,
+    auto_join_min_score: int = 70,
+    max_rounds: Optional[int] = None,
+    groups_per_round: int = 10,
+    round_interval_minutes: int = 5
+):
+    current_round = 1
+    added_this_round = 0
+    active_expansion_task = get_company_expansion_task(company)
+    expansion_task_id = f"expansion:{company}"
+    release_account_task_usage(expansion_task_id, source="expansion-task-reset")
+    active_expansion_task["status"] = "running"
+    active_expansion_task["target_desc"] = target_desc
+    active_expansion_task["interval_minutes"] = interval_minutes
+    active_expansion_task["error"] = None
+    
+    def log(msg):
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%m-%d %H:%M:%S")
+        active_expansion_task["logs"].append(f"[{timestamp}] {msg}")
+        # Keep logs size reasonable (last 500 lines)
+        if len(active_expansion_task["logs"]) > 500:
+            active_expansion_task["logs"] = active_expansion_task["logs"][-500:]
+        print(f"[ExpandAgent] {msg}")
+
+    log(f"业务拓展自主 Agent 已启动。目标: '{target_desc}'，循环间隔: {interval_minutes} 分钟")
+
+    try:
+        from group_scraper import (
+            generate_keyword_with_gemini,
+            generate_keyword_with_deepseek,
+            scrape_links_by_keywords,
+            fetch_group_messages,
+            analyze_group_with_gemini,
+            analyze_group_with_deepseek,
+            calculate_scraped_group_metrics
+        )
+        from db import engine, AccountDb, ScrapedGroupDb, GroupDb, Session, select
+        from datetime import datetime
+        import random
+        
+        while active_expansion_task["status"] in ("running", "paused"):
+            if active_expansion_task["status"] == "paused":
+                await asyncio.sleep(5)
+                continue
+                
+            gemini_api_key = get_gemini_api_key()
+            deepseek_api_key = get_deepseek_api_key()
+            if not gemini_api_key and not deepseek_api_key:
+                log("错误: 未配置 AI API Key，请先保存您的 API Key 后启动 Agent。")
+                active_expansion_task["status"] = "failed"
+                active_expansion_task["error"] = "未配置 AI API Key"
+                break
+                
+            # 1. Gather previously searched keywords from DB to avoid duplication
+            with Session(engine) as session:
+                stmt = select(ScrapedGroupDb.keyword).where(ScrapedGroupDb.company == company).distinct()
+                searched = list(session.exec(stmt).all())
+                searched = [s for s in searched if s]
+                
+            log("正在请 AI 构思下一步搜寻的关键词...")
+            res_kw = None
+            if gemini_api_key:
+                res_kw = generate_keyword_with_gemini(gemini_api_key, active_expansion_task.get("target_desc", target_desc), searched)
+            elif deepseek_api_key:
+                res_kw = generate_keyword_with_deepseek(deepseek_api_key, active_expansion_task.get("target_desc", target_desc), searched)
+                
+            if not res_kw:
+                res_kw = {"keyword": "", "reasoning": "未配置有效的 AI 密钥"}
+                
+            kw = res_kw.get("keyword", "").strip()
+            reason = res_kw.get("reasoning", "未提供理由").strip()
+            
+            if not kw:
+                log(f"AI 构思关键词失败或为空。原因: {reason}。将在 2 分钟后重试...")
+                await asyncio.sleep(120)
+                continue
+                
+            active_expansion_task["current_keyword"] = kw
+            log(f"[AI 思考结论] 决定搜寻关键词: '{kw}'")
+            log(f"[AI 思考逻辑] {reason}")
+            
+            # 2. Scrape group links using combined scraper
+            log(f"正在抓取关键词 '{kw}' 相关的电报群链接...")
+            active_expansion_task["account_id"] = None
+            links = scrape_links_by_keywords([kw], max_pages=1)
+            log(f"抓取完成。共找到 {len(links)} 个潜在公开群链接。")
+            
+            if not links:
+                log("此轮未找到合适的新链接，等待下一个周期。")
+            else:
+                # 3. Find online authorized account under this company
+                authorized_account_id = None
+                authorized_phone = None
+                with Session(engine) as session:
+                    accounts = filter_executable_accounts_for_task(session.exec(select(AccountDb).where(AccountDb.company == company)).all())
+                    
+                for acc in accounts:
+                    try:
+                        cl = await get_client(acc.id)
+                        if await cl.is_user_authorized():
+                            authorized_account_id = acc.id
+                            authorized_phone = acc.account_name
+                            break
+                    except Exception:
+                        pass
+                        
+                if not authorized_account_id:
+                    log("警告: 当前公司下没有在线已登录的电报账号！无法拉取群消息进行评估，此轮跳过。")
+                else:
+                    active_expansion_task["account_id"] = authorized_account_id
+                    register_account_task_usage(
+                        "expansion",
+                        expansion_task_id,
+                        [authorized_account_id],
+                        {"company": company},
+                    )
+                    log(f"使用账号 [{authorized_phone}] 进行群组消息拉取与 AI 质量评估...")
+                    client = await get_client(authorized_account_id)
+                    
+                    # 4. Iterate and analyze
+                    for idx, link in enumerate(links):
+                        if active_expansion_task["status"] != "running":
+                            break
+                            
+                        # Extract public username
+                        public_match = re.search(r'(?:t\.me|telegram\.me)/(?:joinchat/|\+)?([a-zA-Z0-9_\+]{5,32})', link)
+                        if not public_match or "joinchat/" in link or "+" in link:
+                            # Skip private links
+                            continue
+                            
+                        username = public_match.group(1)
+                        
+                        # Check if this group was already analyzed in database
+                        with Session(engine) as session:
+                            existing = session.get(ScrapedGroupDb, username)
+                        if existing and existing.category != "unknown":
+                            # Already processed
+                            continue
+                            
+                        log(f"正在拉取群组 @{username} 的详情与消息...")
+                        fetch_res = await fetch_group_messages(client, username)
+                        
+                        if not fetch_res.get("success"):
+                            err_msg = fetch_res.get("error", "")
+                            log(f"  拉取群组 @{username} 消息失败: {err_msg}")
+                            if "FloodWait" in err_msg or "wait of" in err_msg:
+                                log(f"⚠️ [限制警告] 检测到当前电报账号已触发限制 (FloodWait): {err_msg}。为防止封号，已自动暂停业务拓展任务，请稍后再试。")
+                                active_expansion_task["status"] = "paused"
+                                active_expansion_task["error"] = f"触发电报限制: {err_msg}"
+                                break
+                            await asyncio.sleep(4)
+                            continue
+                            
+                        title = fetch_res["title"]
+                        member_count = fetch_res["member_count"]
+                        messages = fetch_res["messages"]
+                        
+                        log(f"  拉取成功。标题: '{title}' | 成员数: {member_count}。提交 AI 进行质量打分...")
+                        
+                        # Run AI analysis (Prioritize DeepSeek, fallback to Gemini, then local)
+                        analysis = None
+                        if deepseek_api_key:
+                            analysis = analyze_group_with_deepseek(deepseek_api_key, title, fetch_res.get("description", ""), messages, target_keywords=[kw], target_desc=target_desc)
+                            if (not analysis or analysis.get("relevance_score") is None) and gemini_api_key:
+                                log("  DeepSeek 评估失败，尝试使用 Gemini 进行评估...")
+                                analysis = analyze_group_with_gemini(gemini_api_key, title, fetch_res.get("description", ""), messages, target_keywords=[kw], target_desc=target_desc)
+                        elif gemini_api_key:
+                            analysis = analyze_group_with_gemini(gemini_api_key, title, fetch_res.get("description", ""), messages, target_keywords=[kw], target_desc=target_desc)
+                            
+                        if not analysis:
+                            analysis = {
+                                "category": "unknown",
+                                "relevance_score": None,
+                                "analysis_summary": "未配置或调用 AI 接口失败，使用本地兜底计算",
+                                "recommendation": "请在配置中保存有效的 AI 密钥"
+                            }
+                            
+                        category = analysis.get("category", "unknown")
+                        relevance = analysis.get("relevance_score") # can be None
+                        summary = analysis.get("analysis_summary", "")
+                        recom = analysis.get("recommendation", "")
+                        
+                        # Compute Python metrics and combined quality score
+                        metrics = calculate_scraped_group_metrics(member_count, messages, [kw], api_relevance_score=relevance, group_type=fetch_res.get("group_type", "group"), is_dead=fetch_res.get("is_dead", False))
+                        score = metrics["quality_score"]
+                        
+                        log(f"  AI/Python 评估结果 -> 分类: {category} | 粘合度: {metrics['relevance_score']} | 活跃度: {metrics['activity_score']} | 互动率: {metrics['engagement_score']} | 垃圾扣分: {metrics['spam_penalty']} | 综合评分: {score}")
+                        
+                        # Save in database
+                        with Session(engine) as session:
+                            db_group = session.get(ScrapedGroupDb, username)
+                            if not db_group:
+                                db_group = ScrapedGroupDb(
+                                    id=username,
+                                    title=title,
+                                    link=f"https://t.me/{username}",
+                                    member_count=member_count,
+                                    category=category,
+                                    quality_score=score,
+                                    analysis_summary=f"{summary} | 建议: {recom}",
+                                    keyword=kw,
+                                    company=company,
+                                    group_type=fetch_res.get("group_type", "group"),
+                                    is_active=fetch_res.get("is_active", True),
+                                    is_dead=fetch_res.get("is_dead", False),
+                                    relevance_score=metrics["relevance_score"],
+                                    activity_score=metrics["activity_score"],
+                                    engagement_score=metrics["engagement_score"],
+                                    spam_penalty=metrics["spam_penalty"]
+                                )
+                            else:
+                                db_group.title = title
+                                db_group.member_count = member_count
+                                db_group.category = category
+                                db_group.quality_score = score
+                                db_group.analysis_summary = f"{summary} | 建议: {recom}"
+                                db_group.keyword = kw
+                                db_group.group_type = fetch_res.get("group_type", "group")
+                                db_group.is_active = fetch_res.get("is_active", True)
+                                db_group.is_dead = fetch_res.get("is_dead", False)
+                                db_group.relevance_score = metrics["relevance_score"]
+                                db_group.activity_score = metrics["activity_score"]
+                                db_group.engagement_score = metrics["engagement_score"]
+                                db_group.spam_penalty = metrics["spam_penalty"]
+                            session.add(db_group)
+                            session.commit()
+
+                        # --- AUTO JOIN & SAFETY WIND CONTROL ---
+                        if auto_join and score >= auto_join_min_score and category != "spam":
+                            if fetch_res.get("group_type") == "channel":
+                                log(f"  [加群控制] 检测到 @{username} 是频道，触发‘频道不自动加入’规则，跳过。")
+                            # 1. Round Wind Control Check
+                            elif max_rounds is not None and current_round > max_rounds:
+                                log(f"  [加群控制] 已达到最大限制轮数 {max_rounds} 轮，不执行对 @{username} 的加群操作。")
+                            else:
+                                # 2. Local Database Deduplication Check
+                                from db import GroupDb
+                                is_duplicate = False
+                                with Session(engine) as session:
+                                    # Check by username, title, or internal group ID
+                                    stmt_dup = select(GroupDb).where(GroupDb.company == company)
+                                    for g_item in session.exec(stmt_dup).all():
+                                        # Compare username
+                                        if g_item.username and g_item.username.strip('@').lower() == username.lower():
+                                            is_duplicate = True
+                                            break
+                                        # Compare title
+                                        if g_item.title and g_item.title.strip() == title.strip():
+                                            is_duplicate = True
+                                            break
+                                
+                                if is_duplicate:
+                                    log(f"  [加群控制] 触发排重机制跳过：群组 @{username} ('{title}') 已存在于群组库中，不往下执行。")
+                                else:
+                                    # 3. Check if we need to sleep due to round limit
+                                    if added_this_round >= groups_per_round:
+                                        log(f"  [加群控制] 当前第 {current_round} 轮已成功添加 {added_this_round} 个群组，达到单轮上限。进入休眠间隔...")
+                                        log(f"  [加群控制] 轮次休眠间隔: {round_interval_minutes} 分钟，暂停加群进程。")
+                                        # Sleep safely in chunks to allow quick termination
+                                        for _ in range(round_interval_minutes * 60):
+                                            if active_expansion_task["status"] != "running":
+                                                break
+                                            await asyncio.sleep(1)
+                                        # Move to next round
+                                        current_round += 1
+                                        added_this_round = 0
+                                        log(f"  [加群控制] 休眠结束，进入第 {current_round} 轮。")
+                                    
+                                    # Double check max_rounds after potential sleep round increments
+                                    if max_rounds is None or current_round <= max_rounds:
+                                        if active_expansion_task["status"] == "running":
+                                            log(f"  [加群控制] 开始自动加入群组 @{username} ...")
+                                            try:
+                                                # Invoke join_group_or_channel directly (takes client and username/link)
+                                                entity = await join_group_or_channel(client, username)
+                                                log(f"  [加群控制] 自动加入成功: @{username}")
+                                                added_this_round += 1
+                                                
+                                                # Save to GroupDb
+                                                from db import GroupDb
+                                                with Session(engine) as session:
+                                                    db_g = GroupDb(
+                                                        id=str(entity.id),
+                                                        company=company,
+                                                        title=title,
+                                                        username=username,
+                                                        type="channel" if getattr(entity, 'broadcast', False) else "group",
+                                                        enabled=True,
+                                                        memberCount=member_count,
+                                                        category="自动加群"
+                                                    )
+                                                    session.merge(db_g)
+                                                    session.commit()
+                                                    
+                                                # Mark scraped status as joined
+                                                with Session(engine) as session:
+                                                    db_group = session.get(ScrapedGroupDb, username)
+                                                    if db_group:
+                                                        db_group.status = "joined"
+                                                        session.add(db_group)
+                                                        session.commit()
+                                            except Exception as je:
+                                                log(f"  [加群控制] 自动加入失败: {str(je)}")
+
+                        # Avoid Telegram rate limits
+                        await asyncio.sleep(5)
+                        
+            # Sleep for the interval
+            current_interval = active_expansion_task.get("interval_minutes", interval_minutes)
+            log(f"此轮自主搜群拓展完成。休眠 {current_interval} 分钟后继续...")
+            for _ in range(current_interval * 60):
+                if active_expansion_task["status"] != "running":
+                    break
+                await asyncio.sleep(1)
+                
+        log("自主业务拓展任务已终止。")
+        
+    except Exception as e:
+        import traceback
+        err_msg = f"自主业务拓展循环异常: {str(e)}\n{traceback.format_exc()}"
+        log(err_msg)
+        active_expansion_task["status"] = "failed"
+        active_expansion_task["error"] = str(e)
+    finally:
+        release_account_task_usage(expansion_task_id, source="expansion-task-finish")
+
+
+@app.post("/api/expansion/start")
+async def start_business_expansion(req: StartExpansionRequest, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
+    active_expansion_task = get_company_expansion_task(user["company"])
+    from datetime import datetime
+    
+    interval = req.loop_interval_minutes or 15
+    save_expansion_config(req.target_desc, interval)
+    
+    active_expansion_task["target_desc"] = req.target_desc
+    active_expansion_task["interval_minutes"] = interval
+    
+    if active_expansion_task["status"] == "running":
+        return {"status": "success", "message": "业务拓展目标已更新"}
+        
+    if active_expansion_task["status"] == "paused":
+        active_expansion_task["status"] = "running"
+        timestamp = datetime.now().strftime("%m-%d %H:%M:%S")
+        active_expansion_task["logs"].append(f"[{timestamp}] 业务拓展已恢复运行。")
+        return {"status": "success", "message": "业务拓展已恢复运行"}
+        
+    background_tasks.add_task(
+        run_business_expansion_loop,
+        req.target_desc,
+        interval,
+        user["company"],
+        req.auto_join or False,
+        req.auto_join_min_score or 70,
+        req.max_rounds,
+        req.groups_per_round or 10,
+        req.round_interval_minutes or 5
+    )
+    return {"status": "success", "message": "业务拓展已启动"}
+
+
+@app.post("/api/expansion/pause")
+def pause_business_expansion(user: dict = Depends(get_current_user)):
+    active_expansion_task = get_company_expansion_task(user["company"])
+    from datetime import datetime
+    if active_expansion_task["status"] == "running":
+        active_expansion_task["status"] = "paused"
+        timestamp = datetime.now().strftime("%m-%d %H:%M:%S")
+        active_expansion_task["logs"].append(f"[{timestamp}] 业务拓展已暂停。")
+        release_account_task_usage(f"expansion:{user['company']}", source="expansion-task-pause")
+        return {"status": "success", "message": "业务拓展已暂停"}
+    return {"status": "success", "message": "当前没有运行中的业务拓展任务"}
+
+
+@app.get("/api/expansion/status")
+def get_business_expansion_status(user: dict = Depends(get_current_user)):
+    active_expansion_task = get_company_expansion_task(user["company"])
+    logs_slice = active_expansion_task["logs"][-150:]
+    return {
+        "status": active_expansion_task["status"],
+        "target_desc": active_expansion_task["target_desc"],
+        "current_keyword": active_expansion_task["current_keyword"],
+        "error": active_expansion_task["error"],
+        "interval_minutes": active_expansion_task.get("interval_minutes", 15),
+        "logs": logs_slice
+    }
+
+
+@app.get("/api/expansion/groups")
+def get_business_expansion_groups(user: dict = Depends(get_current_user)):
+    """Retrieves high-quality groups found by the business expansion Agent."""
+    from db import engine, ScrapedGroupDb, Session, select
+    with Session(engine) as session:
+        is_admin = user["username"] in ("eason", "admin") or user["company"] == "admin"
+        if is_admin:
+            stmt = (
+                select(ScrapedGroupDb)
+                .where(ScrapedGroupDb.quality_score >= 40)
+            )
+        else:
+            stmt = (
+                select(ScrapedGroupDb)
+                .where(ScrapedGroupDb.company == user["company"])
+                .where(ScrapedGroupDb.quality_score >= 40)
+            )
+        stmt = stmt.order_by(ScrapedGroupDb.is_important.desc(), ScrapedGroupDb.created_at.desc())
+        results = session.exec(stmt).all()
+        return results
+
+
+@app.get("/api/internal/bot/status")
+def get_internal_bot_status():
+    """Internal endpoint for Telegram Bot to query real-time account and task statuses."""
+    from db import engine, AccountDb, CampaignTaskDb, Session, select
+    import time
+    
+    with Session(engine) as session:
+        # 1. Fetch all accounts
+        db_accounts = session.exec(select(AccountDb)).all()
+        accounts_result = []
+        for acc in db_accounts:
+            # Check memory connection state
+            live_client = active_clients.get(acc.id)
+            live_connected = bool(live_client and live_client.is_connected())
+            
+            # Fetch statuses from memory store
+            status = account_status_store.get(acc.id, {
+                "is_connected": False,
+                "is_authorized": False,
+                "me": "（未初始化）",
+                "spambot_status": "unknown",
+                "spambot_details": "",
+                "spambot_time": None
+            })
+            
+            # Compute listener health state
+            health = "disabled"
+            cooldown_until = auto_private_listener_cooldowns.get(acc.id, 0)
+            if ENABLE_REALTIME_PRIVATE_DM:
+                if cooldown_until > time.time():
+                    health = "cooldown"
+                elif live_connected:
+                    if acc.id in registered_listeners:
+                        health = "ok"
+                    else:
+                        health = "zombie"
+                else:
+                    # If not connectable but marked available
+                    if getattr(acc, "is_available", True):
+                        health = "error"
+                    else:
+                        health = "disabled"
+            else:
+                health = "disabled"
+            
+            accounts_result.append({
+                "id": acc.id,
+                "account_name": acc.account_name or acc.id,
+                "owner_username": acc.owner_username or "",
+                "is_connected": live_connected or status.get("is_connected", False),
+                "is_authorized": status.get("is_authorized", False),
+                "spambot_status": status.get("spambot_status", "unknown"),
+                "spambot_details": status.get("spambot_details", ""),
+                "listener_health": health,
+                "cooldown_left": max(0, int(cooldown_until - time.time()))
+            })
+            
+        # 2. Fetch all campaign tasks
+        db_tasks = session.exec(select(CampaignTaskDb)).all()
+        tasks_result = []
+        for task in db_tasks:
+            # Check if running in memory process
+            is_running = task.id in active_processes and active_processes[task.id].poll() is None
+            if not is_running:
+                is_running = find_campaign_process(task.id) is not None
+                
+            tasks_result.append({
+                "id": task.id,
+                "account_id": task.account_id,
+                "owner_username": task.owner_username or "",
+                "status": task.status,
+                "is_running": is_running,
+                "success_count": task.success_count,
+                "fail_count": task.fail_count,
+                "round_interval_minutes": task.round_interval_minutes,
+                "message": task.message[:100] if task.message else "",
+            })
+            
+        return {
+            "ok": True,
+            "accounts": accounts_result,
+            "tasks": tasks_result,
+            "registered_listeners": list(registered_listeners)
+        }
+
+
+cleanup_tasks_progress: Dict[str, dict] = {}
+
+async def run_account_cleanup_process(account_id: str):
+    import datetime
+    import re
+    from datetime import timezone
+    
+    progress = {
+        "status": "running",
+        "started_at": time.time(),
+        "logs": [],
+        "left_groups": 0,
+        "grouped_channels": 0,
+        "synced_dms": 0,
+        "archived_chats": 0
+    }
+    failed_folders = set()
+    cleanup_tasks_progress[account_id] = progress
+    
+    def log(msg):
+        print(f"[{account_id} Cleanup] {msg}")
+        progress["logs"].append(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+    log("初始化账号整理任务...")
+    
+    client = None
+    try:
+        # 获取 Telethon 客户端，必须在 locks 保护内获取以防写冲突
+        if account_id not in client_locks:
+            client_locks[account_id] = asyncio.Lock()
+            
+        async with client_locks[account_id]:
+            # 假定此时账号已经在线，如果没有连上，则临时 connect
+            client = active_clients.get(account_id)
+            if not client:
+                # 从配置加载并获取
+                config_path = account_config_path(account_id)
+                if not config_path.exists():
+                    raise Exception("Account config not found")
+                config = load_json(config_path)
+                base_dir = config_path.parent.parent
+                client = await build_client(config, base_dir)
+                await client.connect()
+                active_clients[account_id] = client
+                
+            if not await client.is_user_authorized():
+                raise Exception("账号未授权登录，请先登录")
+                
+            if not client.is_connected():
+                await client.connect()
+                
+            # 获取翻译 Bot 和 AI Bot 的 InputPeer
+            ai_bot_username = "RosePayTest_bot"
+            translate_bot_username = "RosePay_translation_bot"
+            try:
+                db_path = get_db_path()
+                import sqlite3
+                with sqlite3.connect(db_path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT bot_username, bot_type FROM telegram_bots WHERE is_active = 1")
+                    for row in cursor.fetchall():
+                        if row["bot_type"] == "ai_bot":
+                            ai_bot_username = row["bot_username"]
+                        elif row["bot_type"] == "translate_bot":
+                            translate_bot_username = row["bot_username"]
+            except Exception as e:
+                log(f"查询数据库 bots 失败，使用默认值: {e}")
+                
+            translate_bot_peer = None
+            ai_bot_peer = None
+            try:
+                if translate_bot_username:
+                    translate_bot_peer = await client.get_input_entity(translate_bot_username)
+            except Exception as e:
+                log(f"获取翻译 Bot '{translate_bot_username}' InputPeer 失败: {e}")
+                
+            try:
+                if ai_bot_username:
+                    ai_bot_peer = await client.get_input_entity(ai_bot_username)
+            except Exception as e:
+                log(f"获取 AI Bot '{ai_bot_username}' InputPeer 失败: {e}")
+                
+            # 开始获取会话列表
+            log("正在拉取对话列表...")
+            dialogs = await client.get_dialogs()
+            log(f"拉取完成。共发现 {len(dialogs)} 个对话窗口")
+            
+            now_dt = datetime.datetime.now(timezone.utc)
+            
+            # --- 第一阶段：清理不活跃群组 ---
+            log("=== 第一阶段：检测并退出不活跃群组 ===")
+            groups_to_cleanup = []
+            for dialog in dialogs:
+                if dialog.is_group or dialog.is_channel:
+                    is_megagroup = getattr(dialog.entity, 'megagroup', False) if dialog.is_channel else True
+                    if not is_megagroup and dialog.is_channel:
+                        # 排除纯频道，只清理群组
+                        continue
+                        
+                    last_msg_date = None
+                    if dialog.message and dialog.message.date:
+                        last_msg_date = dialog.message.date
+                        
+                    if last_msg_date:
+                        diff = now_dt - last_msg_date
+                        if diff.days >= 7:
+                            groups_to_cleanup.append(dialog)
+            
+            log(f"共检测到 {len(groups_to_cleanup)} 个超过 7 天无新发言的不活跃群组。")
+            for idx, g in enumerate(groups_to_cleanup):
+                try:
+                    log(f"({idx+1}/{len(groups_to_cleanup)}) 正在退出群组: {g.name} ...")
+                    if g.is_channel:
+                        await client(functions.channels.LeaveChannelRequest(channel=g.input_entity))
+                    else:
+                        await client(functions.messages.DeleteChatUserRequest(chat_id=g.id, user_id='self'))
+                    progress["left_groups"] += 1
+                    # 退出群组后静默 5 秒
+                    await asyncio.sleep(5)
+                except errors.FloodWaitError as fwe:
+                    log(f"遭遇 429 频限，需要等待 {fwe.seconds} 秒。中断后续退群操作。")
+                    auto_private_listener_cooldowns[account_id] = time.time() + fwe.seconds
+                    break
+                except Exception as e:
+                    log(f"退出群组 {g.name} 失败: {e}")
+                    await asyncio.sleep(2)
+            
+            # 重新拉取一次 Dialog 列表，以排除已经退出的群
+            log("重新刷新对话列表以准备分类文件夹...")
+            dialogs = await client.get_dialogs()
+            
+            # --- 第二阶段：分析字数与中英文，即时分配并写入文件夹 ---
+            log("=== 第二阶段：群组字数/语言特征判别、即时归类与文件夹写入 ===")
+            
+            # 在第二阶段开始前，先清理所有旧的文件夹分类
+            log("正在清理云端旧的分类文件夹...")
+            try:
+                filters_res = await client(functions.messages.GetDialogFiltersRequest())
+                current_filters = filters_res.filters
+                
+                old_titles_to_remove = ["中文广告群", "英文广告群", "短广告群", "DM", "中文长", "中文短", "英文长", "英文短"]
+                for f in current_filters:
+                    if isinstance(f, types.DialogFilter):
+                        f_title = getattr(f, "title", "")
+                        should_remove = False
+                        for ot in old_titles_to_remove:
+                            if normalize_title(f_title) == normalize_title(ot):
+                                should_remove = True
+                                break
+                        if should_remove:
+                            log(f"正在删除旧文件夹: '{f_title}' (ID: {f.id})")
+                            await client(functions.messages.UpdateDialogFilterRequest(id=f.id))
+                            await asyncio.sleep(1)
+            except Exception as e:
+                log(f"清理旧分类文件夹失败: {e}")
+                
+            all_classified_peers = set() # 记录已命中规则的所有 Peer 引用，方便后续归档
+            
+            # 归类群组
+            for idx, dialog in enumerate(dialogs):
+                if dialog.is_group or (dialog.is_channel and getattr(dialog.entity, 'megagroup', False)):
+                    try:
+                        # 拉取最近 10 条消息来判定发言限制和中英文
+                        msgs = await client.get_messages(dialog.input_entity, limit=10)
+                        await asyncio.sleep(2) # 每次拉取消息静默 2 秒
+                        
+                        if not msgs:
+                            continue
+                            
+                        # 1. 判定字数限制
+                        msg_lengths = [len(m.message) for m in msgs if m.message]
+                        is_short_ad = False
+                        if msg_lengths:
+                            max_len = max(msg_lengths)
+                            if max_len < 200:
+                                is_short_ad = True
+                        
+                        # 2. 判定语言 (中英文)，综合考虑群名和活跃发言
+                        has_chinese_name = False
+                        if dialog.name:
+                            has_chinese_name = bool(re.search(r"[\u4e00-\u9fa5]", dialog.name)) or "🇨🇳" in dialog.name
+                        
+                        text_messages = [m.message for m in msgs if m.message]
+                        has_messages = len(text_messages) > 0
+                        combined_text = "".join(text_messages)
+                        has_chinese_messages = bool(re.search(r"[\u4e00-\u9fa5]", combined_text))
+                        
+                        is_chinese = False
+                        if has_messages:
+                            # 活跃发言中必须包含中文，方可判定为中文群（起到了中英文的区别）
+                            if has_chinese_messages:
+                                is_chinese = True
+                        else:
+                            # 如果最近没有发言，降级使用群名判定
+                            if has_chinese_name:
+                                is_chinese = True
+                        
+                        input_peer = dialog.input_entity
+                        all_classified_peers.add(dialog.id)
+                        
+                        if is_chinese:
+                            if is_short_ad:
+                                title = "中文短"
+                            else:
+                                title = "中文长"
+                        else:
+                            if is_short_ad:
+                                title = "英文短"
+                            else:
+                                title = "英文长"
+                            
+                        log_info = f"群组: {dialog.name} | 判定类别: {title} | 字数: {'短' if is_short_ad else '长'} | 语言: {'中文' if is_chinese else '英文'}"
+                        log(log_info)
+                        
+                        if title in failed_folders:
+                            continue
+                            
+                        # 即时写入/更新 Telegram 文件夹
+                        try:
+                            filters_res = await client(functions.messages.GetDialogFiltersRequest())
+                            current_filters = filters_res.filters
+                            
+                            f_obj = None
+                            for f in current_filters:
+                                if isinstance(f, types.DialogFilter) and normalize_title(f.title) == normalize_title(title):
+                                    f_obj = f
+                                    break
+                            if not f_obj:
+                                existing_ids = [f.id for f in current_filters if hasattr(f, 'id')]
+                                new_id = max(existing_ids) + 1 if existing_ids else 2
+                                f_obj = types.DialogFilter(
+                                    id=new_id,
+                                    title=title,
+                                    include_peers=[],
+                                    exclude_peers=[],
+                                    pinned_peers=[],
+                                    contacts=False,
+                                    non_contacts=False,
+                                    groups=False,
+                                    broadcasts=False,
+                                    bots=False,
+                                    exclude_muted=False,
+                                    exclude_read=False,
+                                    exclude_archived=False
+                                )
+                                current_filters.append(f_obj)
+                                log(f"已新建文件夹: '{title}'")
+                                
+                            existing_peer_ids = []
+                            for p in f_obj.include_peers:
+                                p_id = getattr(p, 'user_id', None) or getattr(p, 'channel_id', None) or getattr(p, 'chat_id', None)
+                                if p_id:
+                                    existing_peer_ids.append(p_id)
+                                    
+                            new_p_id = dialog.entity.id
+                            peer_obj = await client.get_input_entity(dialog.entity)
+                                
+                            if new_p_id and new_p_id not in existing_peer_ids:
+                                # 重新实例化一个全新的 DialogFilter，清洗所有的 include_peers/pinned_peers/exclude_peers
+                                updated_peers = list(f_obj.include_peers) + [peer_obj]
+                                clean_include = await clean_and_convert_peers_async(client, updated_peers)
+                                clean_pinned = await clean_and_convert_peers_async(client, getattr(f_obj, "pinned_peers", []) or [])
+                                clean_exclude = await clean_and_convert_peers_async(client, getattr(f_obj, "exclude_peers", []) or [])
+                                
+                                title_text = getattr(f_obj, "title", title)
+                                if isinstance(title_text, str):
+                                    title_obj = types.TextWithEntities(text=title_text, entities=[])
+                                else:
+                                    title_obj = title_text
+                                
+                                new_filter = types.DialogFilter(
+                                    id=f_obj.id,
+                                    title=title_obj,
+                                    pinned_peers=clean_pinned,
+                                    include_peers=clean_include,
+                                    exclude_peers=clean_exclude,
+                                    contacts=getattr(f_obj, "contacts", False),
+                                    non_contacts=getattr(f_obj, "non_contacts", False),
+                                    groups=getattr(f_obj, "groups", False),
+                                    broadcasts=getattr(f_obj, "broadcasts", False),
+                                    bots=getattr(f_obj, "bots", False)
+                                )
+                                await client(functions.messages.UpdateDialogFilterRequest(id=f_obj.id, filter=new_filter))
+                                log(f"已即时将群组 '{dialog.name}' 移入文件夹 '{title}'。")
+                                await asyncio.sleep(1)
+                        except Exception as fe:
+                            err_msg = str(fe)
+                            if "DIALOG_FILTERS_TOO_MUCH" in err_msg:
+                                failed_folders.add(title)
+                                log(f"账号文件夹数量已达 Telegram 上限，无法创建新文件夹 '{title}'，请手动清理一些不用的文件夹后再试。")
+                            else:
+                                log(f"即时移动群组 {dialog.name} 到文件夹 {title} 失败: {fe}")
+                            
+                        progress["grouped_channels"] += 1
+                    except errors.FloodWaitError as fwe:
+                        log(f"分析群组时遭遇 429 频限，需要等待 {fwe.seconds} 秒。跳过其余群递析。")
+                        auto_private_listener_cooldowns[account_id] = time.time() + fwe.seconds
+                        break
+                    except Exception as e:
+                        err_str = str(e)
+                        log(f"分析群组 {dialog.name} 异常: {e}")
+                        
+                        # 判定是否为失效群组，如果是则直接退群（删掉）
+                        is_invalid_group = False
+                        if any(k in err_str for k in [
+                            "CHANNEL_PRIVATE", 
+                            "CHAT_WRITE_FORBIDDEN", 
+                            "USER_BANNED_IN_CHANNEL", 
+                            "CHAT_ADMIN_REQUIRED",
+                            "ChannelPrivateError",
+                            "ChatWriteForbiddenError"
+                        ]):
+                            is_invalid_group = True
+                            
+                        if is_invalid_group:
+                            try:
+                                log(f"检测到群组 '{dialog.name}' 已失效，正在执行退群物理删除...")
+                                if dialog.is_channel:
+                                    await client(functions.channels.LeaveChannelRequest(channel=dialog.input_entity))
+                                else:
+                                    await client(functions.messages.DeleteChatUserRequest(chat_id=dialog.id, user_id='self'))
+                                log(f"已成功退出并删除失效群组 '{dialog.name}'。")
+                                progress["left_groups"] += 1
+                                await asyncio.sleep(3)
+                            except Exception as le:
+                                log(f"退出失效群组 '{dialog.name}' 失败: {le}")
+            
+            # --- 第三阶段：私聊同步 DM 文件夹 (即时同步) ---
+            log("=== 第三阶段：同步私聊窗口至 DM 文件夹 ===")
+            dm_count = 0
+            for dialog in dialogs:
+                if dialog.is_user and getattr(dialog.entity, 'bot', False) is False:
+                    try:
+                        all_classified_peers.add(dialog.id)
+                        
+                        if "DM" in failed_folders:
+                            continue
+                            
+                        filters_res = await client(functions.messages.GetDialogFiltersRequest())
+                        current_filters = filters_res.filters
+                        
+                        f_obj = None
+                        for f in current_filters:
+                            if isinstance(f, types.DialogFilter) and normalize_title(f.title) == normalize_title("DM"):
+                                f_obj = f
+                                break
+                        if not f_obj:
+                            existing_ids = [f.id for f in current_filters if hasattr(f, 'id')]
+                            new_id = max(existing_ids) + 1 if existing_ids else 2
+                            f_obj = types.DialogFilter(
+                                id=new_id,
+                                title="DM",
+                                include_peers=[],
+                                exclude_peers=[],
+                                pinned_peers=[],
+                                contacts=False,
+                                non_contacts=False,
+                                groups=False,
+                                broadcasts=False,
+                                bots=False,
+                                exclude_muted=False,
+                                exclude_read=False,
+                                exclude_archived=False
+                            )
+                            current_filters.append(f_obj)
+                            log("已新建文件夹: 'DM'")
+                            
+                        existing_peer_ids = []
+                        for p in f_obj.include_peers:
+                            p_id = getattr(p, 'user_id', None) or getattr(p, 'channel_id', None) or getattr(p, 'chat_id', None)
+                            if p_id:
+                                existing_peer_ids.append(p_id)
+                                
+                        new_p_id = dialog.entity.id
+                        peer_obj = await client.get_input_entity(dialog.entity)
+                        if new_p_id and new_p_id not in existing_peer_ids:
+                            # 重新实例化全新的 DialogFilter 并清洗
+                            updated_peers = list(f_obj.include_peers) + [peer_obj]
+                            clean_include = await clean_and_convert_peers_async(client, updated_peers)
+                            clean_pinned = await clean_and_convert_peers_async(client, getattr(f_obj, "pinned_peers", []) or [])
+                            clean_exclude = await clean_and_convert_peers_async(client, getattr(f_obj, "exclude_peers", []) or [])
+                            
+                            title_text = getattr(f_obj, "title", "DM")
+                            if isinstance(title_text, str):
+                                title_obj = types.TextWithEntities(text=title_text, entities=[])
+                            else:
+                                title_obj = title_text
+                                
+                            new_filter = types.DialogFilter(
+                                id=f_obj.id,
+                                title=title_obj,
+                                pinned_peers=clean_pinned,
+                                include_peers=clean_include,
+                                exclude_peers=clean_exclude,
+                                contacts=getattr(f_obj, "contacts", False),
+                                non_contacts=getattr(f_obj, "non_contacts", False),
+                                groups=getattr(f_obj, "groups", False),
+                                broadcasts=getattr(f_obj, "broadcasts", False),
+                                bots=getattr(f_obj, "bots", False)
+                            )
+                            await client(functions.messages.UpdateDialogFilterRequest(id=f_obj.id, filter=new_filter))
+                            log(f"已即时将私聊 '{dialog.name}' 移入文件夹 'DM'。")
+                            await asyncio.sleep(0.5)
+                            
+                        dm_count += 1
+                        progress["synced_dms"] = dm_count
+                    except Exception as fe:
+                        err_msg = str(fe)
+                        if "DIALOG_FILTERS_TOO_MUCH" in err_msg:
+                            failed_folders.add("DM")
+                            log("账号文件夹数量已达 Telegram 上限，无法创建新文件夹 'DM'，请手动清理一些不用的文件夹后再试。")
+                        else:
+                            log(f"同步私聊 {dialog.name} 失败: {fe}")
+                    
+            # --- 第五阶段：将所有整理命中会话进行“归档隐藏” ---
+            log("=== 第五阶段：批量隐藏归档会话 (Archive) ===")
+            peers_to_archive = []
+            
+            for dialog in dialogs:
+                if dialog.id in all_classified_peers:
+                    if dialog.folder_id != 1:
+                        peers_to_archive.append(dialog)
+                        
+            if peers_to_archive:
+                log(f"共有 {len(peers_to_archive)} 个会话需要进行归档隐藏...")
+                for i in range(0, len(peers_to_archive), 20):
+                    batch = peers_to_archive[i:i+20]
+                    try:
+                        folder_peers = []
+                        for item in batch:
+                            folder_peers.append(types.InputFolderPeer(peer=item.input_entity, folder_id=1))
+                        log(f"正在将本批 {len(batch)} 个会话移动到归档夹...")
+                        await client(functions.folders.EditPeerFoldersRequest(folder_peers=folder_peers))
+                        progress["archived_chats"] += len(batch)
+                        await asyncio.sleep(3)
+                    except errors.FloodWaitError as fwe:
+                        log(f"归档操作遭遇 429 频限，需要等待 {fwe.seconds} 秒。中断后续归档。")
+                        auto_private_listener_cooldowns[account_id] = time.time() + fwe.seconds
+                        break
+                    except Exception as e:
+                        log(f"归档批量操作失败: {e}")
+                        await asyncio.sleep(2)
+            else:
+                log("没有检测到需要移动归档的非归档会话。")
+                
+            # --- 第六阶段：确保翻译 Bot 存在于每一个分类文件夹中，并且置顶 ---
+            log("=== 第六阶段：将翻译 Bot 同步并置顶到每一个分类文件夹 ===")
+            if translate_bot_peer:
+                try:
+                    filters_res = await client(functions.messages.GetDialogFiltersRequest())
+                    current_filters = filters_res.filters
+                    
+                    # 4个我们要管理的文件夹名称
+                    target_folder_titles = ["中文长", "中文短", "英文长", "英文短"]
+                    
+                    for f_obj in current_filters:
+                        if isinstance(f_obj, types.DialogFilter):
+                            f_title = getattr(f_obj, "title", "")
+                            is_target = False
+                            for target_title in target_folder_titles:
+                                if normalize_title(f_title) == normalize_title(target_title):
+                                    is_target = True
+                                    break
+                            
+                            if is_target:
+                                # 清洗现有的 include/pinned/exclude
+                                clean_include = await clean_and_convert_peers_async(client, list(f_obj.include_peers) or [])
+                                clean_pinned = await clean_and_convert_peers_async(client, getattr(f_obj, "pinned_peers", []) or [])
+                                clean_exclude = await clean_and_convert_peers_async(client, getattr(f_obj, "exclude_peers", []) or [])
+                                
+                                t_user_id = getattr(translate_bot_peer, 'user_id', None)
+                                if t_user_id:
+                                    # 1. 确保翻译 Bot 存在于 include 中
+                                    exists_in_include = False
+                                    for p in clean_include:
+                                        if getattr(p, 'user_id', None) == t_user_id:
+                                            exists_in_include = True
+                                            break
+                                    if not exists_in_include:
+                                        clean_include.append(translate_bot_peer)
+                                    
+                                    # 2. 确保翻译 Bot 在 pinned 中且在第一位
+                                    clean_pinned = [p for p in clean_pinned if getattr(p, 'user_id', None) != t_user_id]
+                                    clean_pinned.insert(0, translate_bot_peer)
+                                    
+                                    # 构造更新后的 DialogFilter
+                                    title_text = getattr(f_obj, "title", f_title)
+                                    if isinstance(title_text, str):
+                                        title_obj = types.TextWithEntities(text=title_text, entities=[])
+                                    else:
+                                        title_obj = title_text
+                                        
+                                    new_filter = types.DialogFilter(
+                                        id=f_obj.id,
+                                        title=title_obj,
+                                        pinned_peers=clean_pinned,
+                                        include_peers=clean_include,
+                                        exclude_peers=clean_exclude,
+                                        contacts=getattr(f_obj, "contacts", False),
+                                        non_contacts=getattr(f_obj, "non_contacts", False),
+                                        groups=getattr(f_obj, "groups", False),
+                                        broadcasts=getattr(f_obj, "broadcasts", False),
+                                        bots=getattr(f_obj, "bots", False)
+                                    )
+                                    await client(functions.messages.UpdateDialogFilterRequest(id=f_obj.id, filter=new_filter))
+                                    log(f"已将翻译 Bot 置顶并同步到文件夹 '{f_title}'。")
+                                    await asyncio.sleep(1)
+                except Exception as fe:
+                    log(f"同步/置顶翻译 Bot 到分类文件夹失败: {fe}")
+                    
+            # --- 第七阶段：把 aibot 在主文件夹（默认会话列表）置顶 ---
+            if ai_bot_peer:
+                try:
+                    log(f"正在将 AI Bot '{ai_bot_username}' 置顶在主文件夹...")
+                    await client(functions.messages.ToggleDialogPinRequest(
+                        peer=ai_bot_peer,
+                        pinned=True
+                    ))
+                    log(f"AI Bot '{ai_bot_username}' 置顶在主文件夹成功。")
+                except Exception as e:
+                    log(f"置顶 AI Bot 失败 (可能已置顶或已达上限): {e}")
+                    
+            progress["status"] = "success"
+            log("🎉 账号整理整理完毕！完美闭环成功。")
+            
+    except Exception as exc:
+        progress["status"] = "failed"
+        log(f"❌ 账号整理失败中断: {exc}")
+
+
+@app.post("/api/internal/cleanup")
+async def trigger_cleanup_tasks(background_tasks: BackgroundTasks, payload: dict = Body(...)):
+    account_ids = payload.get("account_ids", [])
+    if not account_ids:
+        raise HTTPException(status_code=400, detail="account_ids is required")
+        
+    for acc_id in account_ids:
+        background_tasks.add_task(run_account_cleanup_process, acc_id)
+        
+    return {"ok": True, "message": f"已提交 {len(account_ids)} 个账号的后台整理任务"}
+
+
+@app.get("/api/internal/cleanup/progress/{account_id}")
+def get_cleanup_progress(account_id: str):
+    prog = cleanup_tasks_progress.get(account_id)
+    if not prog:
+        return {"ok": False, "status": "not_found", "message": "未找到整理记录"}
+    return {
+        "ok": True,
+        "status": prog["status"],
+        "started_at": prog["started_at"],
+        "logs": prog["logs"][-30:],
+        "left_groups": prog["left_groups"],
+        "grouped_channels": prog["grouped_channels"],
+        "synced_dms": prog["synced_dms"],
+        "archived_chats": prog["archived_chats"]
+    }
+
+# --- TELEGRAM BOTS CONFIGURATION & CRUD API ---
+
+from pydantic import BaseModel
+
+class TelegramBotRequest(BaseModel):
+    bot_username: str
+    bot_token: str
+    bot_type: str
+    title: str
+    description: str
+    is_active: int = 1
+
+@app.get("/api/bots")
+def list_telegram_bots(user: dict = Depends(get_current_user)):
+    """列出系统里所有已注册的电报 Bot"""
+    from db import engine, Session, select
+    import sqlite3
+    
+    # 统计每个 Bot 绑定的账号数量
+    stats = {}
+    try:
+        from db import DB_PATH
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='bot_authorized_users';")
+            if cursor.fetchone():
+                cursor.execute("SELECT bot_type, COUNT(*) FROM bot_authorized_users GROUP BY bot_type;")
+                for b_type, count in cursor.fetchall():
+                    stats[b_type] = count
+    except Exception:
+        pass
+
+    with Session(engine) as session:
+        import sqlite3
+        from db import DB_PATH
+        bots = []
+        try:
+            with sqlite3.connect(str(DB_PATH)) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("SELECT id, bot_username, bot_token, bot_type, title, description, is_active, created_at FROM telegram_bots;")
+                for row in cursor.fetchall():
+                    b_type = row["bot_type"]
+                    linked_count = stats.get(b_type, 0)
+                    if b_type == "ai_bot":
+                        cursor.execute("SELECT COUNT(*) FROM accounts;")
+                        linked_count = cursor.fetchone()[0]
+                    elif b_type == "translate_bot":
+                        cursor.execute("SELECT COUNT(*) FROM bot_authorized_users WHERE bot_type = 'translate_bot';")
+                        linked_count = cursor.fetchone()[0]
+                        
+                    bots.append({
+                        "id": row["id"],
+                        "bot_username": row["bot_username"],
+                        "bot_token": row["bot_token"],
+                        "bot_type": row["bot_type"],
+                        "title": row["title"],
+                        "description": row["description"],
+                        "is_active": row["is_active"],
+                        "created_at": row["created_at"],
+                        "linked_accounts_count": linked_count
+                    })
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to load bots: {str(e)}")
+
+        return {"bots": bots}
+        
+        return bots
+
+@app.post("/api/bots")
+def create_telegram_bot(req: TelegramBotRequest, user: dict = Depends(get_current_user)):
+    """在控制台里动态创建一个电报 Bot"""
+    import sqlite3
+    import datetime
+    from db import DB_PATH
+    
+    bot_username_clean = req.bot_username.strip().lstrip("@")
+    now_str = datetime.datetime.now().isoformat()
+    
+    try:
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO telegram_bots (bot_username, bot_token, bot_type, title, description, is_active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (bot_username_clean, req.bot_token.strip(), req.bot_type, req.title.strip(), req.description.strip(), req.is_active, now_str)
+            )
+            conn.commit()
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail=f"Bot 用户名 @{bot_username_clean} 已经存在，无法重复创建")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"创建 Bot 失败: {str(e)}")
+        
+    if req.bot_type == "ai_bot" and req.is_active == 1:
+        try:
+            import subprocess
+            import os
+            if os.name != "nt":
+                subprocess.run(["systemctl", "restart", "rosepay-bot.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+            
+    return {"ok": True, "message": "Bot 创建成功"}
+
+@app.put("/api/bots/{bot_id}")
+def update_telegram_bot(bot_id: int, req: TelegramBotRequest, user: dict = Depends(get_current_user)):
+    """编辑修改现有的电报 Bot 参数"""
+    import sqlite3
+    from db import DB_PATH
+    
+    bot_username_clean = req.bot_username.strip().lstrip("@")
+    
+    try:
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT bot_token, bot_type, is_active FROM telegram_bots WHERE id = ?", (bot_id,))
+            old_row = cursor.fetchone()
+            
+            cursor.execute(
+                "UPDATE telegram_bots SET bot_username = ?, bot_token = ?, bot_type = ?, title = ?, description = ?, is_active = ? WHERE id = ?",
+                (bot_username_clean, req.bot_token.strip(), req.bot_type, req.title.strip(), req.description.strip(), req.is_active, bot_id)
+            )
+            conn.commit()
+            
+            if old_row and (old_row["bot_token"] != req.bot_token.strip() or old_row["bot_type"] != req.bot_type or old_row["is_active"] != req.is_active):
+                if req.bot_type == "ai_bot" or old_row["bot_type"] == "ai_bot":
+                    try:
+                        import subprocess
+                        import os
+                        if os.name != "nt":
+                            subprocess.run(["systemctl", "restart", "rosepay-bot.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    except Exception:
+                        pass
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"更新 Bot 失败: {str(e)}")
+        
+    return {"ok": True, "message": "Bot 更新成功"}
+
+@app.delete("/api/bots/{bot_id}")
+def delete_telegram_bot(bot_id: int, user: dict = Depends(get_current_user)):
+    """删除已注销的电报 Bot"""
+    import sqlite3
+    from db import DB_PATH
+    
+    try:
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM telegram_bots WHERE id = ?", (bot_id,))
+            conn.commit()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"删除 Bot 失败: {str(e)}")
+        
+    return {"ok": True, "message": "Bot 已成功删除"}
+
+
+# --- BOT SPECIFIC AUTHORIZATION MANAGEMENT API ---
+
+class BotAuthRequest(BaseModel):
+    telegram_chat_id: str
+    telegram_username: str
+    role: str
+    owner_username: str
+    is_active: int = 1
+
+@app.get("/api/bots/{bot_type}/authorizations")
+def list_bot_authorizations(bot_type: str, user: dict = Depends(get_current_user)):
+    """获取某个特定 Bot 节点下的所有授权账号和群组"""
+    import sqlite3
+    from db import DB_PATH
+    
+    auths = []
+    try:
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            # 确保表存在
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS bot_authorized_users (
+                    telegram_chat_id TEXT NOT NULL,
+                    bot_type TEXT NOT NULL,
+                    telegram_username TEXT,
+                    role TEXT DEFAULT 'employee',
+                    owner_username TEXT,
+                    approved_at TEXT,
+                    approved_by TEXT,
+                    is_active INTEGER DEFAULT 1,
+                    PRIMARY KEY (telegram_chat_id, bot_type)
+                );
+            """)
+            cursor.execute(
+                "SELECT telegram_chat_id, bot_type, telegram_username, role, owner_username, approved_at, is_active FROM bot_authorized_users WHERE bot_type = ?;",
+                (bot_type,)
+            )
+            for row in cursor.fetchall():
+                auths.append({
+                    "telegram_chat_id": row["telegram_chat_id"],
+                    "bot_type": row["bot_type"],
+                    "telegram_username": row["telegram_username"],
+                    "role": row["role"],
+                    "owner_username": row["owner_username"],
+                    "approved_at": row["approved_at"],
+                    "is_active": row["is_active"]
+                })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch bot auths: {str(e)}")
+        
+    return {"authorizations": auths}
+
+@app.post("/api/bots/{bot_type}/authorizations")
+def create_bot_authorization(bot_type: str, req: BotAuthRequest, user: dict = Depends(get_current_user)):
+    """手动免注册新增一个 Bot 授权账号或中转群"""
+    import sqlite3
+    import datetime
+    from db import DB_PATH
+    
+    now_str = datetime.datetime.now().isoformat()
+    chat_id_clean = req.telegram_chat_id.strip()
+    username_clean = req.telegram_username.strip().lstrip("@")
+    
+    try:
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR REPLACE INTO bot_authorized_users (telegram_chat_id, bot_type, telegram_username, role, owner_username, approved_at, approved_by, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (chat_id_clean, bot_type, username_clean, req.role, req.owner_username.strip(), now_str, user["username"], req.is_active)
+            )
+            
+            # 如果角色是系统管理员或普通员工，且关联了后台 admins 表中已有的用户名，同步更新其 telegram_chat_id
+            if req.role in ["admin", "employee"] and username_clean:
+                cursor.execute("SELECT username FROM admins WHERE username = ? OR telegram_contact = ?", (username_clean, f"@{username_clean}"))
+                admin_row = cursor.fetchone()
+                if admin_row:
+                    cursor.execute("UPDATE admins SET telegram_chat_id = ? WHERE username = ?", (chat_id_clean, admin_row[0]))
+                    
+            conn.commit()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create bot auth: {str(e)}")
+        
+    return {"ok": True, "message": "授权添加成功"}
+
+@app.put("/api/bots/{bot_type}/authorizations/{chat_id}")
+def update_bot_authorization(bot_type: str, chat_id: str, req: BotAuthRequest, user: dict = Depends(get_current_user)):
+    """编辑修改某个 Bot 的授权账号或中转群配置"""
+    import sqlite3
+    from db import DB_PATH
+    
+    username_clean = req.telegram_username.strip().lstrip("@")
+    chat_id_clean = req.telegram_chat_id.strip()
+    
+    try:
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            cursor = conn.cursor()
+            
+            # 如果 Chat ID 发生改变，先删掉旧的再插入新的以保证主键唯一
+            if chat_id_clean != chat_id:
+                cursor.execute("DELETE FROM bot_authorized_users WHERE telegram_chat_id = ? AND bot_type = ?", (chat_id, bot_type))
+            
+            cursor.execute(
+                "INSERT OR REPLACE INTO bot_authorized_users (telegram_chat_id, bot_type, telegram_username, role, owner_username, is_active) VALUES (?, ?, ?, ?, ?, ?)",
+                (chat_id_clean, bot_type, username_clean, req.role, req.owner_username.strip(), req.is_active)
+            )
+            
+            # 同步更新 admins 表的关联
+            if req.role in ["admin", "employee"] and username_clean:
+                cursor.execute("SELECT username FROM admins WHERE username = ? OR telegram_contact = ?", (username_clean, f"@{username_clean}"))
+                admin_row = cursor.fetchone()
+                if admin_row:
+                    cursor.execute("UPDATE admins SET telegram_chat_id = ? WHERE username = ?", (chat_id_clean, admin_row[0]))
+                    
+            conn.commit()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update bot auth: {str(e)}")
+        
+    return {"ok": True, "message": "授权修改成功"}
+
+@app.delete("/api/bots/{bot_type}/authorizations/{chat_id}")
+def delete_bot_authorization(bot_type: str, chat_id: str, user: dict = Depends(get_current_user)):
+    """解除某个电报账号或中转群对该 Bot 的授权"""
+    import sqlite3
+    from db import DB_PATH
+    
+    try:
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM bot_authorized_users WHERE telegram_chat_id = ? AND bot_type = ?", (chat_id, bot_type))
+            conn.commit()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete bot auth: {str(e)}")
+        
+    return {"ok": True, "message": "已解除授权"}
+
+
+# --- BOT AUTO REPLY TEMPLATE CRUD API ---
+
+class AutoReplyRequest(BaseModel):
+    reply_text: str
+    is_enabled: int = 1
+
+@app.get("/api/bots/{bot_type}/auto-replies")
+def list_bot_auto_replies(bot_type: str, user: dict = Depends(get_current_user)):
+    """获取某个 Bot 节点下的所有自动回复模板"""
+    import sqlite3
+    from db import DB_PATH
+    
+    replies = []
+    try:
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS bot_auto_replies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    bot_type TEXT NOT NULL,
+                    reply_text TEXT NOT NULL,
+                    is_enabled INTEGER DEFAULT 1,
+                    created_at TEXT
+                );
+            """)
+            cursor.execute(
+                "SELECT id, bot_type, reply_text, is_enabled, created_at FROM bot_auto_replies WHERE bot_type = ?;",
+                (bot_type,)
+            )
+            for row in cursor.fetchall():
+                replies.append({
+                    "id": row["id"],
+                    "bot_type": row["bot_type"],
+                    "reply_text": row["reply_text"],
+                    "is_enabled": row["is_enabled"],
+                    "created_at": row["created_at"]
+                })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch auto replies: {str(e)}")
+        
+    return {"replies": replies}
+
+@app.post("/api/bots/{bot_type}/auto-replies")
+def create_bot_auto_reply(bot_type: str, req: AutoReplyRequest, user: dict = Depends(get_current_user)):
+    """为某个 Bot 手动新增一条随机自动回复模板"""
+    import sqlite3
+    import datetime
+    from db import DB_PATH
+    
+    now_str = datetime.datetime.now().isoformat()
+    
+    try:
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO bot_auto_replies (bot_type, reply_text, is_enabled, created_at) VALUES (?, ?, ?, ?)",
+                (bot_type, req.reply_text.strip(), req.is_enabled, now_str)
+            )
+            conn.commit()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create auto reply: {str(e)}")
+        
+    return {"ok": True, "message": "添加自动回复模板成功"}
+
+@app.put("/api/bots/{bot_type}/auto-replies/{reply_id}")
+def update_bot_auto_reply(bot_type: str, reply_id: int, req: AutoReplyRequest, user: dict = Depends(get_current_user)):
+    """编辑修改某个自动回复模板的内容"""
+    import sqlite3
+    from db import DB_PATH
+    
+    try:
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE bot_auto_replies SET reply_text = ?, is_enabled = ? WHERE id = ? AND bot_type = ?",
+                (req.reply_text.strip(), req.is_enabled, reply_id, bot_type)
+            )
+            conn.commit()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update auto reply: {str(e)}")
+        
+    return {"ok": True, "message": "修改自动回复模板成功"}
+
+@app.delete("/api/bots/{bot_type}/auto-replies/{reply_id}")
+def delete_bot_auto_reply(bot_type: str, reply_id: int, user: dict = Depends(get_current_user)):
+    """删除某个自动回复模板"""
+    import sqlite3
+    from db import DB_PATH
+    
+    try:
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM bot_auto_replies WHERE id = ? AND bot_type = ?", (reply_id, bot_type))
+            conn.commit()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete auto reply: {str(e)}")
+        
+    return {"ok": True, "message": "已删除该回复模板"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    import os
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", 8000))
+    reload = os.getenv("RELOAD", "false").lower() == "true"
+    print(f"Starting web server on {host}:{port} (reload={reload})...")
+    uvicorn.run("web_server:app", host=host, port=port, reload=reload)
+
+
