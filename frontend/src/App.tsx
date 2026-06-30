@@ -2271,6 +2271,8 @@ export default function App() {
     }
   };
 
+  const isTranslateBotType = (botType?: string | null) => (botType || '').toLowerCase() === 'translate_bot';
+
   const refreshBotPermissionPage = async (botType: string = selectedBotType) => {
     await Promise.all([
       fetchManagedBots(),
@@ -2292,20 +2294,27 @@ export default function App() {
   };
 
   const openEditBotNodeModal = async (bot: ManagedBot, tab: 'auth' | 'reply' = 'auth') => {
+    const botType = bot.bot_type || 'ai_bot';
+    const translateBot = isTranslateBotType(botType);
     setEditingBotNode(bot);
     setBotNodeTitle(bot.title || '');
     setBotNodeUsername(bot.bot_username || '');
     setBotNodeToken(bot.bot_token || '');
-    setBotNodeType(bot.bot_type || 'ai_bot');
+    setBotNodeType(botType);
     setBotNodeDescription(bot.description || '');
     setBotNodeActive(bot.is_active ? 1 : 0);
-    setSelectedBotType(bot.bot_type || 'ai_bot');
-    setBotManageTab(tab);
+    setSelectedBotType(botType);
+    setBotManageTab(translateBot ? 'auth' : tab);
     setShowBotNodeModal(true);
-    await Promise.all([
-      fetchBotAuthorizations(bot.bot_type || 'ai_bot'),
-      fetchBotAutoReplies(bot.bot_type || 'ai_bot')
-    ]);
+    if (translateBot) {
+      setBotAutoReplies([]);
+      await fetchBotAuthorizations(botType);
+    } else {
+      await Promise.all([
+        fetchBotAuthorizations(botType),
+        fetchBotAutoReplies(botType)
+      ]);
+    }
   };
 
   const saveBotNode = async (e?: any) => {
@@ -14715,8 +14724,14 @@ export default function App() {
                         </div>
                       </div>
                       <div className="flex gap-2 pt-1">
-                        <button onClick={() => openEditBotNodeModal(bot, 'auth')} className="flex-1 px-3 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-[11px] font-black transition-all active:scale-[0.98]">专属授权账号与中转群</button>
-                        <button onClick={() => openEditBotNodeModal(bot, 'reply')} className="px-3 py-2 border border-slate-200 hover:bg-slate-50 text-slate-600 rounded-xl text-[11px] font-bold transition-colors">自动回复</button>
+                        {isTranslateBotType(bot.bot_type) ? (
+                          <button onClick={() => openEditBotNodeModal(bot, 'auth')} className="flex-1 px-3 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-[11px] font-black transition-all active:scale-[0.98]">查看绑定账号</button>
+                        ) : (
+                          <>
+                            <button onClick={() => openEditBotNodeModal(bot, 'auth')} className="flex-1 px-3 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-[11px] font-black transition-all active:scale-[0.98]">专属授权账号与中转群</button>
+                            <button onClick={() => openEditBotNodeModal(bot, 'reply')} className="px-3 py-2 border border-slate-200 hover:bg-slate-50 text-slate-600 rounded-xl text-[11px] font-bold transition-colors">自动回复</button>
+                          </>
+                        )}
                       </div>
                     </div>
                   ))}
@@ -20749,37 +20764,47 @@ export default function App() {
                 {editingBotNode && (
                   <div className="p-6 flex flex-col gap-4 col-span-2 bg-slate-50/25">
                     <div className="flex border-b border-slate-100 pb-1.5 gap-2">
-                      <button type="button" onClick={() => setBotManageTab('auth')} className={`px-4 py-2 text-xs font-black rounded-xl transition-all ${botManageTab === 'auth' ? 'bg-slate-900 text-white shadow-sm' : 'text-slate-400 hover:text-slate-700'}`}>🔑 专属授权账号与中转群</button>
-                      <button type="button" onClick={() => setBotManageTab('reply')} className={`px-4 py-2 text-xs font-black rounded-xl transition-all ${botManageTab === 'reply' ? 'bg-slate-900 text-white shadow-sm' : 'text-slate-400 hover:text-slate-700'}`}>💬 首问随机自动回复模板</button>
+                      <button type="button" onClick={() => setBotManageTab('auth')} className={`px-4 py-2 text-xs font-black rounded-xl transition-all ${botManageTab === 'auth' ? 'bg-slate-900 text-white shadow-sm' : 'text-slate-400 hover:text-slate-700'}`}>
+                        {isTranslateBotType(editingBotNode.bot_type) ? '🔑 绑定账号情况' : '🔑 专属授权账号与中转群'}
+                      </button>
+                      {!isTranslateBotType(editingBotNode.bot_type) && (
+                        <button type="button" onClick={() => setBotManageTab('reply')} className={`px-4 py-2 text-xs font-black rounded-xl transition-all ${botManageTab === 'reply' ? 'bg-slate-900 text-white shadow-sm' : 'text-slate-400 hover:text-slate-700'}`}>💬 首问随机自动回复模板</button>
+                      )}
                     </div>
 
                     {botManageTab === 'auth' && (
                       <div className="flex flex-col gap-4 animate-fade-in">
                         <div className="flex justify-between items-center">
-                          <span className="text-[10px] text-slate-400 font-bold">管理此 Bot 的访问权限与消息接收群组</span>
-                          <button type="button" onClick={openCreateBotAuthModal} className="px-2.5 py-1 bg-slate-950 text-white hover:bg-slate-800 rounded-lg text-[10px] font-black transition-all active:scale-[0.97]">➕ 免注册手动新增授权</button>
+                          <span className="text-[10px] text-slate-400 font-bold">
+                            {isTranslateBotType(editingBotNode.bot_type) ? '查看翻译助手当前绑定的电报账号' : '管理此 Bot 的访问权限与消息接收群组'}
+                          </span>
+                          {!isTranslateBotType(editingBotNode.bot_type) && (
+                            <button type="button" onClick={openCreateBotAuthModal} className="px-2.5 py-1 bg-slate-950 text-white hover:bg-slate-800 rounded-lg text-[10px] font-black transition-all active:scale-[0.97]">➕ 免注册手动新增授权</button>
+                          )}
                         </div>
                         <div className="bg-white border border-slate-100 rounded-2xl overflow-hidden shadow-xs">
                           <table className="w-full text-left border-collapse text-xs">
                             <thead>
                               <tr className="bg-slate-50/70 text-[10px] font-bold text-slate-400 uppercase tracking-wider border-b border-slate-100">
-                                <th className="py-3 px-4">电报用户 / 群组</th>
+                                <th className="py-3 px-4">{isTranslateBotType(editingBotNode.bot_type) ? '绑定电报账号' : '电报用户 / 群组'}</th>
                                 <th className="py-3 px-4">Chat ID</th>
                                 <th className="py-3 px-4">角色权限</th>
                                 <th className="py-3 px-4">归属绑定账号</th>
-                                <th className="py-3 px-4 text-right">操作</th>
+                                {!isTranslateBotType(editingBotNode.bot_type) && <th className="py-3 px-4 text-right">操作</th>}
                               </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-50">
                               {botAuthorizations.length === 0 ? (
-                                <tr><td colSpan={5} className="py-8 text-center text-xs text-slate-400 bg-white">📭 该 Bot 暂无任何专属授权记录。</td></tr>
+                                <tr><td colSpan={isTranslateBotType(editingBotNode.bot_type) ? 4 : 5} className="py-8 text-center text-xs text-slate-400 bg-white">📭 该 Bot 暂无任何专属授权记录。</td></tr>
                               ) : botAuthorizations.map((auth, idx) => (
                                 <tr key={`${auth.bot_type}-${auth.telegram_chat_id}-${idx}`} className="hover:bg-slate-50/50 transition-colors">
                                   <td className="py-3 px-4 font-semibold text-slate-800">{auth.telegram_username ? <a href={`https://t.me/${auth.telegram_username.replace(/^@+/, '')}`} target="_blank" rel="noreferrer" className="text-blue-600 hover:underline">@{auth.telegram_username.replace(/^@+/, '')}</a> : <span className="text-slate-400 font-light">未命名 / 群组</span>}</td>
                                   <td className="py-3 px-4 font-mono text-slate-500">{auth.telegram_chat_id}</td>
                                   <td className="py-3 px-4"><span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${auth.role === 'admin' ? 'bg-purple-50 text-purple-700 border border-purple-100' : auth.role === 'employee' ? 'bg-blue-50 text-blue-700 border border-blue-100' : 'bg-slate-100 text-slate-600'}`}>{auth.role === 'admin' ? '👑 管理员' : auth.role === 'employee' ? '🔑 员工' : '🟢 托管关联'}</span></td>
                                   <td className="py-3 px-4 text-slate-600">{auth.owner_username ? <span className="px-1.5 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-100 font-medium">{auth.owner_username}</span> : <span className="text-slate-300 font-light">—</span>}</td>
-                                  <td className="py-3 px-4 text-right"><button type="button" onClick={() => openEditBotAuthModal(auth)} className="text-slate-400 hover:text-blue-600 font-bold mr-3">编辑</button><button type="button" onClick={() => deleteBotAuthorization(auth)} className="text-slate-400 hover:text-rose-600 font-bold">解除</button></td>
+                                  {!isTranslateBotType(editingBotNode.bot_type) && (
+                                    <td className="py-3 px-4 text-right"><button type="button" onClick={() => openEditBotAuthModal(auth)} className="text-slate-400 hover:text-blue-600 font-bold mr-3">编辑</button><button type="button" onClick={() => deleteBotAuthorization(auth)} className="text-slate-400 hover:text-rose-600 font-bold">解除</button></td>
+                                  )}
                                 </tr>
                               ))}
                             </tbody>
@@ -20788,7 +20813,7 @@ export default function App() {
                       </div>
                     )}
 
-                    {botManageTab === 'reply' && (
+                    {botManageTab === 'reply' && !isTranslateBotType(editingBotNode.bot_type) && (
                       <div className="flex flex-col gap-4 animate-fade-in">
                         <div className="flex justify-between items-center bg-blue-500/5 p-3 rounded-2xl border border-blue-500/10 text-[11px] text-blue-700 font-medium">
                           <span>💡 <b>多话术随机防封机制已激活</b>：当客户首次私聊您绑定的电报账号时，系统会从以下启用的文本模板中<b>随机抽取一条</b>自动回复。</span>
