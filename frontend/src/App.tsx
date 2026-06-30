@@ -1081,6 +1081,7 @@ export default function App() {
   const [isBotSetupLoading, setIsBotSetupLoading] = useState<boolean>(false);
   const [loadingBotAccounts, setLoadingBotAccounts] = useState<Record<string, boolean>>({});
   const [privateUnreadSummary, setPrivateUnreadSummary] = useState<Record<string, PrivateUnreadSummary>>({});
+  const [privateRelayStarting, setPrivateRelayStarting] = useState<boolean>(false);
   const [showPrivateChatModal, setShowPrivateChatModal] = useState<boolean>(false);
   const [privateChatAccount, setPrivateChatAccount] = useState<BackendAccount | null>(null);
   const [privateDialogs, setPrivateDialogs] = useState<PrivateDialog[]>([]);
@@ -1091,9 +1092,6 @@ export default function App() {
   const [loadingPrivateMessages, setLoadingPrivateMessages] = useState<boolean>(false);
   const [sendingPrivateMessage, setSendingPrivateMessage] = useState<boolean>(false);
   const [privateChatError, setPrivateChatError] = useState<string>('');
-  const [dmNotificationPermission, setDmNotificationPermission] = useState<NotificationPermission | 'unsupported'>(
-    () => ('Notification' in window ? Notification.permission : 'unsupported')
-  );
   const showPrivateChatModalRef = useRef<boolean>(false);
   const privateChatAccountRef = useRef<BackendAccount | null>(null);
   const selectedPrivateDialogRef = useRef<PrivateDialog | null>(null);
@@ -1103,8 +1101,6 @@ export default function App() {
   const privateMessageRequestSeqRef = useRef<number>(0);
   const openPrivateChatFromEventRef = useRef<(event: PrivateDmEvent) => void>(() => {});
   const privateMessagesEndRef = useRef<HTMLDivElement | null>(null);
-  const notificationPromptedAtRef = useRef<number>(0);
-
   const [accountSortField, setAccountSortField] = useState<'health' | 'available' | 'none'>('health');
 
   const [accountSortDesc, setAccountSortDesc] = useState<boolean>(true);
@@ -1116,22 +1112,6 @@ export default function App() {
     backendAccountsRef.current = backendAccounts;
     currentUsernameRef.current = currentUsername;
   }, [showPrivateChatModal, privateChatAccount, selectedPrivateDialog, backendAccounts, currentUsername]);
-
-  const isAccountOwnedByUsername = (acc: BackendAccount | undefined | null, username: string) => {
-    if (!acc || !username) return false;
-    const owner = String(acc.owner_username || acc.config?.owner_username || '').trim();
-    const createdBy = String(acc.created_by || acc.config?.created_by || '').trim();
-    if (owner) return owner === username;
-    return createdBy === username;
-  };
-
-  const isPrivateEventOwnedByUsername = (event: PrivateDmEvent, username: string) => {
-    if (!username) return false;
-    const owner = String(event.account_owner_username || '').trim();
-    const createdBy = String(event.account_created_by || '').trim();
-    if (owner) return owner === username;
-    return createdBy === username;
-  };
 
   const buildAccountFromPrivateEvent = (event: PrivateDmEvent): BackendAccount | null => {
     const accountId = String(event.account_id || '');
@@ -1165,31 +1145,6 @@ export default function App() {
       privateMessagesEndRef.current?.scrollIntoView({ block: 'end', behavior: 'auto' });
     });
   }, [showPrivateChatModal, selectedPrivateDialog?.peer_id, privateMessages.length, loadingPrivateMessages]);
-
-  const requestDmNotificationPermission = async () => {
-    if (!('Notification' in window)) {
-      setDmNotificationPermission('unsupported');
-      setToastText('当前浏览器不支持桌面通知');
-      setTimeout(() => setToastText(''), 2500);
-      return;
-    }
-    if (Notification.permission === 'granted') {
-      setDmNotificationPermission('granted');
-      setToastText('私聊桌面通知已开启');
-      setTimeout(() => setToastText(''), 2000);
-      return;
-    }
-    if (Notification.permission === 'denied') {
-      setDmNotificationPermission('denied');
-      setToastText('浏览器已禁止通知，请在地址栏网站权限里手动开启');
-      setTimeout(() => setToastText(''), 4000);
-      return;
-    }
-    const permission = await Notification.requestPermission();
-    setDmNotificationPermission(permission);
-    setToastText(permission === 'granted' ? '私聊桌面通知已开启' : '未开启桌面通知，仍会在页面内更新未读');
-    setTimeout(() => setToastText(''), 3000);
-  };
 
   useEffect(() => {
     // Automatically remove accounts that truly cannot run tasks from task selections.
@@ -1240,6 +1195,38 @@ export default function App() {
   const isAccountLockedForManualOperation = (acc: BackendAccount) => {
     const state = getAccountTaskState(acc);
     return state === 'operation' || state === 'join' || state === 'campaign' || state === 'scraper' || state === 'expansion';
+  };
+
+  const startPrivateRelayListeners = async () => {
+    if (privateRelayStarting) return;
+    setPrivateRelayStarting(true);
+    try {
+      const res = await fetch(`${BASE_URL}/api/accounts/private-listeners/start-idle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || `启动失败：${res.status}`);
+      }
+      if (data.disabled) {
+        setToastText(data.message || '实时私聊中转未启用');
+      } else {
+        const started = Array.isArray(data.started) ? data.started.length : 0;
+        const skipped = Array.isArray(data.skipped) ? data.skipped.length : 0;
+        const failed = Array.isArray(data.failed) ? data.failed.length : 0;
+        setToastText(`私聊中转启动完成：已监听 ${started} 个，跳过 ${skipped} 个，失败 ${failed} 个`);
+      }
+      setTimeout(() => setToastText(''), 4500);
+      await fetchBackendAccounts(false);
+      await fetchPrivateUnreadSummary(false);
+    } catch (err: any) {
+      setToastText(err?.message || '启动私聊中转失败');
+      setTimeout(() => setToastText(''), 4500);
+    } finally {
+      setPrivateRelayStarting(false);
+    }
   };
   const shouldShowAccountUnlockButton = (acc: BackendAccount) => Boolean(acc.active_operation);
 
@@ -1339,43 +1326,6 @@ export default function App() {
       return Boolean(username && username.endsWith('bot'));
     };
 
-    const showPrivateDmNotification = (event: PrivateDmEvent, eventKey: string) => {
-      return; // 彻底关闭私聊弹窗通知
-      const accountId = String(event.account_id || '');
-      const account = backendAccountsRef.current.find(item => item.id === accountId);
-      const accountLabel = account?.name || event.account_label || `+${accountId}`;
-      const senderLabel = event.sender_username || event.sender_name || `ID ${event.sender_id || ''}`;
-      const preview = (event.text || '[media]').replace(/\s+/g, ' ').slice(0, 160);
-
-      if ('Notification' in window && Notification.permission === 'granted') {
-        const notification = new Notification(`RosePay 私聊提醒 - ${accountLabel}`, {
-          body: `${senderLabel}: ${preview}`,
-          tag: eventKey,
-          requireInteraction: false,
-          silent: false
-        });
-        notification.onclick = () => {
-          window.focus();
-          openPrivateChatFromEventRef.current(event);
-          notification.close();
-        };
-        return;
-      }
-
-      if ('Notification' in window) {
-        setDmNotificationPermission(Notification.permission);
-      } else {
-        setDmNotificationPermission('unsupported');
-      }
-
-      const now = Date.now();
-      if (now - notificationPromptedAtRef.current > 30000) {
-        notificationPromptedAtRef.current = now;
-        setToastText(`新私聊：${accountLabel} / ${senderLabel}`);
-        setTimeout(() => setToastText(''), 3500);
-      }
-    };
-
     const applyPrivateDmEvent = (event: PrivateDmEvent) => {
       const accountId = String(event.account_id || '');
       const peerId = String(event.sender_id || '');
@@ -1396,14 +1346,6 @@ export default function App() {
       const eventDate = event.timestamp ? new Date(event.timestamp * 1000).toISOString() : new Date().toISOString();
       const messageIdNumber = Number(event.message_id || 0) || -Math.floor((event.timestamp || Date.now()) * 1000);
       const displayName = event.sender_name || event.sender_username || 'Unknown';
-      const account = backendAccountsRef.current.find(item => item.id === accountId);
-      const shouldNotifyForAccount = account
-        ? isAccountOwnedByUsername(account, currentUsernameRef.current)
-        : isPrivateEventOwnedByUsername(event, currentUsernameRef.current);
-      if (!isSelectedDialog && shouldNotifyForAccount) {
-        showPrivateDmNotification(event, key);
-      }
-
       setPrivateUnreadSummary(prev => {
         const base = prev[accountId] || { unread_dialogs: 0, unread_messages: 0 };
         const nextMessages = isSelectedDialog ? 0 : Number(base.unread_messages || 0) + 1;
@@ -10437,31 +10379,19 @@ export default function App() {
 
                       <button 
 
-                        onClick={requestDmNotificationPermission}
+                        onClick={startPrivateRelayListeners}
 
-                        disabled={dmNotificationPermission === 'unsupported'}
+                        disabled={privateRelayStarting}
 
-                        className={`px-4 py-2 rounded-lg text-xs font-bold shadow-sm transition-all flex items-center gap-1.5 border ${
-                          dmNotificationPermission === 'granted'
-                            ? 'bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border-emerald-200'
-                            : dmNotificationPermission === 'denied'
-                              ? 'bg-rose-50 hover:bg-rose-100 text-rose-700 border-rose-200'
-                              : 'bg-cyan-50 hover:bg-cyan-100 text-cyan-700 border-cyan-200'
-                        }`}
+                        className="px-4 py-2 rounded-lg text-xs font-bold shadow-sm transition-all flex items-center gap-1.5 border bg-cyan-50 hover:bg-cyan-100 disabled:bg-cyan-50 disabled:text-cyan-400 text-cyan-700 border-cyan-200"
 
-                        title={
-                          dmNotificationPermission === 'granted'
-                            ? '仅归属于当前用户的账号收到私聊时会弹出浏览器通知；管理员仍可打开全部账号私聊查看'
-                            : dmNotificationPermission === 'denied'
-                              ? '浏览器已禁止通知，请在地址栏网站权限里开启'
-                              : '开启后，仅归属于当前用户的账号收到私聊会弹出浏览器通知'
-                        }
+                        title="启动所有可用且空闲账号的实时私聊监听；收到私聊后由 AI Bot 转发到中转群主题。"
 
                       >
 
-                        <Bell className="w-3.5 h-3.5" />
+                        {privateRelayStarting ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Bell className="w-3.5 h-3.5" />}
 
-                        <span>{dmNotificationPermission === 'granted' ? '通知已开' : dmNotificationPermission === 'denied' ? '通知被禁' : '开启私聊通知'}</span>
+                        <span>{privateRelayStarting ? '正在启动中转' : '启动私聊中转'}</span>
 
                       </button>
 

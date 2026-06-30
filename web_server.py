@@ -44,7 +44,7 @@ from private_dm_events import append_private_dm_event, read_private_dm_events, r
 from telethon import TelegramClient, functions, types, errors, utils
 from telethon.errors import SessionPasswordNeededError, UserDeactivatedError
 
-ENABLE_REALTIME_PRIVATE_DM = False
+ENABLE_REALTIME_PRIVATE_DM = os.getenv("ROSEPAY_ENABLE_REALTIME_PRIVATE_DM", "1").strip().lower() not in {"0", "false", "off", "no"}
 
 app = FastAPI(title="Telegram Control Panel API", version="1.0.0")
 
@@ -3133,14 +3133,22 @@ async def start_idle_private_listeners(req: Optional[PrivateListenerStartRequest
         if target_ids and acc.id not in target_ids:
             continue
 
+        if getattr(acc, "is_available", True) is False:
+            skipped.append({"account_id": acc.id, "name": acc.account_name, "reason": "账号当前为占用状态"})
+            continue
+
+        if not account_has_session_file(acc.id, acc):
+            skipped.append({"account_id": acc.id, "name": acc.account_name, "reason": "未找到有效 session"})
+            continue
+
         skip_reason = get_private_poll_skip_reason(acc.id)
         if skip_reason:
             skipped.append({"account_id": acc.id, "name": acc.account_name, "reason": skip_reason})
             continue
 
         try:
-            client = await get_client(acc.id)
-            if not await client.is_user_authorized():
+            ok = await ensure_private_listener_for_account(acc.id, acc.account_name or acc.id)
+            if not ok:
                 failed.append({"account_id": acc.id, "name": acc.account_name, "error": "账号未登录"})
                 continue
             started.append({"account_id": acc.id, "name": acc.account_name})
