@@ -1237,6 +1237,7 @@ export default function App() {
     const state = getAccountTaskState(acc);
     return state === 'operation' || state === 'join' || state === 'campaign' || state === 'scraper' || state === 'expansion';
   };
+  const shouldShowAccountUnlockButton = (acc: BackendAccount) => Boolean(acc.active_operation);
 
   const getAccountSortBucket = (acc: BackendAccount): number => {
     if (acc.is_available === false) return 3;
@@ -10924,10 +10925,10 @@ export default function App() {
                                 </td>
                                 <td className="py-2.5 px-2 text-right whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
                                   <div className="account-actions flex gap-1 justify-end items-center flex-nowrap">
-                                    {acc.isAuthorized && (
+                                    {acc.isAuthorized && shouldShowAccountUnlockButton(acc) && (
                                       <button
                                         onClick={async () => {
-                                          if (!confirm(`确认强制清除账号 +${acc.id} 的所有操作锁？这可以解决操作卡死报错的问题。`)) return;
+                                          if (!confirm(`确认强制清除账号 +${acc.id} 的当前操作锁？仅建议在账号操作卡死、一直提示 409 正在执行其他操作时使用。`)) return;
                                           try {
                                             const res = await fetch(`${BASE_URL}/api/accounts/${acc.id}/reset-lock`, { method: 'POST' });
                                             if (res.ok) {
@@ -10942,7 +10943,7 @@ export default function App() {
                                           }
                                         }}
                                         className="account-action-button px-2 py-1 bg-amber-50 hover:bg-amber-100 text-amber-700 text-[11px] font-semibold rounded-md border border-amber-100 transition-colors"
-                                        title="如果账号提示409正在执行其他操作，点击此处强行解锁"
+                                        title={`当前锁定操作：${acc.active_operation_label || acc.active_operation || '未知操作'}。仅账号操作卡死时使用。`}
                                       >
                                         解锁
                                       </button>
