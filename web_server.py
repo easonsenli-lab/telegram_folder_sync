@@ -8117,6 +8117,30 @@ async def campaign_worker_task(task_id: str):
                 session.add(new_log)
                 session.commit()
 
+        async def campaign_drain_private_queues(max_items_per_account: int = 3) -> int:
+            drained_total = 0
+            for queued_account_id in list(account_ids):
+                try:
+                    queued_client = clients.get(queued_account_id)
+                    if queued_client and queued_client.is_connected():
+                        drained_total += await drain_pending_private_sends(
+                            queued_account_id,
+                            queued_client,
+                            max_items=max_items_per_account,
+                        )
+                except Exception as drain_exc:
+                    print(f"[PrivateSendQueue] Campaign drain failed for {queued_account_id}: {drain_exc}")
+            return drained_total
+
+        async def campaign_sleep_with_private_queue(total_seconds: float, max_items_per_account: int = 2):
+            remaining = max(0.0, float(total_seconds or 0))
+            while remaining > 0:
+                await campaign_drain_private_queues(max_items_per_account=max_items_per_account)
+                step = min(5.0, remaining)
+                await asyncio.sleep(step)
+                remaining -= step
+            await campaign_drain_private_queues(max_items_per_account=max_items_per_account)
+
         cycle = max(1, int(task_record.current_cycle or 1))
         while True:
             # 1. Update status
@@ -8130,6 +8154,8 @@ async def campaign_worker_task(task_id: str):
 
             # 2. Iterate through targets in this cycle
             for idx, group in enumerate(target_groups):
+                await campaign_drain_private_queues(max_items_per_account=2)
+
                 # Check cancellation
                 with Session(engine) as session:
                     task = session.get(CampaignTaskDb, task_id)
@@ -8410,7 +8436,7 @@ async def campaign_worker_task(task_id: str):
                     # Cool down only the account that triggered FloodWait.
                     if selected_account_id:
                         account_cooldowns[selected_account_id] = time.time() + int(exc.seconds)
-                    await asyncio.sleep(min(int(exc.seconds), max(5, group_interval)))
+                    await campaign_sleep_with_private_queue(min(int(exc.seconds), max(5, group_interval)), max_items_per_account=2)
                     continue
                 except (errors.ChatAdminRequiredError, errors.ChatWriteForbiddenError, errors.UserBannedInChannelError) as exc:
                     log_status = "failed"
@@ -8450,18 +8476,11 @@ async def campaign_worker_task(task_id: str):
 
                 # Group Delay
                 if idx < len(target_groups) - 1:
-                    for queued_account_id in list(account_ids):
-                        try:
-                            queued_client = clients.get(queued_account_id)
-                            if queued_client and queued_client.is_connected():
-                                await drain_pending_private_sends(queued_account_id, queued_client, max_items=3)
-                        except Exception as drain_exc:
-                            print(f"[PrivateSendQueue] Drain before campaign sleep failed for {queued_account_id}: {drain_exc}")
                     delay = group_interval
                     if is_safety:
                         # Safety Blasting: random delay between 5 and group_interval
                         delay = random.randint(5, max(5, group_interval))
-                    await asyncio.sleep(delay)
+                    await campaign_sleep_with_private_queue(delay, max_items_per_account=3)
 
             # Cycle complete check
             if max_cycles > 0 and cycle >= max_cycles:
@@ -8476,15 +8495,8 @@ async def campaign_worker_task(task_id: str):
 
             # Round Interval Sleep
             cycle += 1
-            for queued_account_id in list(account_ids):
-                try:
-                    queued_client = clients.get(queued_account_id)
-                    if queued_client and queued_client.is_connected():
-                        await drain_pending_private_sends(queued_account_id, queued_client, max_items=5)
-                except Exception as drain_exc:
-                    print(f"[PrivateSendQueue] Drain before round sleep failed for {queued_account_id}: {drain_exc}")
             # Sleep round_interval minutes
-            await asyncio.sleep(round_interval * 60)
+            await campaign_sleep_with_private_queue(round_interval * 60, max_items_per_account=5)
 
     except asyncio.CancelledError:
         with Session(engine) as session:
