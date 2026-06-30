@@ -354,7 +354,7 @@ export default function App() {
 
   // User management states
 
-  const [usersList, setUsersList] = useState<{id: number, username: string, role: string, company: string, created_at: string}[]>([]);
+  const [usersList, setUsersList] = useState<{id: number, username: string, role: string, company: string, telegram_contact?: string, forum_chat_id?: string, created_at: string}[]>([]);
 
   const [showAddUserModal, setShowAddUserModal] = useState<boolean>(false);
 
@@ -365,6 +365,10 @@ export default function App() {
   const [newUserRole, setNewUserRole] = useState<'admin' | 'user'>('user');
 
   const [newUserCompany, setNewUserCompany] = useState<string>('admin');
+
+  const [newUserTelegramContact, setNewUserTelegramContact] = useState<string>('');
+
+  const [newUserForumChatId, setNewUserForumChatId] = useState<string>('');
 
   const [showEditPasswordModal, setShowEditPasswordModal] = useState<boolean>(false);
 
@@ -387,6 +391,10 @@ export default function App() {
   const [editUserCompany, setEditUserCompany] = useState<string>('');
 
   const [editUserPassword, setEditUserPassword] = useState<string>('');
+
+  const [editUserTelegramContact, setEditUserTelegramContact] = useState<string>('');
+
+  const [editUserForumChatId, setEditUserForumChatId] = useState<string>('');
 
 
 
@@ -1972,7 +1980,11 @@ export default function App() {
 
           role: newUserRole,
 
-          company: newUserCompany
+          company: newUserCompany,
+
+          telegram_contact: newUserTelegramContact.trim(),
+
+          forum_chat_id: newUserForumChatId.trim()
 
         })
 
@@ -1993,6 +2005,10 @@ export default function App() {
         setNewUserPassword('');
 
         setNewUserCompany('admin');
+
+        setNewUserTelegramContact('');
+
+        setNewUserForumChatId('');
 
         fetchUsersList();
 
@@ -2084,7 +2100,11 @@ export default function App() {
 
         role: editUserRole,
 
-        company: editUserCompany
+        company: editUserCompany,
+
+        telegram_contact: editUserTelegramContact.trim(),
+
+        forum_chat_id: editUserForumChatId.trim()
 
       };
 
@@ -2117,6 +2137,10 @@ export default function App() {
         setEditUserTarget(null);
 
         setEditUserPassword('');
+
+        setEditUserTelegramContact('');
+
+        setEditUserForumChatId('');
 
         fetchUsersList();
 
@@ -14417,6 +14441,8 @@ export default function App() {
 
                           <th className="py-4 px-6">角色权限</th>
 
+                          <th className="py-4 px-6">通知绑定</th>
+
                           <th className="py-4 px-6">创建时间</th>
 
                           <th className="py-4 px-6 text-right">操作</th>
@@ -14431,7 +14457,7 @@ export default function App() {
 
                           <tr>
 
-                            <td colSpan={6} className="py-8 text-center text-slate-400 text-xs font-light">
+                            <td colSpan={7} className="py-8 text-center text-slate-400 text-xs font-light">
 
                               暂无用户数据。
 
@@ -14441,7 +14467,15 @@ export default function App() {
 
                         ) : (
 
-                          usersList.map((user) => (
+                          usersList.map((user) => {
+
+                            const telegramContact = (user.telegram_contact || '').trim();
+
+                            const forumChatId = (user.forum_chat_id || '').trim();
+
+                            const telegramHref = telegramContact ? `https://t.me/${telegramContact.replace(/^@/, '')}` : '';
+
+                            return (
 
                             <tr key={user.id} className="border-b border-slate-50 text-sm text-slate-700 hover:bg-slate-50/40 transition-colors">
 
@@ -14481,6 +14515,54 @@ export default function App() {
 
                               </td>
 
+                              <td className="py-4 px-6 min-w-[180px]">
+
+                                <div className="flex flex-col gap-1 text-[11px]">
+
+                                  {telegramContact ? (
+
+                                    <a
+
+                                      href={telegramHref}
+
+                                      target="_blank"
+
+                                      rel="noreferrer"
+
+                                      className="font-mono text-blue-600 hover:text-blue-700 hover:underline truncate max-w-[180px]"
+
+                                      title={telegramContact}
+
+                                    >
+
+                                      {telegramContact}
+
+                                    </a>
+
+                                  ) : (
+
+                                    <span className="text-slate-300">未绑定电报号</span>
+
+                                  )}
+
+                                  {forumChatId ? (
+
+                                    <span className="font-mono text-slate-500 truncate max-w-[180px]" title={forumChatId}>
+
+                                      中转群 {forumChatId}
+
+                                    </span>
+
+                                  ) : (
+
+                                    <span className="text-slate-300">未设置中转群</span>
+
+                                  )}
+
+                                </div>
+
+                              </td>
+
                               <td className="py-4 px-6 text-xs text-slate-500 font-mono">
 
                                 {new Date(user.created_at).toLocaleString('zh-CN')}
@@ -14500,6 +14582,10 @@ export default function App() {
                                     setEditUserCompany(user.company || 'admin');
 
                                     setEditUserPassword('');
+
+                                    setEditUserTelegramContact(user.telegram_contact || '');
+
+                                    setEditUserForumChatId(user.forum_chat_id || '');
 
                                     setShowEditUserModal(true);
 
@@ -14535,7 +14621,9 @@ export default function App() {
 
                             </tr>
 
-                          ))
+                            );
+
+                          })
 
                         )}
 
@@ -17040,6 +17128,10 @@ export default function App() {
 
                     setNewUserPassword('');
 
+                    setNewUserTelegramContact('');
+
+                    setNewUserForumChatId('');
+
                   }}
 
                   className="w-8 h-8 hover:bg-slate-100 rounded-full flex items-center justify-center text-slate-400 hover:text-slate-600 transition-colors"
@@ -17128,6 +17220,52 @@ export default function App() {
 
 
 
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+
+                  <div className="flex flex-col gap-1.5">
+
+                    <label className="text-xs font-semibold text-slate-700">电报通知账号</label>
+
+                    <input
+
+                      type="text"
+
+                      value={newUserTelegramContact}
+
+                      onChange={(e) => setNewUserTelegramContact(e.target.value)}
+
+                      placeholder="@username 或 t.me/username"
+
+                      className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 text-sm focus:outline-none focus:bg-white focus:border-blue-500 font-mono"
+
+                    />
+
+                  </div>
+
+                  <div className="flex flex-col gap-1.5">
+
+                    <label className="text-xs font-semibold text-slate-700">中转群 Chat ID</label>
+
+                    <input
+
+                      type="text"
+
+                      value={newUserForumChatId}
+
+                      onChange={(e) => setNewUserForumChatId(e.target.value)}
+
+                      placeholder="-100xxxxxxxxxx"
+
+                      className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 text-sm focus:outline-none focus:bg-white focus:border-blue-500 font-mono"
+
+                    />
+
+                  </div>
+
+                </div>
+
+
+
                 <div className="flex flex-col gap-2">
 
                   <label className="text-xs font-semibold text-slate-700">角色权限</label>
@@ -17198,6 +17336,10 @@ export default function App() {
 
                     setNewUserPassword('');
 
+                    setNewUserTelegramContact('');
+
+                    setNewUserForumChatId('');
+
                   }}
 
                   className="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-700 text-xs font-bold rounded-lg transition-all"
@@ -17257,6 +17399,10 @@ export default function App() {
                     setEditUserTarget(null);
 
                     setEditUserPassword('');
+
+                    setEditUserTelegramContact('');
+
+                    setEditUserForumChatId('');
 
                   }}
 
@@ -17344,6 +17490,52 @@ export default function App() {
 
 
 
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+
+                  <div className="flex flex-col gap-1.5">
+
+                    <label className="text-xs font-semibold text-slate-700">电报通知账号</label>
+
+                    <input
+
+                      type="text"
+
+                      value={editUserTelegramContact}
+
+                      onChange={(e) => setEditUserTelegramContact(e.target.value)}
+
+                      placeholder="@username 或 t.me/username"
+
+                      className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 text-sm focus:outline-none focus:bg-white focus:border-blue-500 font-mono"
+
+                    />
+
+                  </div>
+
+                  <div className="flex flex-col gap-1.5">
+
+                    <label className="text-xs font-semibold text-slate-700">中转群 Chat ID</label>
+
+                    <input
+
+                      type="text"
+
+                      value={editUserForumChatId}
+
+                      onChange={(e) => setEditUserForumChatId(e.target.value)}
+
+                      placeholder="-100xxxxxxxxxx"
+
+                      className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 text-sm focus:outline-none focus:bg-white focus:border-blue-500 font-mono"
+
+                    />
+
+                  </div>
+
+                </div>
+
+
+
                 <div className="flex flex-col gap-2">
 
                   <label className="text-xs font-semibold text-slate-700">角色权限</label>
@@ -17413,6 +17605,10 @@ export default function App() {
                     setEditUserTarget(null);
 
                     setEditUserPassword('');
+
+                    setEditUserTelegramContact('');
+
+                    setEditUserForumChatId('');
 
                   }}
 
