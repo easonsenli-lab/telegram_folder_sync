@@ -277,6 +277,10 @@ class CampaignLogDb(SQLModel, table=True):
 
     group_id: str
 
+    group_username: Optional[str] = None
+
+    ad_ref: Optional[str] = None
+
     account_id: Optional[str] = None
 
     phone: Optional[str] = None
@@ -1046,6 +1050,22 @@ def migrate_columns():
                 print("Migrating DB: adding column 'phone' to 'campaign_logs' table...")
 
                 cursor.execute("ALTER TABLE campaign_logs ADD COLUMN phone TEXT")
+
+                conn.commit()
+
+            if "group_username" not in columns:
+
+                print("Migrating DB: adding column 'group_username' to 'campaign_logs' table...")
+
+                cursor.execute("ALTER TABLE campaign_logs ADD COLUMN group_username TEXT")
+
+                conn.commit()
+
+            if "ad_ref" not in columns:
+
+                print("Migrating DB: adding column 'ad_ref' to 'campaign_logs' table...")
+
+                cursor.execute("ALTER TABLE campaign_logs ADD COLUMN ad_ref TEXT")
 
                 conn.commit()
 

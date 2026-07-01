@@ -80,13 +80,51 @@ def get_info_by_thread_id(thread_id: int, chat_id: Optional[int] = None) -> Opti
 
 def _send_urllib_request_sync(url: str, data_bytes: bytes, headers: dict, timeout: int = 10) -> dict:
     import urllib.request
+    import urllib.error
     import json
     try:
         req = urllib.request.Request(url, data=data_bytes, headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
-    except Exception:
-        return {}
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", "replace")
+            parsed = json.loads(body) if body else {}
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            body = ""
+        return {"ok": False, "error_code": exc.code, "description": body or str(exc)}
+    except Exception as exc:
+        return {"ok": False, "description": str(exc)}
+
+
+def _topic_send_failed_because_thread_is_stale(response: dict) -> bool:
+    description = str(response.get("description") or "").lower()
+    return any(
+        marker in description
+        for marker in (
+            "message thread not found",
+            "thread not found",
+            "topic closed",
+            "topic deleted",
+        )
+    )
+
+
+def clear_topic_thread_id(account_id: str, sender_id: int, chat_id: Optional[int] = None, thread_id: Optional[int] = None) -> None:
+    if not TOPICS_MAP_FILE.exists():
+        return
+    try:
+        with TOPICS_MAP_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        data.pop(f"{account_id}:{sender_id}", None)
+        if chat_id is not None and thread_id is not None:
+            data.pop(f"rev:{chat_id}:{thread_id}", None)
+        with TOPICS_MAP_FILE.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"[Topics] Clear error: {exc}")
 
 async def async_notify_admin_of_dm(account_id: str, account_label: str, sender_id: int, sender_name: str, sender_username: str, message_text: str, message_id: int) -> None:
     import sqlite3
@@ -261,9 +299,43 @@ async def async_notify_admin_of_dm(account_id: str, account_label: str, sender_i
                 if resp_data.get("ok"):
                     print(f"[NotifyAdmin] Message successfully forwarded to Topic {thread_id} for account {account_id}")
                     return
+                print(f"[NotifyAdmin] Failed to forward message to Topic {thread_id}: {resp_data}")
+                if _topic_send_failed_because_thread_is_stale(resp_data):
+                    clear_topic_thread_id(account_id, sender_id, int(notify_chat_id), int(thread_id))
+                    recreate_payload = {
+                        "chat_id": int(notify_chat_id),
+                        "name": f"[{display_account_name}] {sender_display}"
+                    }
+                    recreated = await asyncio.to_thread(
+                        _send_urllib_request_sync,
+                        f"https://api.telegram.org/bot{bot_token}/createForumTopic",
+                        json.dumps(recreate_payload).encode("utf-8"),
+                        {"Content-Type": "application/json"},
+                        10
+                    )
+                    if recreated.get("ok"):
+                        new_thread_id = recreated["result"]["message_thread_id"]
+                        save_topic_thread_id(account_id, sender_id, int(notify_chat_id), new_thread_id)
+                        msg_payload["message_thread_id"] = int(new_thread_id)
+                        retry_resp = await asyncio.to_thread(
+                            _send_urllib_request_sync,
+                            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                            json.dumps(msg_payload).encode("utf-8"),
+                            {"Content-Type": "application/json"},
+                            10
+                        )
+                        if retry_resp.get("ok"):
+                            print(f"[NotifyAdmin] Message forwarded after recreating Topic {new_thread_id} for account {account_id}")
+                            return
+                        print(f"[NotifyAdmin] Retry after recreating Topic failed: {retry_resp}")
+                    else:
+                        print(f"[NotifyAdmin] Failed to recreate stale Forum Topic: {recreated}")
             except Exception as msg_exc:
                 print(f"[NotifyAdmin] Error forwarding message to Topic: {msg_exc}")
- 
+
+        print(f"[NotifyAdmin] Forum group is configured but forwarding failed; skip deprecated direct DM fallback for account {account_id}")
+        return
+
     # CASE B: Fallback to original Direct Chat / Private DM routing if no notify_chat_id group is configured
     if not telegram_chat_id:
         print(f"[NotifyAdmin] No private telegram_chat_id bound and no Forum Group configured for owner of account {account_id}")

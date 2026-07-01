@@ -38,6 +38,8 @@ from telethon.errors import (
 from telethon import TelegramClient, functions, types, utils
 from telethon.sessions import StringSession
 
+from static_proxy_pool import ensure_safe_telegram_proxy_config, safe_proxy_summary
+
 BUILTIN_TELEGRAM_DESKTOP_API_ID = 2040
 BUILTIN_TELEGRAM_DESKTOP_API_HASH = "b18441a1ff607e10a989891a5462e627"
 
@@ -162,6 +164,41 @@ def telegram_client_options(config: dict[str, Any], proxy_type: str | None = Non
 
 
 async def choose_telegram_client_options(config: dict[str, Any], api_id: int, api_hash: str) -> dict[str, Any]:
+    proxy_candidates = config.get("_runtime_proxy_candidates")
+    if isinstance(proxy_candidates, list) and proxy_candidates:
+        timeout = int(config.get("connection_timeout_seconds", 30) or 30)
+        retries = int(config.get("connection_retries", 5) or 5)
+        errors: list[str] = []
+        for proxy_config in proxy_candidates:
+            test_config = dict(config)
+            test_config["proxy"] = proxy_config
+            proxy_type = str(proxy_config.get("type", "socks5")).lower()
+            options = {
+                "timeout": max(timeout, 5),
+                "connection_retries": max(retries, 1),
+                "retry_delay": 3,
+                "proxy": build_proxy(test_config, proxy_type),
+            }
+            label = proxy_label(test_config, proxy_type)
+            safe_print(f"正在测试静态代理：{label}")
+            client = TelegramClient(StringSession(), api_id, api_hash, **options)
+            try:
+                await asyncio.wait_for(client.connect(), timeout=max(8, min(20, timeout)))
+                if client.is_connected():
+                    await client.disconnect()
+                    config["proxy"] = proxy_config
+                    config["_runtime_proxy_selected"] = proxy_config.get("host")
+                    safe_print(f"静态代理可用：{label}")
+                    return options
+                errors.append(f"{label}: 未能建立连接")
+            except Exception as exc:
+                errors.append(f"{label}: {type(exc).__name__}: {exc}")
+            finally:
+                if client.is_connected():
+                    await client.disconnect()
+
+        raise ConnectionError("静态代理池全部不可用，已阻止裸连 Telegram: " + str(errors[:6]))
+
     types_to_try = proxy_type_names(config)
     if not types_to_try or len(types_to_try) == 1:
         if types_to_try:
@@ -531,6 +568,8 @@ def export_csv(db_path: Path, csv_path: Path) -> None:
 
 
 async def build_client(config: dict[str, Any], base_dir: Path) -> TelegramClient:
+    config = ensure_safe_telegram_proxy_config(config)
+    safe_print(f"Telegram 连接代理：{safe_proxy_summary(config)}")
     auth_mode = config.get("auth_mode", "api_id_hash")
     session_path = resolve_path(base_dir, config["session_name"])
     session_path.parent.mkdir(parents=True, exist_ok=True)
@@ -556,6 +595,14 @@ async def build_client(config: dict[str, Any], base_dir: Path) -> TelegramClient
             system_lang_code="en-US",
             **options,
         )
+
+    if auth_mode == "telegram_desktop_tdata":
+        raise RuntimeError(
+            "telegram_desktop_tdata 模式暂时禁用：当前无法确认 OpenTele 会强制使用静态代理池，"
+            "为避免服务器 IP 裸连 Telegram，请改用 builtin_telegram_desktop。"
+        )
+
+    raise RuntimeError(f"不支持的 auth_mode：{auth_mode}。为避免裸连 Telegram，仅允许已验证代理路径的登录模式。")
 
     try:
         from opentele.api import API, UseCurrentSession

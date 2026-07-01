@@ -209,7 +209,6 @@ def append_log(path: Path, group: TargetGroup, action: str, status: str, detail:
                 detail,
             ]
         )
-
     # Also write to SQLite database data/rosepay.db
     try:
         import sqlite3
@@ -247,7 +246,6 @@ def append_log(path: Path, group: TargetGroup, action: str, status: str, detail:
             )
     except Exception as e:
         print(f"Failed to append log to SQLite: {e}", flush=True)
-
 
 
 def prompt_text(prompt: str, default: str | None = None) -> str:
@@ -539,7 +537,9 @@ async def run_cycle(
     cycle_number: int,
 ) -> bool:
     max_groups = int(config.get("max_groups_per_cycle", 0) or 0)
-    targets = options.groups[:max_groups] if max_groups > 0 else options.groups
+    targets = list(options.groups)
+    random.shuffle(targets)
+    targets = targets[:max_groups] if max_groups > 0 else targets
     jitter = int(config.get("jitter_seconds", 0) or 0)
     parse_mode = config.get("parse_mode") or None
     link_preview = bool(config.get("link_preview", False))
@@ -593,7 +593,7 @@ async def run_cycle(
                         parse_mode=parse_mode,
                         link_preview=link_preview,
                     )
-                    append_log(log_path, group, "发送", "成功")
+                    append_log(log_path, group, "发送", "成功", "消息发送成功")
                 except FloodWaitError as exc:
                     detail = f"Telegram 要求等待 {exc.seconds} 秒"
                     safe_print(f"[限流] {label}：{detail}")

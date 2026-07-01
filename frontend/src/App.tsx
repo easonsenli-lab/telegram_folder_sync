@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import { pinyin } from 'pinyin-pro';
 
 import { 
 
@@ -79,6 +80,41 @@ import {
 const BASE_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
   ? (window.location.port === '5173' ? 'http://127.0.0.1:8000' : window.location.origin)
   : window.location.origin;
+
+const STATIC_PROXY_HOSTS = [
+  '103.204.22.13',
+  '103.204.22.12',
+  '103.204.22.19',
+  '103.204.22.162',
+  '103.204.22.220',
+  '103.204.22.197',
+  '103.204.22.198',
+  '103.204.22.20',
+  '103.204.22.17',
+  '103.204.22.252',
+];
+
+const parseCampaignMessagePool = (raw: string): string[] => {
+  const text = String(raw || '').trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) {
+      return parsed.map((item) => String(item || '').trim()).filter(Boolean);
+    }
+  } catch {
+    // Plain textarea input, handled below.
+  }
+  return text.split('====').map((item) => item.trim()).filter(Boolean);
+};
+
+const hasBrokenEllipsis = (text: string): boolean => {
+  return text.includes('...') || text.includes('…');
+};
+
+const utf8ByteLength = (text: string): number => {
+  return new TextEncoder().encode(String(text || '')).length;
+};
 
 const originalFetch = window.fetch;
 
@@ -287,6 +323,7 @@ export default function App() {
 
   const [allowedTabs, setAllowedTabs] = useState<string[]>([]);
   const [accountViewScope, setAccountViewScope] = useState<'mine' | 'all'>('mine');
+  const [accountAvailableOnly, setAccountAvailableOnly] = useState<boolean>(true);
   const [selectedExpansionGroupDetail, setSelectedExpansionGroupDetail] = useState<any | null>(null);
   const [selectedScrapedGroupDetail, setSelectedScrapedGroupDetail] = useState<any | null>(null);
   const [groupToImportCategory, setGroupToImportCategory] = useState<any | null>(null);
@@ -634,6 +671,8 @@ export default function App() {
   const [batchProfileAbout, setBatchProfileAbout] = useState<string>('');
 
   const [updatingBatchProfiles, setUpdatingBatchProfiles] = useState<boolean>(false);
+  const [updatingProfileIdentity, setUpdatingProfileIdentity] = useState<boolean>(false);
+  const [updatingProfileAbout, setUpdatingProfileAbout] = useState<boolean>(false);
 
 
 
@@ -849,6 +888,13 @@ export default function App() {
   const [campaignMultiAccountSafety, setCampaignMultiAccountSafety] = useState<boolean>(true);
 
   const [campaignStrategyEnabled, setCampaignStrategyEnabled] = useState<boolean>(false);
+
+  const handleToggleCampaignStrategy = (enabled: boolean) => {
+    setCampaignStrategyEnabled(enabled);
+    if (enabled) {
+      setSelectedAdTemplateIds(adTemplates.map(ad => ad.id));
+    }
+  };
 
   
 
@@ -1074,6 +1120,7 @@ export default function App() {
 
 
   const [backendAccounts, setBackendAccounts] = useState<BackendAccount[]>([]);
+  const [staticProxyHosts, setStaticProxyHosts] = useState<string[]>(STATIC_PROXY_HOSTS);
 
   const [loadingAccounts, setLoadingAccounts] = useState<boolean>(false);
 
@@ -1114,6 +1161,22 @@ export default function App() {
     backendAccountsRef.current = backendAccounts;
     currentUsernameRef.current = currentUsername;
   }, [showPrivateChatModal, privateChatAccount, selectedPrivateDialog, backendAccounts, currentUsername]);
+
+  useEffect(() => {
+    const fetchStaticProxyPool = async () => {
+      try {
+        const res = await fetch(`${BASE_URL}/api/config/static-proxies`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (Array.isArray(data.hosts) && data.hosts.length > 0) {
+          setStaticProxyHosts(data.hosts.map((host: unknown) => String(host)).filter(Boolean));
+        }
+      } catch (err) {
+        console.error('Failed to fetch static proxy pool:', err);
+      }
+    };
+    fetchStaticProxyPool();
+  }, []);
 
   const buildAccountFromPrivateEvent = (event: PrivateDmEvent): BackendAccount | null => {
     const accountId = String(event.account_id || '');
@@ -3584,6 +3647,10 @@ export default function App() {
 
     let result = [...backendAccounts];
 
+    if (accountAvailableOnly) {
+      result = result.filter(acc => getAccountTaskState(acc) === 'idle');
+    }
+
     if (accountSearchQuery.trim()) {
 
       const query = accountSearchQuery.toLowerCase().trim();
@@ -3834,7 +3901,10 @@ export default function App() {
 
   const handleBatchUpdateProfiles = async (onlyAbout: boolean = false) => {
 
-    if (batchEditTargetIds.length === 0) return;
+    if (batchEditTargetIds.length === 0) {
+      alert("没有可执行的账号，请重新选择账号后再操作。");
+      return;
+    }
 
     if (onlyAbout) {
 
@@ -3948,12 +4018,6 @@ export default function App() {
 
         setShowBatchProfileModal(false);
 
-        setSelectedAccountIds([]);
-
-        setBatchEditTargetIds([]);
-
-        setIsBatchManagingAccounts(false);
-
         fetchBackendAccounts();
 
         if (isFromImportResult) {
@@ -3961,6 +4025,14 @@ export default function App() {
           setImportBatchProfileCompleted(true);
 
           setShowImportResultModal(true);
+
+        } else {
+
+          setSelectedAccountIds([]);
+
+          setBatchEditTargetIds([]);
+
+          setIsBatchManagingAccounts(false);
 
         }
 
@@ -4070,7 +4142,10 @@ export default function App() {
 
   const handleBatchUpdateAvatars = async () => {
 
-    if (batchEditTargetIds.length === 0) return;
+    if (batchEditTargetIds.length === 0) {
+      alert("没有可执行的账号，请重新选择账号后再操作。");
+      return;
+    }
 
 
 
@@ -4160,12 +4235,6 @@ export default function App() {
 
         setSelectedBatchLibraryAvatarNames([]);
 
-        setSelectedAccountIds([]);
-
-        setBatchEditTargetIds([]);
-
-        setIsBatchManagingAccounts(false);
-
         fetchBackendAccounts();
 
         if (isFromImportResult) {
@@ -4173,6 +4242,14 @@ export default function App() {
           setImportBatchAvatarCompleted(true);
 
           setShowImportResultModal(true);
+
+        } else {
+
+          setSelectedAccountIds([]);
+
+          setBatchEditTargetIds([]);
+
+          setIsBatchManagingAccounts(false);
 
         }
 
@@ -4306,6 +4383,15 @@ export default function App() {
 
     // 前端字数验证
     const contentLen = newTemplateContent.trim().length;
+    const contentBytes = utf8ByteLength(newTemplateContent.trim());
+    if (contentBytes > 350) {
+      alert(`字数不符：广告内容不能超过 350 UTF-8 字节（当前 ${contentBytes} 字节）`);
+      return;
+    }
+    if (hasBrokenEllipsis(newTemplateContent.trim())) {
+      alert("广告内容包含 ... 或 …，这通常是被截断的半截文案，请改成完整收尾后再保存。");
+      return;
+    }
     if (newTemplateGtype.includes("短")) {
       if (contentLen >= 200) {
         alert(`字数不符：短广告内容长度必须在 200 字以下（当前 ${contentLen} 字）`);
@@ -4379,6 +4465,15 @@ export default function App() {
 
     // 前端字数验证
     const contentLen = newTemplateContent.trim().length;
+    const contentBytes = utf8ByteLength(newTemplateContent.trim());
+    if (contentBytes > 350) {
+      alert(`字数不符：广告内容不能超过 350 UTF-8 字节（当前 ${contentBytes} 字节）`);
+      return;
+    }
+    if (hasBrokenEllipsis(newTemplateContent.trim())) {
+      alert("广告内容包含 ... 或 …，这通常是被截断的半截文案，请改成完整收尾后再保存。");
+      return;
+    }
     if (newTemplateGtype.includes("短")) {
       if (contentLen >= 200) {
         alert(`字数不符：短广告内容长度必须在 200 字以下（当前 ${contentLen} 字）`);
@@ -4497,6 +4592,22 @@ export default function App() {
 
     if (!campaignStrategyEnabled && allAdsPool.length === 0) {
       alert("请输入要发送的广告内容，或勾选常用广告语！");
+      return;
+    }
+
+    const overLimitAds = allAdsPool
+      .map((text: string, index: number) => ({ index: index + 1, length: utf8ByteLength(text), text }))
+      .filter((item) => item.length > 350);
+    if (overLimitAds.length > 0) {
+      const first = overLimitAds[0];
+      alert(`广告语第 ${first.index} 条超过 350 UTF-8 字节（当前 ${first.length} 字节），请先缩短后再启动。`);
+      return;
+    }
+    const brokenAds = allAdsPool
+      .map((text: string, index: number) => ({ index: index + 1, text }))
+      .filter((item) => hasBrokenEllipsis(item.text));
+    if (brokenAds.length > 0) {
+      alert(`广告语第 ${brokenAds[0].index} 条包含 ... 或 …，像是被截断的半截文案，请改成完整收尾后再启动。`);
       return;
     }
 
@@ -5102,6 +5213,47 @@ export default function App() {
 
   };
 
+  const handleCloseImportResultModal = () => {
+
+    setShowImportResultModal(false);
+
+    setIsFromImportResult(false);
+
+    setImportedBatchSuccessIds([]);
+
+    setBatchEditTargetIds([]);
+
+    setSelectedAccountIds([]);
+
+  };
+
+  const openImportBatchStep = (step: 'profile' | '2fa' | 'avatar') => {
+
+    const ids = importedBatchSuccessIds.length > 0 ? importedBatchSuccessIds : batchEditTargetIds;
+
+    if (ids.length === 0) {
+      alert("没有成功登录的账号可配置。");
+      return;
+    }
+
+    setBatchEditTargetIds(ids);
+
+    setSelectedAccountIds(ids);
+
+    setIsFromImportResult(true);
+
+    setShowImportResultModal(false);
+
+    if (step === 'profile') {
+      setShowBatchProfileModal(true);
+    } else if (step === '2fa') {
+      setShowBatch2faModal(true);
+    } else {
+      setShowBatchAvatarModal(true);
+    }
+
+  };
+
 
 
   const handleCloseBatchAvatarModal = () => {
@@ -5460,6 +5612,11 @@ export default function App() {
 
   const handleBatchUpdate2fa = async () => {
 
+    if (batchEditTargetIds.length === 0) {
+      alert("没有可执行的账号，请重新选择账号后再操作。");
+      return;
+    }
+
     if (batch2faNewPasswordMode === 'same' && !batch2faCustomNewPassword.trim()) {
 
       alert("请输入新的两步验证密码");
@@ -5542,13 +5699,23 @@ export default function App() {
 
         setShowBatch2faModal(false);
 
-        setSelectedAccountIds([]);
-
-        setBatchEditTargetIds([]);
-
-        setIsBatchManagingAccounts(false);
-
         fetchBackendAccounts();
+
+        if (isFromImportResult) {
+
+          setImportBatch2faCompleted(true);
+
+          setShowImportResultModal(true);
+
+        } else {
+
+          setSelectedAccountIds([]);
+
+          setBatchEditTargetIds([]);
+
+          setIsBatchManagingAccounts(false);
+
+        }
 
       } else {
 
@@ -5591,6 +5758,8 @@ export default function App() {
   const [editLastName, setEditLastName] = useState<string>('');
 
   const [editUsername, setEditUsername] = useState<string>('');
+
+  const [editAbout, setEditAbout] = useState<string>('');
 
   const [newFolderTitle, setNewFolderTitle] = useState<string>('广告');
 
@@ -5717,7 +5886,20 @@ export default function App() {
 
     let user = '';
 
-    if (acc.meInfo) {
+    const savedProfileName = (acc.config?.profile_modified_name || '').trim();
+    const savedProfileUsername = (acc.config?.profile_modified_username || '').trim().replace("@", "");
+
+    if (savedProfileName) {
+      const savedParts = savedProfileName.split(/\s+/);
+      first = savedParts[0] || '';
+      last = savedParts.slice(1).join(' ');
+    }
+
+    if (savedProfileUsername) {
+      user = savedProfileUsername;
+    }
+
+    if (!first && acc.meInfo) {
 
       const idIdx = acc.meInfo.indexOf('(ID:');
 
@@ -5733,7 +5915,8 @@ export default function App() {
 
       }
 
-      const nameParts = cleanInfo.split(/\s+/);
+      const statusOnlyValues = new Set(['已连接', '未连接', '未登录', '状态未知', '连接状态失败', '未初始化（等待检测）']);
+      const nameParts = statusOnlyValues.has(cleanInfo) ? [] : cleanInfo.split(/\s+/).filter(Boolean);
 
       if (nameParts.length > 0) {
 
@@ -5754,6 +5937,8 @@ export default function App() {
     setEditLastName(last);
 
     setEditUsername(user);
+
+    setEditAbout((acc.config?.profile_about || acc.config?.about || '').slice(0, 70));
 
     setNewFolderTitle('广告');
 
@@ -5981,6 +6166,86 @@ export default function App() {
 
     }
 
+  };
+
+
+  const buildProfileUsernamePreview = (firstName: string, lastName: string) => {
+    const cleanPart = (value: string, keepCase = false) => {
+      let converted = value.trim();
+      if (/[\u4e00-\u9fff]/.test(converted)) {
+        converted = pinyin(converted, { toneType: 'none', type: 'array' }).join('');
+      }
+      const cleaned = converted.replace(/[\s\-]+/g, '').replace(/[^a-zA-Z0-9]/g, '');
+      return keepCase ? cleaned : cleaned.toLowerCase();
+    };
+    const first = cleanPart(firstName, true);
+    const last = cleanPart(lastName, false);
+    let username = last ? `${first}_${last}` : first;
+    username = username.replace(/_+/g, '_').replace(/^_+|_+$/g, '');
+    if (username.length < 5) username = `${username}00000`.slice(0, 5);
+    return username.slice(0, 32);
+  };
+
+  const handleUpdateProfileIdentity = async (accountId: string) => {
+    if (!editFirstName.trim()) {
+      alert("名字不能为空");
+      return;
+    }
+    setUpdatingProfileIdentity(true);
+    const backendUrl = BASE_URL;
+    try {
+      const res = await fetch(`${backendUrl}/api/accounts/${accountId}/profile/identity`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          first_name: editFirstName.trim(),
+          last_name: editLastName.trim()
+        })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setEditUsername(data.username || buildProfileUsernamePreview(editFirstName, editLastName));
+        setToastText(`资料保存成功：@${data.username || ''}`);
+        setTimeout(() => setToastText(''), 2200);
+        await fetchBackendAccounts();
+        await checkAccountLoginStatus(accountId, backendAccounts.findIndex(a => a.id === accountId));
+      } else {
+        alert(`保存资料失败: ${data.detail || '原因未知'}`);
+      }
+    } catch (err: any) {
+      alert(`保存资料异常: ${err.message}`);
+    } finally {
+      setUpdatingProfileIdentity(false);
+    }
+  };
+
+  const handleUpdateProfileAbout = async (accountId: string) => {
+    const aboutText = editAbout.trim();
+    if (aboutText.length > 70) {
+      alert("个人简介不能超过 70 个字符");
+      return;
+    }
+    setUpdatingProfileAbout(true);
+    const backendUrl = BASE_URL;
+    try {
+      const res = await fetch(`${backendUrl}/api/accounts/${accountId}/profile/about`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ about: aboutText })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setToastText("个人简介保存成功");
+        setTimeout(() => setToastText(''), 2200);
+        await fetchBackendAccounts();
+      } else {
+        alert(`保存个人简介失败: ${data.detail || '原因未知'}`);
+      }
+    } catch (err: any) {
+      alert(`保存个人简介异常: ${err.message}`);
+    } finally {
+      setUpdatingProfileAbout(false);
+    }
   };
 
 
@@ -8214,7 +8479,13 @@ export default function App() {
 
       if (successIds.length > 0) {
         setSelectedAccountIds(successIds);
-        setShowBatchProfileModal(true);
+        setBatchEditTargetIds(successIds);
+        setIsFromImportResult(true);
+        setImportBatchProfileCompleted(false);
+        setImportBatch2faCompleted(false);
+        setImportBatchAvatarCompleted(false);
+        setImportBatchBotCompleted(false);
+        setShowImportResultModal(true);
       } else {
         setShowImportResultModal(true);
       }
@@ -10430,20 +10701,6 @@ export default function App() {
 
                 </div>
 
-              ) : backendAccounts.length === 0 ? (
-
-                <div className="p-6">
-
-                  <div className="flex flex-col items-center justify-center py-12 text-slate-400 gap-2 border border-dashed border-slate-200 rounded-xl bg-slate-50/20">
-
-                    <UserCheck className="w-10 h-10 opacity-30" />
-
-                    <span className="text-xs font-light">暂无已配置账号，请在 “账号登录” 页面导入账号并登录。</span>
-
-                  </div>
-
-                </div>
-
               ) : (
 
                 <>
@@ -10507,6 +10764,19 @@ export default function App() {
                           </label>
                         ))}
                       </div>
+
+                      <button
+                        type="button"
+                        onClick={() => setAccountAvailableOnly(prev => !prev)}
+                        className={`px-2.5 py-1 rounded-lg border text-[11px] font-bold transition-all ${
+                          accountAvailableOnly
+                            ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                            : 'bg-white text-slate-500 border-slate-200 hover:text-slate-700 hover:bg-slate-50'
+                        }`}
+                        title="只显示当前视图中未占用、未执行任务且可操作的账号"
+                      >
+                        只看可用账号
+                      </button>
 
                       <span>排序方式：</span>
 
@@ -10778,11 +11048,13 @@ export default function App() {
                                 </td>
                                 <td className="py-2.5 px-2 whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
                                   {(() => {
-                                    const availableHosts = Array.from(new Set(
-                                      backendAccounts
-                                        .map(a => a.config?.proxy?.host)
-                                        .filter(Boolean)
-                                    )).filter(h => h !== '127.0.0.1');
+                                    const assignedHosts = backendAccounts
+                                      .map(a => a.config?.proxy?.host)
+                                      .filter(Boolean);
+                                    const availableHosts = Array.from(new Set([
+                                      ...staticProxyHosts,
+                                      ...assignedHosts,
+                                    ])).filter(h => h !== '127.0.0.1');
 
                                     const currentHost = acc.config?.proxy?.enabled && acc.config?.proxy?.host 
                                       ? acc.config.proxy.host 
@@ -10800,6 +11072,7 @@ export default function App() {
                                       >
                                         <option value="none">无代理 / 禁用</option>
                                         {availableHosts.map((host) => {
+                                          const isCurrentAccountHost = host === currentHost;
                                           const isUsedByOthers = backendAccounts.some(
                                             (other) => other.id !== acc.id && 
                                                        other.config?.proxy?.enabled && 
@@ -10807,7 +11080,7 @@ export default function App() {
                                           );
                                           return (
                                             <option key={host} value={host}>
-                                              {host} {isUsedByOthers ? '(已分配)' : ''}
+                                              {host} {isCurrentAccountHost ? '(已分配给本账号)' : isUsedByOthers ? '(已分配)' : ''}
                                             </option>
                                           );
                                         })}
@@ -11209,7 +11482,7 @@ export default function App() {
 
                         <PlusCircle className="w-4 h-4" />
 
-                        <span>添加群组</span>
+                        <span>批量导入群组</span>
 
                       </button>
 
@@ -13418,9 +13691,22 @@ export default function App() {
 
                           {/* Message summary */}
 
-                          <div className="bg-slate-50 border border-slate-100 rounded-xl p-3 text-[11px] text-slate-500 leading-normal line-clamp-3 font-medium select-none">
+                          <div className="bg-slate-50 border border-slate-100 rounded-xl p-3 text-[11px] text-slate-500 leading-normal font-medium select-none flex flex-col gap-1.5 max-h-32 overflow-y-auto">
 
-                            {task.message}
+                            {parseCampaignMessagePool(task.message).slice(0, 3).map((adText, index) => (
+                              <div key={`${task.id}-${index}`} className="flex items-start gap-2 min-w-0">
+                                <span className="shrink-0 text-slate-400">#{index + 1}</span>
+                                <span className="min-w-0 flex-1 break-words whitespace-pre-wrap">{adText}</span>
+                                <span className={`shrink-0 font-mono ${utf8ByteLength(adText) > 350 ? 'text-rose-600' : utf8ByteLength(adText) >= 330 ? 'text-amber-600' : 'text-slate-400'}`}>
+                                  {utf8ByteLength(adText)}/350
+                                </span>
+                              </div>
+                            ))}
+                            {parseCampaignMessagePool(task.message).length > 3 && (
+                              <div className="text-[10px] text-slate-400 font-bold">
+                                另有 {parseCampaignMessagePool(task.message).length - 3} 条广告语，请打开详情查看
+                              </div>
+                            )}
 
                           </div>
 
@@ -13779,6 +14065,11 @@ export default function App() {
 
                               </span>
 
+                              <span className={`text-[10px] font-bold px-2 py-0.5 rounded border ${
+                                utf8ByteLength(tpl.content) > 350 ? 'bg-rose-50 text-rose-600 border-rose-100' : utf8ByteLength(tpl.content) >= 330 ? 'bg-amber-50 text-amber-600 border-amber-100' : 'bg-slate-50 text-slate-500 border-slate-100'
+                              }`}>
+                                {utf8ByteLength(tpl.content)}/350
+                              </span>
                               {tpl.group_type && (
                                 <span className={`text-[10px] font-bold px-2 py-0.5 rounded border ${
                                   tpl.group_type.includes('长')
@@ -16407,6 +16698,110 @@ export default function App() {
 
         {/* E. BATCH MODIFY ACCOUNTS PROFILE MODAL */}
 
+        {showImportResultModal && (
+          <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs z-50 flex items-center justify-center p-4">
+            <div className="bg-white rounded-2xl border border-slate-100 shadow-xl w-full max-w-2xl flex flex-col max-h-[85vh] overflow-hidden">
+              <div className="p-5 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
+                <div>
+                  <h3 className="font-bold text-slate-900 text-base">批量登录完成后的账号设置</h3>
+                  <p className="text-xs text-slate-400 mt-0.5 font-light">
+                    成功登录 {importStats.success || importedBatchSuccessIds.length} 个，失败 {importStats.failed} 个。建议按下面三步完成初始化。
+                  </p>
+                </div>
+                <button
+                  onClick={handleCloseImportResultModal}
+                  className="w-8 h-8 hover:bg-slate-100 rounded-full flex items-center justify-center text-slate-400 hover:text-slate-600 transition-colors"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="p-6 overflow-y-auto flex flex-col gap-4">
+                <div className="grid grid-cols-3 gap-3">
+                  <div className="rounded-xl border border-emerald-100 bg-emerald-50/50 p-4">
+                    <div className="text-[10px] text-emerald-600 font-bold uppercase">成功登录</div>
+                    <div className="text-2xl font-black text-emerald-700 mt-1">{importStats.success || importedBatchSuccessIds.length}</div>
+                  </div>
+                  <div className="rounded-xl border border-rose-100 bg-rose-50/50 p-4">
+                    <div className="text-[10px] text-rose-600 font-bold uppercase">失败数量</div>
+                    <div className="text-2xl font-black text-rose-700 mt-1">{importStats.failed}</div>
+                  </div>
+                  <div className="rounded-xl border border-slate-100 bg-slate-50 p-4">
+                    <div className="text-[10px] text-slate-400 font-bold uppercase">本次总数</div>
+                    <div className="text-2xl font-black text-slate-800 mt-1">{importStats.total}</div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <button
+                    type="button"
+                    onClick={() => openImportBatchStep('profile')}
+                    className={`text-left rounded-xl border p-4 transition-all active:scale-[0.98] ${
+                      importBatchProfileCompleted
+                        ? 'border-emerald-100 bg-emerald-50 text-emerald-800'
+                        : 'border-blue-100 bg-blue-50/40 hover:bg-blue-50 text-slate-800'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-black">1. 修改个人信息</span>
+                      <span className={`text-[10px] font-bold ${importBatchProfileCompleted ? 'text-emerald-700' : 'text-blue-600'}`}>
+                        {importBatchProfileCompleted ? '已完成' : '去设置'}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-500 leading-relaxed mt-2">统一姓氏、随机名字/用户名，并可同步修改个人简介。</p>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => openImportBatchStep('2fa')}
+                    className={`text-left rounded-xl border p-4 transition-all active:scale-[0.98] ${
+                      importBatch2faCompleted
+                        ? 'border-emerald-100 bg-emerald-50 text-emerald-800'
+                        : 'border-indigo-100 bg-indigo-50/40 hover:bg-indigo-50 text-slate-800'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-black">2. 修改两步验证</span>
+                      <span className={`text-[10px] font-bold ${importBatch2faCompleted ? 'text-emerald-700' : 'text-indigo-600'}`}>
+                        {importBatch2faCompleted ? '已完成' : '去设置'}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-500 leading-relaxed mt-2">统一设置或自动生成两步验证密码，成功后会保存到账号资料。</p>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => openImportBatchStep('avatar')}
+                    className={`text-left rounded-xl border p-4 transition-all active:scale-[0.98] ${
+                      importBatchAvatarCompleted
+                        ? 'border-emerald-100 bg-emerald-50 text-emerald-800'
+                        : 'border-pink-100 bg-pink-50/40 hover:bg-pink-50 text-slate-800'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-black">3. 修改头像</span>
+                      <span className={`text-[10px] font-bold ${importBatchAvatarCompleted ? 'text-emerald-700' : 'text-pink-600'}`}>
+                        {importBatchAvatarCompleted ? '已完成' : '去设置'}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-500 leading-relaxed mt-2">从本地上传或从头像库选择图片，批量分配给本次成功账号。</p>
+                  </button>
+                </div>
+              </div>
+
+              <div className="p-5 border-t border-slate-100 flex justify-end gap-2 bg-slate-50/50">
+                <button
+                  type="button"
+                  onClick={handleCloseImportResultModal}
+                  className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded-lg border border-slate-200 transition-colors"
+                >
+                  稍后处理
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {showBatchProfileModal && (
 
           <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs z-50 flex items-center justify-center p-4">
@@ -16423,13 +16818,13 @@ export default function App() {
 
                   <h3 className="font-bold text-slate-900 text-base">批量修改个人信息</h3>
 
-                  <p className="text-xs text-slate-400 mt-0.5 font-light">已选择 {selectedAccountIds.length} 个账号</p>
+                  <p className="text-xs text-slate-400 mt-0.5 font-light">已选择 {batchEditTargetIds.length} 个账号</p>
 
                 </div>
 
                 <button 
 
-                  onClick={() => setShowBatchProfileModal(false)}
+                  onClick={handleCloseBatchProfileModal}
 
                   disabled={updatingBatchProfiles}
 
@@ -16657,7 +17052,7 @@ export default function App() {
 
                 <button
 
-                  onClick={() => setShowBatchProfileModal(false)}
+                  onClick={handleCloseBatchProfileModal}
 
                   disabled={updatingBatchProfiles}
 
@@ -16755,13 +17150,13 @@ export default function App() {
 
                   <h3 className="font-bold text-slate-900 text-base">批量修改两步验证</h3>
 
-                  <p className="text-xs text-slate-400 mt-0.5 font-light">已选择 {selectedAccountIds.length} 个账号</p>
+                  <p className="text-xs text-slate-400 mt-0.5 font-light">已选择 {batchEditTargetIds.length} 个账号</p>
 
                 </div>
 
                 <button 
 
-                  onClick={() => setShowBatch2faModal(false)}
+                  onClick={handleCloseBatch2faModal}
 
                   disabled={updatingBatch2fa}
 
@@ -16959,7 +17354,7 @@ export default function App() {
 
                   type="button"
 
-                  onClick={() => setShowBatch2faModal(false)}
+                  onClick={handleCloseBatch2faModal}
 
                   disabled={updatingBatch2fa}
 
@@ -18182,7 +18577,7 @@ export default function App() {
 
 
 
-                {/* 1. Modify Profile Name */}
+                {/* 1. Modify Profile Identity */}
 
                 <div className="flex flex-col gap-3">
 
@@ -18190,7 +18585,7 @@ export default function App() {
 
                     <span className="w-1.5 h-3 bg-blue-500 rounded-full"></span>
 
-                    👤 修改个人姓名
+                    👤 修改个人资料
 
                   </h4>
 
@@ -18212,6 +18607,8 @@ export default function App() {
 
                         className="bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-xs text-slate-800 focus:outline-none focus:bg-white focus:border-blue-500"
 
+                        disabled={updatingProfileIdentity}
+
                       />
 
                     </div>
@@ -18232,107 +18629,99 @@ export default function App() {
 
                         className="bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-xs text-slate-800 focus:outline-none focus:bg-white focus:border-blue-500"
 
+                        disabled={updatingProfileIdentity}
+
                       />
 
                     </div>
 
                   </div>
 
-                  <button
-
-                    onClick={async () => {
-
-                      await handleUpdateProfileName(modalAccount.id);
-
-                      checkAccountLoginStatus(modalAccount.id, backendAccounts.findIndex(a => a.id === modalAccount.id))
-
-                        .then(() => {
-
-                          const updated = backendAccounts.find(a => a.id === modalAccount.id);
-
-                          if (updated) setModalAccount(updated);
-
-                        });
-
-                    }}
-
-                    className="self-end px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-lg transition-colors active:scale-[0.98] shadow-sm"
-
-                  >
-
-                    保存姓名修改
-
-                  </button>
+                  <div className="flex items-end gap-3">
+                    <div className="flex-1 flex flex-col gap-1">
+                      <label className="text-[10px] text-slate-400 font-semibold">自动生成用户名 (@username)</label>
+                      <div className="relative">
+                        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-xs font-mono font-medium">@</span>
+                        <div className="w-full bg-slate-50 border border-slate-200 rounded-lg pl-6 pr-3 py-2 text-xs text-slate-800 font-mono">
+                          {buildProfileUsernamePreview(editFirstName, editLastName)}
+                        </div>
+                      </div>
+                      <div className="text-[10px] text-slate-400">
+                        保存时会自动校验 Telegram 用户名；如果已被占用，会自动追加字母或数字排重。
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => handleUpdateProfileIdentity(modalAccount.id)}
+                      disabled={updatingProfileIdentity}
+                      className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white text-xs font-bold rounded-lg transition-colors active:scale-[0.98] shadow-sm shrink-0 flex items-center gap-1.5"
+                    >
+                      {updatingProfileIdentity && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                      <span>{updatingProfileIdentity ? '保存中...' : '保存资料'}</span>
+                    </button>
+                  </div>
 
                 </div>
 
 
+                {/* 2. Modify Profile Bio */}
 
-                {/* 2. Modify Profile Username */}
-
-                <div className="flex flex-col gap-3">
+                <div className="flex flex-col gap-3 border-t border-slate-100 pt-5">
 
                   <h4 className="font-bold text-slate-800 text-xs flex items-center gap-1.5">
 
                     <span className="w-1.5 h-3 bg-blue-500 rounded-full"></span>
 
-                    🏷️ 修改用户名 (Username)
+                    📝 修改个人简介 (Bio)
 
                   </h4>
 
-                  <div className="flex flex-col gap-1">
+                  <div className="flex items-end gap-3">
 
-                    <label className="text-[10px] text-slate-400 font-semibold">用户名 (@username)</label>
+                    <div className="flex-1 flex flex-col gap-1">
 
-                    <div className="flex gap-2">
+                      <div className="flex items-center justify-between">
 
-                      <div className="flex-grow relative">
+                        <label className="text-[10px] text-slate-400 font-semibold">个人简介 (70字以内)</label>
 
-                        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-xs font-mono font-medium">@</span>
-
-                        <input 
-
-                          type="text" 
-
-                          value={editUsername}
-
-                          onChange={(e) => setEditUsername(e.target.value)}
-
-                          placeholder="新用户名"
-
-                          className="w-full bg-slate-50 border border-slate-200 rounded-lg pl-6 pr-3 py-2 text-xs text-slate-800 focus:outline-none focus:bg-white focus:border-blue-500 font-mono"
-
-                        />
+                        <span className="text-[10px] text-slate-400 font-mono">{editAbout.length} / 70</span>
 
                       </div>
 
-                      <button
+                      <textarea
 
-                        onClick={async () => {
+                        value={editAbout}
 
-                          await handleUpdateProfileUsername(modalAccount.id);
+                        onChange={(e) => setEditAbout(e.target.value.slice(0, 70))}
 
-                          checkAccountLoginStatus(modalAccount.id, backendAccounts.findIndex(a => a.id === modalAccount.id))
+                        placeholder="输入 Telegram 个人简介"
 
-                            .then(() => {
+                        rows={3}
 
-                              const updated = backendAccounts.find(a => a.id === modalAccount.id);
+                        maxLength={70}
 
-                              if (updated) setModalAccount(updated);
+                        className="bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-xs text-slate-800 focus:outline-none focus:bg-white focus:border-blue-500 resize-none"
 
-                            });
+                        disabled={updatingProfileAbout}
 
-                        }}
-
-                        className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-lg transition-colors active:scale-[0.98] shadow-sm shrink-0"
-
-                      >
-
-                        保存用户名
-
-                      </button>
+                      />
 
                     </div>
+
+                    <button
+
+                      onClick={() => handleUpdateProfileAbout(modalAccount.id)}
+
+                      disabled={updatingProfileAbout}
+
+                      className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white text-xs font-bold rounded-lg transition-colors active:scale-[0.98] shadow-sm shrink-0 flex items-center gap-1.5"
+
+                    >
+
+                      {updatingProfileAbout && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+
+                      <span>{updatingProfileAbout ? '保存中...' : '保存简介'}</span>
+
+                    </button>
 
                   </div>
 
@@ -19997,7 +20386,7 @@ export default function App() {
 
                         checked={campaignStrategyEnabled}
 
-                        onChange={(e) => setCampaignStrategyEnabled(e.target.checked)}
+                        onChange={(e) => handleToggleCampaignStrategy(e.target.checked)}
 
                         className="mt-0.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500/20 w-3.5 h-3.5"
 
@@ -20045,7 +20434,7 @@ export default function App() {
 
                       <p className="text-[11px] text-amber-600/80 font-medium italic">
 
-                        * 请确保已录入对应分类的广告文本，否则将使用普通输入内容或安全兜底模板。
+                        * 请确保四个分类均已录入广告文本；策略模式会严格按群组分类选择广告语。
 
                       </p>
 
@@ -20176,13 +20565,20 @@ export default function App() {
                                       <span className="font-bold text-[10px] text-slate-800 truncate" title={ad.description}>
                                         {ad.description}
                                       </span>
-                                      <span className={`text-[9px] font-bold px-1.5 py-0.2 rounded border shrink-0 ${
-                                        ad.group_type?.includes('长')
-                                          ? 'bg-purple-50 text-purple-600 border-purple-100/60'
-                                          : 'bg-indigo-50 text-indigo-600 border-indigo-100/60'
-                                      }`}>
-                                        {ad.group_type}
-                                      </span>
+                                      <div className="flex items-center gap-1 shrink-0">
+                                        <span className={`text-[9px] font-bold px-1.5 py-0.2 rounded border ${
+                                          utf8ByteLength(ad.content) > 350 ? 'bg-rose-50 text-rose-600 border-rose-100/70' : utf8ByteLength(ad.content) >= 330 ? 'bg-amber-50 text-amber-600 border-amber-100/70' : 'bg-slate-50 text-slate-500 border-slate-100/70'
+                                        }`}>
+                                          {utf8ByteLength(ad.content)}/350
+                                        </span>
+                                        <span className={`text-[9px] font-bold px-1.5 py-0.2 rounded border ${
+                                          ad.group_type?.includes('长')
+                                            ? 'bg-purple-50 text-purple-600 border-purple-100/60'
+                                            : 'bg-indigo-50 text-indigo-600 border-indigo-100/60'
+                                        }`}>
+                                          {ad.group_type}
+                                        </span>
+                                      </div>
                                     </div>
                                     <span className="text-slate-400 text-[10px] truncate" title={ad.content}>
                                       {ad.content}
@@ -20472,9 +20868,21 @@ export default function App() {
 
                         <span className="text-xs font-bold text-slate-700">📜 营销广告词文本</span>
 
-                        <div className="bg-slate-50 rounded-xl p-3 text-xs text-slate-600 font-medium max-h-24 overflow-y-auto whitespace-pre-wrap leading-relaxed select-all">
+                        <div className="bg-slate-50 rounded-xl p-3 text-xs text-slate-600 font-medium max-h-32 overflow-y-auto leading-relaxed select-all flex flex-col gap-2">
 
-                          {task.message}
+                          {parseCampaignMessagePool(task.message).map((adText, index) => (
+                            <div key={`${index}-${adText.slice(0, 16)}`} className="border-b border-slate-200/70 last:border-b-0 pb-2 last:pb-0">
+                              <div className="flex items-center justify-between gap-2 mb-1">
+                                <span className="font-bold text-slate-500">广告语 {index + 1}</span>
+                                <span className={`font-mono text-[10px] ${utf8ByteLength(adText) > 350 ? 'text-rose-600 font-bold' : utf8ByteLength(adText) >= 330 ? 'text-amber-600 font-bold' : 'text-slate-400'}`}>
+                                  {utf8ByteLength(adText)}/350
+                                </span>
+                              </div>
+                              <div className="whitespace-pre-wrap break-words">
+                                {adText}
+                              </div>
+                            </div>
+                          ))}
 
                         </div>
 
@@ -20514,11 +20922,11 @@ export default function App() {
 
                                   <th className="py-2.5 px-4 w-[10%] text-center">轮次</th>
 
-                                  <th className="py-2.5 px-4 w-[25%]">目标群组标题</th>
+                                  <th className="py-2.5 px-4 w-[22%]">目标群组标题</th>
 
-                                  <th className="py-2.5 px-4 w-[12%] text-center">状态</th>
+                                  <th className="py-2.5 px-4 w-[10%] text-center">状态</th>
 
-                                  <th className="py-2.5 px-4 w-[18%]">流水详情</th>
+                                  <th className="py-2.5 px-4 w-[23%]">发送详情</th>
 
                                 </tr>
 
@@ -20526,14 +20934,35 @@ export default function App() {
 
                                 {activeCampaignTaskLogs.map((log) => {
                                   let username = "";
+                                  const loggedUsername = String(log.group_username || "").trim();
+                                  if (loggedUsername) {
+                                    const cleanLoggedUsername = loggedUsername
+                                      .replace(/^https?:\/\/t\.me\//i, "")
+                                      .replace(/^@+/, "")
+                                      .split(/[/?#]/)[0];
+                                    username = cleanLoggedUsername ? `@${cleanLoggedUsername}` : loggedUsername;
+                                  }
                                   try {
-                                    const targetGroups = JSON.parse(task.target_groups_json || "[]");
-                                    const matched = targetGroups.find((g: any) => 
-                                      String(g.chat_id) === String(log.group_id) || 
-                                      String(g.chat_id).replace(/^-100/, '') === String(log.group_id).replace(/^-100/, '')
-                                    );
-                                    if (matched && matched.username) {
-                                      username = matched.username;
+                                    const normalizeGroupId = (value: any) => String(value ?? "")
+                                      .trim()
+                                      .replace(/^-100/, "")
+                                      .replace(/^-/, "");
+                                    const logGroupId = normalizeGroupId(log.group_id);
+                                    const targetGroups = Array.isArray(targetGroupsList) ? targetGroupsList : [];
+                                    const matched = targetGroups.find((g: any) => {
+                                      const candidateIds = [g.chat_id, g.group_id, g.id, g.peer_id].map(normalizeGroupId);
+                                      const sameId = Boolean(logGroupId) && candidateIds.includes(logGroupId);
+                                      const sameTitle = String(g.title || "").trim() && String(g.title || "").trim() === String(log.group_title || "").trim();
+                                      return sameId || sameTitle;
+                                    });
+                                    const matchedUsername = matched?.username || matched?.link || "";
+                                    if (!username && matchedUsername) {
+                                      const cleanUsername = String(matchedUsername)
+                                        .trim()
+                                        .replace(/^https?:\/\/t\.me\//i, "")
+                                        .replace(/^@+/, "")
+                                        .split(/[/?#]/)[0];
+                                      username = cleanUsername ? `@${cleanUsername}` : "";
                                     }
                                   } catch (e) {}
 
@@ -20553,32 +20982,60 @@ export default function App() {
                                     }, 2000);
                                   };
 
-                                  const handleCopy = () => {
-                                    const copyText = username || log.group_id;
+                                  const copyToClipboard = async (copyText: string) => {
+                                    if (navigator.clipboard?.writeText) {
+                                      await navigator.clipboard.writeText(copyText);
+                                      return;
+                                    }
+                                    const textarea = document.createElement("textarea");
+                                    textarea.value = copyText;
+                                    textarea.setAttribute("readonly", "true");
+                                    textarea.style.position = "fixed";
+                                    textarea.style.left = "-9999px";
+                                    textarea.style.top = "0";
+                                    document.body.appendChild(textarea);
+                                    textarea.focus();
+                                    textarea.select();
+                                    const ok = document.execCommand("copy");
+                                    textarea.remove();
+                                    if (!ok) throw new Error("浏览器拒绝复制");
+                                  };
+
+                                  const handleCopy = (event?: { stopPropagation: () => void }) => {
+                                    event?.stopPropagation();
+                                    const copyText = username || loggedUsername || log.group_id;
                                     if (!copyText) return;
-                                    navigator.clipboard.writeText(copyText).then(() => {
+                                    copyToClipboard(copyText).then(() => {
                                       showToast(`已成功复制: ${copyText}`);
                                     }).catch((err) => {
                                       console.error("Copy failed: ", err);
+                                      showToast(`复制失败，请手动复制: ${copyText}`);
                                     });
                                   };
 
-                                  let displayDetail = log.detail;
-                                  let tooltipDetail = log.detail;
-                                  if (log.status === 'success') {
-                                    const previewMatch = log.detail.match(/\[预览:\s*([\s\S]+)\]$/);
-                                    if (previewMatch) {
-                                      const text = previewMatch[1];
-                                      displayDetail = text.length > 25 ? text.slice(0, 25) + "..." : text;
-                                      tooltipDetail = text;
-                                    } else {
-                                      displayDetail = "消息发送成功";
-                                      tooltipDetail = log.detail;
-                                    }
-                                  } else {
-                                    displayDetail = log.detail;
-                                    tooltipDetail = log.detail;
-                                  }
+                                  const rawDetail = String(log.detail || "");
+                                  const previewMatch = rawDetail.match(/\s*\[预览:\s*([\s\S]+?)\]\s*$/);
+                                  const resolvedAdText = String(log.ad_text || "").trim();
+                                  const sentText = resolvedAdText || (previewMatch ? previewMatch[1].trim() : "");
+                                  const reasonText = (previewMatch ? rawDetail.replace(previewMatch[0], "") : rawDetail).trim();
+                                  const originalTaskText = (() => {
+                                    const rawMessage = String(task.message || "").trim();
+                                    if (!rawMessage) return "";
+                                    try {
+                                      const parsed = JSON.parse(rawMessage);
+                                      if (Array.isArray(parsed)) {
+                                        return parsed.map((item) => String(item || "").trim()).filter(Boolean).join("\n---\n");
+                                      }
+                                      if (typeof parsed === "string") return parsed.trim();
+                                    } catch (e) {}
+                                    return rawMessage;
+                                  })();
+                                  const displayReason = reasonText || (log.status === 'success' ? "消息发送成功" : "未记录失败原因");
+                                  const displayAdText = sentText || originalTaskText || "未记录原广告文本";
+                                  const inlineDetail = `${displayReason} · 原广告：${displayAdText}`;
+                                  const tooltipDetail = displayAdText
+                                    ? `原因：${displayReason}\n广告语：${displayAdText}`
+                                    : displayReason;
 
                                   return (
                                     <tr key={log.id} className="hover:bg-slate-50/50 transition-colors">
@@ -20592,11 +21049,23 @@ export default function App() {
                                         {log.cycle}
                                       </td>
                                       <td 
-                                        className={`py-2.5 px-4 text-slate-800 font-semibold text-[11px] truncate ${username ? 'cursor-pointer hover:underline hover:text-indigo-600' : ''}`}
-                                        title={username ? `点击复制群用户名: ${username}` : `群ID: ${log.group_id}`}
+                                        className="py-2.5 px-4 text-slate-800 font-semibold text-[11px]"
+                                        title={username ? `${log.group_title}\n点击复制群组 username: ${username}` : `${log.group_title}\n未找到 username，点击复制群ID: ${log.group_id}`}
                                         onClick={handleCopy}
                                       >
-                                        {log.group_title} <span className="text-[10px] text-slate-400 font-light font-mono">({log.group_id})</span>
+                                        <div className="flex items-center gap-1.5 min-w-0">
+                                          <button
+                                            type="button"
+                                            onClick={handleCopy}
+                                            className="w-5 h-5 shrink-0 inline-flex items-center justify-center rounded border border-slate-200 bg-white text-slate-400 hover:text-indigo-600 hover:border-indigo-200 hover:bg-indigo-50 transition-colors"
+                                            title={username ? `复制 ${username}` : `复制群ID ${log.group_id}`}
+                                          >
+                                            <Copy className="w-3 h-3" />
+                                          </button>
+                                          <span className="min-w-0 flex-1 truncate cursor-pointer hover:underline hover:text-indigo-600" title={log.group_title}>
+                                            {log.group_title}
+                                          </span>
+                                        </div>
                                       </td>
                                       <td className="py-2.5 px-4 text-center">
                                         {log.status === 'success' ? (
@@ -20614,7 +21083,7 @@ export default function App() {
                                         )}
                                       </td>
                                       <td className="py-2.5 px-4 text-slate-500 font-mono text-[10px] truncate" title={tooltipDetail}>
-                                        {displayDetail}
+                                        {inlineDetail}
                                       </td>
                                     </tr>
                                   );
@@ -21501,9 +21970,9 @@ export default function App() {
 
                 <div>
 
-                  <h3 className="font-bold text-slate-900 text-base">添加 Telegram 群组</h3>
+                  <h3 className="font-bold text-slate-900 text-base">批量导入 Telegram 群组</h3>
 
-                  <p className="text-xs text-slate-400 mt-0.5">支持群组链接、邀请链接、用户名或 ID (每行一个)</p>
+                  <p className="text-xs text-slate-400 mt-0.5">支持 @username、t.me 链接、邀请链接或 ID，每行一个</p>
 
                 </div>
 
@@ -21555,7 +22024,7 @@ export default function App() {
 
                   <p className="text-[10px] text-slate-400 leading-normal mt-1">
 
-                    系统将通过您已登录的 Telegram 账号向 Telegram 官方 API 请求校验这批群组或频道的真实性，校验成功后将自动拉取标题、人数等信息并保存。
+                    系统将通过已登录且可用的 Telegram 账号校验群组真实性，校验成功后自动拉取标题、人数，并按现有规则判定中文长/短、英文长/短后保存；已存在的 username 会自动跳过。
 
                   </p>
 
@@ -21563,64 +22032,9 @@ export default function App() {
 
 
 
-                {/* Category Selection */}
-
-                <div className="flex flex-col gap-2">
-
-                  <label className="text-xs font-semibold text-slate-700">广告类型 (单选)</label>
-
-                  <div className="flex gap-4">
-
-                    <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer select-none font-medium">
-
-                      <input 
-
-                        type="radio" 
-
-                        name="newGroupCategory" 
-
-                        value="中文广告"
-
-                        checked={newGroupCategory === '中文广告'}
-
-                        onChange={() => setNewGroupCategory('中文广告')}
-
-                        className="text-blue-600 focus:ring-blue-500/20 border-slate-300"
-
-                        disabled={resolvingGroup}
-
-                      />
-
-                      <span>中文广告</span>
-
-                    </label>
-
-                    <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer select-none font-medium">
-
-                      <input 
-
-                        type="radio" 
-
-                        name="newGroupCategory" 
-
-                        value="英文广告"
-
-                        checked={newGroupCategory === '英文广告'}
-
-                        onChange={() => setNewGroupCategory('英文广告')}
-
-                        className="text-blue-600 focus:ring-blue-500/20 border-slate-300"
-
-                        disabled={resolvingGroup}
-
-                      />
-
-                      <span>英文广告</span>
-
-                    </label>
-
-                  </div>
-
+                <div className="bg-slate-50 border border-slate-100 rounded-lg p-3.5 text-xs text-slate-500 leading-relaxed">
+                  <div className="font-bold text-slate-700 mb-1">自动分类</div>
+                  <div>导入时会读取群名和最近消息样本，按现有逻辑保存为中文长、中文短、英文长或英文短。无法读取消息时使用群名兜底判断。</div>
                 </div>
 
 
@@ -21631,7 +22045,7 @@ export default function App() {
 
                     <RefreshCw className="w-4 h-4 animate-spin text-blue-500 shrink-0" />
 
-                    <span>正在通过电报 API 校验该链接，这可能需要几秒钟...</span>
+                    <span>正在逐个校验并导入群组，请保持页面打开...</span>
 
                   </div>
 
@@ -22431,15 +22845,7 @@ export default function App() {
 
                 <button 
 
-                  onClick={() => {
-
-                    setShowBatchAvatarModal(false);
-
-                    setBatchAvatarFiles(null);
-
-                    setSelectedBatchLibraryAvatarNames([]);
-
-                  }}
+                  onClick={handleCloseBatchAvatarModal}
 
                   disabled={updatingAvatar}
 
@@ -22691,15 +23097,7 @@ export default function App() {
 
                 <button 
 
-                  onClick={() => {
-
-                    setShowBatchAvatarModal(false);
-
-                    setBatchAvatarFiles(null);
-
-                    setSelectedBatchLibraryAvatarNames([]);
-
-                  }}
+                  onClick={handleCloseBatchAvatarModal}
 
                   disabled={updatingAvatar}
 
