@@ -3502,7 +3502,7 @@ async def bot_export_folders(account_id: str):
             output_lines = [
                 f"=========================================",
                 f" 托管账号: {db_account_name} (ID: {account_id})",
-                f" 导出时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f" 导出时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                 f"=========================================",
                 ""
             ]
