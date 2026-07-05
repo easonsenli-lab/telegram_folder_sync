@@ -13,6 +13,7 @@ import asyncio
 import threading
 import subprocess
 import datetime
+from zoneinfo import ZoneInfo
 from collections import deque
 from contextlib import asynccontextmanager
 from functools import wraps
@@ -38,6 +39,8 @@ from static_proxy_pool import (
     ensure_safe_telegram_proxy_config,
     safe_proxy_summary,
     static_proxy_usage_counts,
+    telegram_httpx_proxy_url,
+    telegram_requests_proxy_kwargs,
 )
 from account_manager import (
     list_accounts,
@@ -54,6 +57,20 @@ ENABLE_REALTIME_PRIVATE_DM = os.getenv("ROSEPAY_ENABLE_REALTIME_PRIVATE_DM", "1"
 private_relay_enabled = ENABLE_REALTIME_PRIVATE_DM
 
 app = FastAPI(title="Telegram Control Panel API", version="1.0.0")
+
+
+def telegram_api_get(url: str, **kwargs):
+    kwargs.update(telegram_requests_proxy_kwargs("web_server_bot_api"))
+    return requests.get(url, **kwargs)
+
+
+def telegram_api_post(url: str, **kwargs):
+    kwargs.update(telegram_requests_proxy_kwargs("web_server_bot_api"))
+    return requests.post(url, **kwargs)
+
+
+def telegram_httpx_client_kwargs(service_key: str = "web_server_bot_api") -> dict:
+    return {"proxy": telegram_httpx_proxy_url(service_key)}
 
 # Initialize SQLite Database tables and run migrations
 from db import init_db
@@ -110,7 +127,7 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     user_payload = verify_token(token)
     if not user_payload:
         raise HTTPException(status_code=401, detail="会话已过期，请重新登录")
-        
+
     from db import engine, AdminDb, Session, select
     with Session(engine) as session:
         db_user = session.exec(select(AdminDb).where(AdminDb.username == user_payload["username"])).first()
@@ -225,17 +242,17 @@ def query_accounts_for_view_scope(session, user, scope: str = "mine"):
 def sync_db_and_files():
     from db import engine, AccountDb, Session, select
     from account_manager import account_config_path, save_json, ACCOUNTS_DIR, load_json
-    
+
     ACCOUNTS_DIR.mkdir(exist_ok=True)
-    
+
     with Session(engine) as session:
         db_accounts = session.exec(select(AccountDb)).all()
         db_account_ids = {acc.id for acc in db_accounts}
-        
+
         for acc in db_accounts:
             path = account_config_path(acc.id)
             save_json(path, acc.to_dict())
-            
+
         for json_file in ACCOUNTS_DIR.glob("*.json"):
             account_id = json_file.stem
             if account_id not in db_account_ids:
@@ -442,6 +459,8 @@ private_unread_cache: Dict[str, dict] = {}
 private_unread_refreshing: set[str] = set()
 PRIVATE_UNREAD_CACHE_TTL_SECONDS = 8
 PRIVATE_DM_ACK_FILE = Path("data/private_dm_event_ack.json")
+PRIVATE_SENDER_CACHE_FILE = Path("data/private_sender_cache.json")
+PRIVATE_WELCOME_SENT_FILE = Path("data/private_welcome_sent.json")
 pending_private_sends: Dict[str, deque] = {}
 private_send_queue_locks: Dict[str, asyncio.Lock] = {}
 auto_private_listener_accounts: set[str] = set()
@@ -450,6 +469,36 @@ AUTO_PRIVATE_LISTENER_STARTUP_DELAY_SECONDS = 8
 AUTO_PRIVATE_LISTENER_INTERVAL_SECONDS = 60
 AUTO_PRIVATE_LISTENER_CONNECT_GAP_SECONDS = 4
 AUTO_PRIVATE_LISTENER_FAILURE_COOLDOWN_SECONDS = 300
+PRIVATE_LISTENER_TRANSPORT_429_COOLDOWN_SECONDS = 900
+
+
+def is_telegram_transport_rate_error(exc: Exception) -> bool:
+    err = str(exc)
+    return (
+        "HTTP code 429" in err
+        or "Invalid response buffer" in err
+        or "FloodWait" in err
+        or "A wait of" in err
+    )
+
+
+def mark_private_listener_cooldown(account_id: str, exc: Exception, context: str = "private-listener") -> None:
+    wait_time = getattr(exc, "seconds", None)
+    if not wait_time:
+        wait_time = PRIVATE_LISTENER_TRANSPORT_429_COOLDOWN_SECONDS if is_telegram_transport_rate_error(exc) else AUTO_PRIVATE_LISTENER_FAILURE_COOLDOWN_SECONDS
+    wait_time = max(60, int(wait_time))
+    auto_private_listener_cooldowns[account_id] = time.time() + wait_time
+    auto_private_listener_accounts.discard(account_id)
+    set_account_status(
+        account_id,
+        {
+            "private_listener": False,
+            "private_listener_source": None,
+            "last_error": f"{context} 进入冷却 {wait_time} 秒: {exc}",
+        },
+        source="private-listener-cooldown",
+    )
+    print(f"[PrivateListener] {account_id} cooldown {wait_time}s after {context}: {exc}")
 
 
 def load_private_dm_ack() -> Dict[str, float]:
@@ -471,6 +520,105 @@ def save_private_dm_ack(data: Dict[str, float]) -> None:
 
 
 private_dm_event_ack: Dict[str, float] = load_private_dm_ack()
+
+
+def load_private_sender_cache() -> Dict[str, dict]:
+    if not PRIVATE_SENDER_CACHE_FILE.exists():
+        return {}
+    try:
+        raw = load_json(PRIVATE_SENDER_CACHE_FILE)
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_private_sender_cache() -> None:
+    try:
+        PRIVATE_SENDER_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        save_json(PRIVATE_SENDER_CACHE_FILE, private_sender_cache)
+    except Exception as exc:
+        print(f"Failed to save private sender cache: {exc}")
+
+
+def private_sender_cache_key(sender_id: Any) -> str:
+    return str(sender_id or "").strip()
+
+
+def get_private_sender_cache(sender_id: Any) -> Optional[dict]:
+    key = private_sender_cache_key(sender_id)
+    if not key:
+        return None
+    item = private_sender_cache.get(key)
+    return item if isinstance(item, dict) else None
+
+
+def cache_private_sender_info(account_id: str, sender_id: int, sender_name: str, sender_username: str = "", sender_is_bot: bool = False) -> None:
+    key = private_sender_cache_key(sender_id)
+    if not key:
+        return
+    sender_name = (sender_name or "").strip() or key
+    sender_username = (sender_username or "").strip()
+    if sender_name == key and not sender_username:
+        return
+    private_sender_cache[key] = {
+        "sender_id": int(sender_id),
+        "sender_name": sender_name,
+        "sender_username": sender_username,
+        "sender_is_bot": bool(sender_is_bot),
+        "first_seen_account_id": str(account_id),
+        "updated_at": time.time(),
+    }
+    save_private_sender_cache()
+
+
+def cache_private_sender_entity(account_id: str, sender) -> None:
+    if sender is None:
+        return
+    sender_id = int(getattr(sender, "id", 0) or 0)
+    if sender_id <= 0:
+        return
+    cache_private_sender_info(
+        account_id,
+        sender_id,
+        private_user_display_name(sender),
+        f"@{sender.username}" if getattr(sender, "username", None) else "",
+        bool(getattr(sender, "bot", False)),
+    )
+
+
+def load_private_welcome_sent() -> Dict[str, float]:
+    if not PRIVATE_WELCOME_SENT_FILE.exists():
+        return {}
+    try:
+        raw = load_json(PRIVATE_WELCOME_SENT_FILE)
+        return {str(k): float(v or 0) for k, v in raw.items()} if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_private_welcome_sent() -> None:
+    try:
+        PRIVATE_WELCOME_SENT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        save_json(PRIVATE_WELCOME_SENT_FILE, private_welcome_sent)
+    except Exception as exc:
+        print(f"Failed to save private welcome sent file: {exc}")
+
+
+def private_welcome_key(account_id: str, sender_id: Any) -> str:
+    return f"{account_id}:{sender_id}"
+
+
+def has_private_welcome_sent(account_id: str, sender_id: Any) -> bool:
+    return private_welcome_key(str(account_id), sender_id) in private_welcome_sent
+
+
+def mark_private_welcome_sent(account_id: str, sender_id: Any) -> None:
+    private_welcome_sent[private_welcome_key(str(account_id), sender_id)] = time.time()
+    save_private_welcome_sent()
+
+
+private_sender_cache: Dict[str, dict] = load_private_sender_cache()
+private_welcome_sent: Dict[str, float] = load_private_welcome_sent()
 
 
 def private_dm_event_key(event: dict) -> str:
@@ -770,7 +918,13 @@ def load_env_file_values(path: Path) -> Dict[str, str]:
 
 
 def ai_bot_workspace() -> Path:
-    return Path(os.getenv("ROSEPAY_AI_BOT_WORKSPACE", "E:/telegram_bot_workspace"))
+    configured = os.getenv("ROSEPAY_AI_BOT_WORKSPACE", "").strip()
+    if configured:
+        return Path(configured)
+    linux_bot_path = Path("/opt/rosepay-telegram-bot")
+    if linux_bot_path.exists():
+        return linux_bot_path
+    return Path("E:/telegram_bot_workspace")
 
 
 def get_ops_notify_bot_token() -> str:
@@ -955,7 +1109,7 @@ def send_ops_bot_notification(text: str, dedup_key: str = "", cooldown_seconds: 
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         for chat_id in chat_ids:
             try:
-                resp = requests.post(
+                resp = telegram_api_post(
                     url,
                     json={
                         "chat_id": chat_id,
@@ -1056,7 +1210,7 @@ def format_ops_event_detail_html(event: dict) -> str:
 
 def get_ops_bot_username(token: str) -> str:
     try:
-        resp = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=8)
+        resp = telegram_api_get(f"https://api.telegram.org/bot{token}/getMe", timeout=8)
         if not resp.ok:
             print(f"[OpsNotify] getMe failed: {resp.status_code} {resp.text[:200]}")
             return ""
@@ -1138,7 +1292,7 @@ def send_ops_bot_notification_with_buttons(text: str, event: dict, buttons: List
             if direct_buttons:
                 payload["reply_markup"] = {"inline_keyboard": direct_buttons}
             try:
-                resp = requests.post(url, json=payload, timeout=8)
+                resp = telegram_api_post(url, json=payload, timeout=8)
                 if resp.ok:
                     return
                 print(f"[OpsNotify] direct send failed user={direct_user_id}: {resp.status_code} {resp.text[:200]}")
@@ -1159,7 +1313,7 @@ def send_ops_bot_notification_with_buttons(text: str, event: dict, buttons: List
             }
         for chat_id in chat_ids:
             try:
-                resp = requests.post(
+                resp = telegram_api_post(
                     url,
                     json={
                         "chat_id": chat_id,
@@ -1244,6 +1398,7 @@ class MessageCampaignTaskRequest(BaseModel):
     strategy_enabled: bool = False
     message: str
     target_groups: List[CampaignGroupInfo]
+    scheduled_start_at: Optional[str] = None
 
 class ProfileNameRequest(BaseModel):
     first_name: str
@@ -1369,7 +1524,7 @@ def add_login_log(account_id: str, message: str):
 
 def register_login_code_listener(account_id: str, client: TelegramClient):
     from telethon import events
-    
+
     # Check if already registered
     for handler, event in client.list_event_handlers():
         if getattr(handler, "__name__", "") == "login_code_message_handler":
@@ -1378,36 +1533,32 @@ def register_login_code_listener(account_id: str, client: TelegramClient):
     @client.on(events.NewMessage(incoming=True))
     async def login_code_message_handler(event):
         try:
+            cooldown_until = auto_private_listener_cooldowns.get(account_id, 0)
+            if cooldown_until > time.time():
+                return
+            account_is_busy = is_account_busy_with_task(account_id)
             sender_id = event.sender_id
             is_official = (sender_id == 777000)
             if not is_official and event.message.peer_id:
                 is_official = (getattr(event.message.peer_id, "user_id", None) == 777000)
-            
-            if not is_official:
-                try:
-                    sender = await event.get_sender()
-                    if getattr(sender, "id", None) == 777000:
-                        is_official = True
-                except Exception:
-                    pass
-            
+
             if is_official:
                 text = event.message.message
                 if not text:
                     return
-                
+
                 add_login_log(account_id, "监听到新的官方通知消息！")
-                
+
                 import datetime
                 msg_date = event.message.date
                 if isinstance(msg_date, datetime.datetime):
                     timestamp = msg_date.timestamp()
                 else:
                     timestamp = time.time()
-                    
+
                 if account_id not in official_messages_store:
                     official_messages_store[account_id] = []
-                    
+
                 # Avoid duplicates
                 exists = any(m["text"] == text and abs(m["timestamp"] - timestamp) < 5 for m in official_messages_store[account_id])
                 if not exists:
@@ -1420,19 +1571,19 @@ def register_login_code_listener(account_id: str, client: TelegramClient):
                         key=lambda x: x["timestamp"],
                         reverse=True
                     )[:5]
-                
+
                 # Match "Login code: 45001" or other patterns
                 match = re.search(r"Login code\s*:?\s*(\d+)", text, re.IGNORECASE)
                 if not match:
                     match = re.search(r"(?:code|验证码)[:：\s]+(\d+)", text, re.IGNORECASE)
                 if not match:
                     match = re.search(r"\b(\d{5,6})\b", text)
-                    
+
                 if match:
                     code = match.group(1)
                     if account_id not in captured_login_codes:
                         captured_login_codes[account_id] = []
-                    
+
                     exists_code = any(c["code"] == code and abs(c["timestamp"] - timestamp) < 10 for c in captured_login_codes[account_id])
                     if not exists_code:
                         captured_login_codes[account_id].append({
@@ -1453,19 +1604,39 @@ def register_login_code_listener(account_id: str, client: TelegramClient):
             if not getattr(event, "is_private", False):
                 return
 
-            try:
-                sender = await event.get_sender()
-            except Exception:
-                sender = None
-
-            if not isinstance(sender, types.User):
-                return
-            if bool(getattr(sender, "bot", False)):
-                return
-
-            sender_id_int = int(getattr(sender, "id", 0) or 0)
+            sender_id_int = int(sender_id or 0)
             if sender_id_int <= 0:
                 return
+
+            cached_sender = get_private_sender_cache(sender_id_int)
+            sender = None
+            if cached_sender:
+                if bool(cached_sender.get("sender_is_bot", False)):
+                    return
+                sender_name = str(cached_sender.get("sender_name") or sender_id_int)
+                sender_username = str(cached_sender.get("sender_username") or "")
+                sender_is_bot = False
+            else:
+                try:
+                    sender = await asyncio.wait_for(event.get_sender(), timeout=8)
+                except Exception as sender_exc:
+                    if is_telegram_transport_rate_error(sender_exc):
+                        mark_private_listener_cooldown(account_id, sender_exc, "get first private sender")
+                        return
+                    print(f"[PrivateListener] Failed to resolve first sender {sender_id_int} for {account_id}: {sender_exc}")
+                    sender = None
+
+                if sender is not None and not isinstance(sender, types.User):
+                    return
+                if sender is not None and bool(getattr(sender, "bot", False)):
+                    cache_private_sender_entity(account_id, sender)
+                    return
+
+                sender_name = private_user_display_name(sender) if sender is not None else str(sender_id_int)
+                sender_username = f"@{sender.username}" if sender is not None and getattr(sender, "username", None) else ""
+                sender_is_bot = bool(getattr(sender, "bot", False)) if sender is not None else False
+                if sender is not None:
+                    cache_private_sender_entity(account_id, sender)
 
             try:
                 msg = getattr(event, "message", None)
@@ -1475,9 +1646,9 @@ def register_login_code_listener(account_id: str, client: TelegramClient):
                     "account_label": str(account_id),
                     "source": "web_server",
                     "sender_id": sender_id_int,
-                    "sender_name": private_user_display_name(sender),
-                    "sender_username": f"@{sender.username}" if getattr(sender, "username", None) else "",
-                    "sender_is_bot": bool(getattr(sender, "bot", False)),
+                    "sender_name": sender_name,
+                    "sender_username": sender_username,
+                    "sender_is_bot": sender_is_bot,
                     "message_id": int(getattr(msg, "id", 0) or 0),
                     "text": message_preview_text(msg),
                     "out": False,
@@ -1487,24 +1658,15 @@ def register_login_code_listener(account_id: str, client: TelegramClient):
                 }
                 append_private_dm_event(private_event)
                 publish_private_dm_event(private_event)
-                
+
                 # --- 自动首问欢迎语回复逻辑（穿透 Telegram 官方云端历史判定） ---
                 try:
-                    is_first_chat = False
                     cache_key = f"{account_id}:{sender_id_int}"
                     from private_dm_events import first_chat_notified_set
-                    if cache_key not in first_chat_notified_set:
-                        # 实时拉取 Telegram 云端历史消息（限制2条）
-                        history_msgs = await client.get_messages(sender, limit=2)
-                        cloud_count = len(history_msgs) if history_msgs else 0
-                        print(f"[Welcome Check] Active Account {account_id} -> Sender {sender_id_int}: Cloud message history count is {cloud_count}")
-                        if cloud_count <= 1:
-                            is_first_chat = True
-                    
-                    if is_first_chat:
-                        print(f"[Welcome Check] Sender {sender_id_int} is verified as FIRST-TIME chat. Preparing to send welcome text.")
+                    if not has_private_welcome_sent(account_id, sender_id_int) and cache_key not in first_chat_notified_set:
+                        print(f"[Welcome Check] Sender {sender_id_int} has no local welcome marker. Preparing one-time welcome text.")
                         first_chat_notified_set.add(cache_key)
-                        
+
                         welcome_text = ""
                         try:
                             import sqlite3
@@ -1520,7 +1682,7 @@ def register_login_code_listener(account_id: str, client: TelegramClient):
                                     print(f"[Welcome] Selected random welcome template from {len(rows)} enabled options.")
                         except Exception as db_err:
                             print(f"[Welcome] Failed to query welcome templates from database: {db_err}")
-                            
+
                         if not welcome_text:
                             welcome_text = (
                                 "🌹 <b>Hello! Welcome to RosePay!</b>\n\n"
@@ -1531,20 +1693,43 @@ def register_login_code_listener(account_id: str, client: TelegramClient):
                                 "💬 Please state your specific business needs here. Our support team will get back to you shortly. "
                                 "Have a great day!"
                             )
-                        await client.send_message(sender, welcome_text, parse_mode="HTML")
+                        welcome_target = sender if sender is not None else sender_id_int
+                        await client.send_message(welcome_target, welcome_text, parse_mode="HTML")
+                        mark_private_welcome_sent(account_id, sender_id_int)
                         print(f"[Welcome] Auto sent first-chat welcome message to {sender_id_int} from account {account_id}.")
+                except RuntimeError as welcome_skip:
+                    if str(welcome_skip) != "skip-heavy-private-listener-work-while-account-busy":
+                        print(f"[Welcome] Skipped: {welcome_skip}")
                 except Exception as welcome_err:
+                    try:
+                        first_chat_notified_set.discard(cache_key)
+                    except Exception:
+                        pass
+                    if is_telegram_transport_rate_error(welcome_err):
+                        mark_private_listener_cooldown(account_id, welcome_err, "welcome private message")
                     print(f"[Welcome] Failed to send welcome message: {welcome_err}")
-            except Exception:
-                pass
+            except Exception as event_exc:
+                if is_telegram_transport_rate_error(event_exc):
+                    mark_private_listener_cooldown(account_id, event_exc, "private event handling")
+                else:
+                    print(f"[PrivateListener] Failed to process private event for {account_id}: {event_exc}")
 
-            cache = dm_folder_peer_cache.setdefault(account_id, set())
-            if sender_id_int not in cache:
-                await add_peer_to_folder(client, sender, DM_FOLDER_NAME)
-                cache.add(sender_id_int)
-                print(f"[{account_id}] Added private dialog {sender_id_int} to {DM_FOLDER_NAME} folder.")
+            if not account_is_busy and sender is not None:
+                cache = dm_folder_peer_cache.setdefault(account_id, set())
+                if sender_id_int not in cache:
+                    try:
+                        await add_peer_to_folder(client, sender, DM_FOLDER_NAME)
+                        cache.add(sender_id_int)
+                        print(f"[{account_id}] Added private dialog {sender_id_int} to {DM_FOLDER_NAME} folder.")
+                    except Exception as folder_exc:
+                        if is_telegram_transport_rate_error(folder_exc):
+                            mark_private_listener_cooldown(account_id, folder_exc, "dm folder sync")
+                        else:
+                            print(f"[{account_id}] Failed to add private dialog {sender_id_int} to {DM_FOLDER_NAME}: {folder_exc}")
 
         except Exception as e:
+            if is_telegram_transport_rate_error(e):
+                mark_private_listener_cooldown(account_id, e, "login/private listener")
             print(f"Error handling login code listener for {account_id}: {e}")
 
 def mark_account_runtime_status(account_id: str, *, is_connected: bool, is_authorized: Optional[bool] = None, me: Optional[str] = None):
@@ -1587,7 +1772,7 @@ async def get_client(account_id: str, ignore_proxy: bool = False) -> TelegramCli
 
     if account_id not in client_locks:
         client_locks[account_id] = asyncio.Lock()
-        
+
     async with client_locks[account_id]:
         active_clients_last_accessed[account_id] = time.time()
         if account_id in active_clients:
@@ -1632,14 +1817,14 @@ async def get_client(account_id: str, ignore_proxy: bool = False) -> TelegramCli
         await client.connect()
         active_clients[account_id] = client
         mark_account_runtime_status(account_id, is_connected=True)
-        
+
         if account_id not in registered_listeners:
             try:
                 register_login_code_listener(account_id, client)
                 registered_listeners.add(account_id)
             except Exception as e:
                 print(f"Failed to register login code listener: {e}")
-                
+
         return client
 
 class LoginRequest(BaseModel):
@@ -1680,28 +1865,28 @@ def sync_translation_bot_config():
     import json
     import os
     import sqlite3
-    
+
     json_path = "/opt/rosepay-translate-bot/data/translate_access.json"
     if not os.path.exists(json_path):
         return
-        
+
     try:
         with open(json_path, "r", encoding="utf-8") as f:
             old_data = json.load(f)
-            
+
         old_allowed_chats = [cid for cid in old_data.get("allowed_chat_ids", [])]
         old_owner_ids = [oid for oid in old_data.get("owner_chat_ids", []) if oid < 0]
-        
+
         from db import DB_PATH
         conn = sqlite3.connect(str(DB_PATH))
         cursor = conn.cursor()
         cursor.execute("SELECT telegram_chat_id, role FROM bot_authorized_users WHERE bot_type = 'translate_bot' AND is_active = 1;")
         rows = cursor.fetchall()
         conn.close()
-        
+
         new_allowed_users = []
         new_owner_users = []
-        
+
         for chat_id_str, role in rows:
             try:
                 cid = int(chat_id_str)
@@ -1712,20 +1897,20 @@ def sync_translation_bot_config():
                         new_allowed_users.append(cid)
             except ValueError:
                 pass
-                
+
         final_owners = sorted(list(set(old_owner_ids + new_owner_users + [8302461675])))
         final_allowed = sorted(list(set(new_allowed_users)))
-        
+
         new_data = {
             "allowed_usernames": [],
             "allowed_user_ids": final_allowed,
             "allowed_chat_ids": old_allowed_chats,
             "owner_chat_ids": final_owners
         }
-        
+
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(new_data, f, indent=2)
-            
+
         os.system("systemctl restart rosepay-translate-bot.service")
     except Exception as exc:
         print("sync_translation_bot_config failed:", exc)
@@ -1756,7 +1941,7 @@ def get_bot_authorizations(user: dict = Depends(get_current_user)):
             owner_label = r.owner_username or ""
             acc_status = "unknown"
             is_system_linked = False
-            
+
             # 优先关联查询 accounts 托管表获取具体账号名称（如 RosePay Frank）与状态
             cursor = session.connection().connection.cursor()
             cursor.execute("SELECT account_name, is_available, owner_username FROM accounts WHERE id = ?", (r.telegram_chat_id,))
@@ -1781,11 +1966,11 @@ def get_bot_authorizations(user: dict = Depends(get_current_user)):
                     else:
                         role_label = "employee"
                     is_system_linked = True
-            
+
             # 兜底：如果都没有关联上，则使用创建时记录的用户名，但标记 system_linked = False
             if not display_name or display_name.strip() == "":
                 display_name = r.telegram_username or ""
-                
+
             result.append({
                 "telegram_chat_id": r.telegram_chat_id,
                 "bot_type": r.bot_type,
@@ -1964,12 +2149,12 @@ def setup_first_admin(req: SetupAdminRequest):
         stmt = select(AdminDb)
         if session.exec(stmt).first() is not None:
             raise HTTPException(status_code=400, detail="管理员已配置，不允许重复初始化")
-        
+
         username = req.username.strip()
         password = req.password
         if not username or len(password) < 6:
             raise HTTPException(status_code=400, detail="用户名不能为空，密码长度必须不小于 6 位")
-            
+
         pwd_hash, salt = hash_password(password)
         admin_user = AdminDb(
             username=username,
@@ -1988,16 +2173,16 @@ def login(req: LoginRequest):
     from db import engine, AdminDb, RolePermissionDb, Session, select, verify_password
     username = req.username.strip()
     password = req.password
-    
+
     with Session(engine) as session:
         stmt = select(AdminDb).where(AdminDb.username == username)
         user = session.exec(stmt).first()
         if not user:
             raise HTTPException(status_code=401, detail="用户名或密码错误")
-            
+
         if not verify_password(password, user.salt, user.password_hash):
             raise HTTPException(status_code=401, detail="用户名或密码错误")
-            
+
         # Get allowed tabs
         perm = session.get(RolePermissionDb, user.role)
         allowed = [x.strip() for x in perm.allowed_tabs.split(",") if x.strip()] if perm else []
@@ -2006,7 +2191,7 @@ def login(req: LoginRequest):
                 allowed.append("bot_auth")
             if "bots" not in allowed:
                 allowed.append("bots")
-        
+
         token = generate_token(user.username, user.role)
         return {
             "status": "success",
@@ -2070,12 +2255,12 @@ def create_admin_company(req: CompanyCreateRequest, user: dict = Depends(get_cur
     name = req.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="公司名称不能为空")
-    
+
     with Session(engine) as session:
         dup = session.exec(select(CompanyDb).where(CompanyDb.name == name)).first()
         if dup:
             raise HTTPException(status_code=400, detail="公司名称已存在")
-        
+
         new_company = CompanyDb(
             name=name,
             created_at=datetime.now(timezone.utc).isoformat()
@@ -2092,19 +2277,19 @@ def update_admin_company(company_id: int, req: CompanyUpdateRequest, user: dict 
     name = req.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="公司名称不能为空")
-        
+
     with Session(engine) as session:
         company = session.get(CompanyDb, company_id)
         if not company:
             raise HTTPException(status_code=404, detail="公司不存在")
-        
+
         if company.name == "admin":
             raise HTTPException(status_code=400, detail="不能修改admin")
-            
+
         dup = session.exec(select(CompanyDb).where(CompanyDb.name == name).where(CompanyDb.id != company_id)).first()
         if dup:
             raise HTTPException(status_code=400, detail="公司名称已存在")
-            
+
         company.name = name
         session.add(company)
         session.commit()
@@ -2119,20 +2304,20 @@ def delete_admin_company(company_id: int, user: dict = Depends(get_current_user)
         company = session.get(CompanyDb, company_id)
         if not company:
             raise HTTPException(status_code=404, detail="公司不存在")
-            
+
         if company.name == "admin":
             raise HTTPException(status_code=400, detail="不能删除admin")
-            
+
         # Check if any admin/user belongs to this company
         user_dup = session.exec(select(AdminDb).where(AdminDb.company == company.name)).first()
         if user_dup:
             raise HTTPException(status_code=400, detail="该公司下有系统用户，无法删除")
-            
+
         # Check if any accounts belong to this company
         account_dup = session.exec(select(AccountDb).where(AccountDb.company == company.name)).first()
         if account_dup:
             raise HTTPException(status_code=400, detail="该公司下有 Telegram 账号，无法删除")
-            
+
         session.delete(company)
         session.commit()
     return {"status": "success", "message": "删除公司成功"}
@@ -2171,34 +2356,34 @@ def create_admin_user(req: UserCreateRequest, user: dict = Depends(get_current_u
     if not username or len(password) < 6:
         raise HTTPException(status_code=400, detail="用户名不能为空，密码长度必须不小于 6 位")
     telegram_contact = normalize_telegram_contact(req.telegram_contact)
-        
+
     company_name = req.company.strip() if req.company else ""
     if username not in ("eason", "admin") and not company_name:
         raise HTTPException(status_code=400, detail="除了 eason 用户外，其他用户必须绑定公司")
-        
+
     forum_chat_id = req.forum_chat_id.strip() if req.forum_chat_id else ""
-        
+
     with Session(engine) as session:
         from db import CompanyDb
         if company_name:
             company_exists = session.exec(select(CompanyDb).where(CompanyDb.name == company_name)).first()
             if not company_exists:
                 raise HTTPException(status_code=400, detail=f"绑定的公司 '{company_name}' 不存在")
-            
+
         dup = session.exec(select(AdminDb).where(AdminDb.username == username)).first()
         if dup:
             raise HTTPException(status_code=400, detail="用户名已存在")
-            
+
         if telegram_contact:
             dup_contact = session.exec(select(AdminDb).where(AdminDb.telegram_contact == telegram_contact)).first()
             if dup_contact:
                 raise HTTPException(status_code=400, detail="该电报用户名已被系统内其他用户绑定")
-                
+
         if forum_chat_id:
             dup_forum = session.exec(select(AdminDb).where(AdminDb.forum_chat_id == forum_chat_id)).first()
             if dup_forum:
                 raise HTTPException(status_code=400, detail="该超级群 ID 已被系统内其他用户占用")
-            
+
         pwd_hash, salt = hash_password(password)
         new_user = AdminDb(
             username=username,
@@ -2212,7 +2397,7 @@ def create_admin_user(req: UserCreateRequest, user: dict = Depends(get_current_u
         )
         session.add(new_user)
         session.commit()
-        
+
         # 自动激活暂存账号所有权
         if telegram_contact:
             clean_contact = telegram_contact.strip().lstrip("@").lower()
@@ -2224,7 +2409,7 @@ def create_admin_user(req: UserCreateRequest, user: dict = Depends(get_current_u
                 acc.owner_username = username
                 session.add(acc)
             session.commit()
-            
+
     return {"status": "success", "message": "添加用户成功"}
 
 class UserUpdateRequest(BaseModel):
@@ -2239,51 +2424,51 @@ def update_admin_user(user_id: int, req: UserUpdateRequest, user: dict = Depends
     if user["role"] != "admin":
         raise HTTPException(status_code=403, detail="拒绝访问")
     from db import engine, AdminDb, Session, select, hash_password
-    
+
     role = req.role.strip()
     company_name = req.company.strip() if req.company else ""
     telegram_contact = normalize_telegram_contact(req.telegram_contact)
     forum_chat_id = req.forum_chat_id.strip() if req.forum_chat_id else ""
-    
+
     if role not in {"admin", "user"}:
         raise HTTPException(status_code=400, detail="角色必须是 admin 或 user")
-        
+
     with Session(engine) as session:
         target_user = session.get(AdminDb, user_id)
         if not target_user:
             raise HTTPException(status_code=404, detail="用户不存在")
-            
+
         username = target_user.username
         if username not in ("eason", "admin") and not company_name:
             raise HTTPException(status_code=400, detail="除了 eason 用户外，其他用户必须绑定公司")
-            
+
         if telegram_contact:
             dup_contact = session.exec(
                 select(AdminDb).where(AdminDb.telegram_contact == telegram_contact).where(AdminDb.id != user_id)
             ).first()
             if dup_contact:
                 raise HTTPException(status_code=400, detail="该电报用户名已被系统内其他用户绑定")
-                
+
         if forum_chat_id:
             dup_forum = session.exec(
                 select(AdminDb).where(AdminDb.forum_chat_id == forum_chat_id).where(AdminDb.id != user_id)
             ).first()
             if dup_forum:
                 raise HTTPException(status_code=400, detail="该超级群 ID 已被系统内其他用户占用")
-            
+
         if company_name:
             from db import CompanyDb
             company_exists = session.exec(select(CompanyDb).where(CompanyDb.name == company_name)).first()
             if not company_exists:
                 raise HTTPException(status_code=400, detail=f"绑定的公司 '{company_name}' 不存在")
-                
+
         target_user.role = role
         target_user.company = company_name
         if getattr(target_user, "telegram_contact", "") != telegram_contact:
             target_user.telegram_chat_id = None
         target_user.telegram_contact = telegram_contact
         target_user.forum_chat_id = forum_chat_id
-        
+
         if req.password:
             password = req.password.strip()
             if len(password) < 6:
@@ -2291,10 +2476,10 @@ def update_admin_user(user_id: int, req: UserUpdateRequest, user: dict = Depends
             pwd_hash, salt = hash_password(password)
             target_user.password_hash = pwd_hash
             target_user.salt = salt
-            
+
         session.add(target_user)
         session.commit()
-        
+
         # 自动激活暂存账号所有权
         if telegram_contact:
             clean_contact = telegram_contact.strip().lstrip("@").lower()
@@ -2306,7 +2491,7 @@ def update_admin_user(user_id: int, req: UserUpdateRequest, user: dict = Depends
                 acc.owner_username = username
                 session.add(acc)
             session.commit()
-            
+
     return {"status": "success", "message": "修改用户成功"}
 
 @app.delete("/api/admin/users/{user_id}")
@@ -2320,7 +2505,7 @@ def delete_admin_user(user_id: int, user: dict = Depends(get_current_user)):
             raise HTTPException(status_code=404, detail="用户不存在")
         if u.username == user["username"]:
             raise HTTPException(status_code=400, detail="不允许删除当前登录账号")
-            
+
         session.delete(u)
         session.commit()
     return {"status": "success", "message": "删除用户成功"}
@@ -2336,10 +2521,10 @@ def change_user_password(user_id: int, req: ChangeUserPasswordRequest, user: dic
         target_user = session.get(AdminDb, user_id)
         if not target_user:
             raise HTTPException(status_code=404, detail="目标用户不存在")
-            
+
         is_self = user["id"] == target_user.id or user["username"] == target_user.username
         is_super = user["username"] in ("eason", "admin")
-        
+
         has_permission = False
         if is_self or is_super:
             has_permission = True
@@ -2350,18 +2535,18 @@ def change_user_password(user_id: int, req: ChangeUserPasswordRequest, user: dic
                     allowed = [x.strip() for x in role_perm.allowed_tabs.split(",") if x.strip()]
                     if "change_password" in allowed:
                         has_permission = True
-                    
+
         if not has_permission:
             raise HTTPException(status_code=403, detail="没有修改他人密码的权限")
-            
+
         new_pwd = req.password.strip()
         if len(new_pwd) < 6:
             raise HTTPException(status_code=400, detail="新密码长度不能小于6位")
-            
+
         # Check if new password is identical to current password
         if verify_password(new_pwd, target_user.salt, target_user.password_hash):
             raise HTTPException(status_code=400, detail="新密码不能与原密码相同")
-            
+
         # Verify old password if modifying own password
         if is_self:
             old_pwd = req.old_password
@@ -2369,13 +2554,13 @@ def change_user_password(user_id: int, req: ChangeUserPasswordRequest, user: dic
                 raise HTTPException(status_code=400, detail="修改个人密码必须输入原密码")
             if not verify_password(old_pwd, target_user.salt, target_user.password_hash):
                 raise HTTPException(status_code=401, detail="原密码输入错误")
-            
+
         pwd_hash, salt = hash_password(new_pwd)
         target_user.password_hash = pwd_hash
         target_user.salt = salt
         session.add(target_user)
         session.commit()
-        
+
     return {"status": "success", "message": "密码修改成功"}
 
 class RolePermissionRequest(BaseModel):
@@ -2402,10 +2587,10 @@ def get_role_permissions(user: dict = Depends(get_current_user)):
 def update_role_permissions(req: RolePermissionRequest, user: dict = Depends(get_current_user)):
     if user["role"] != "admin":
         raise HTTPException(status_code=403, detail="拒绝访问")
-    
+
     role = req.role.strip()
     allowed_list = [x.strip() for x in req.allowed_tabs if x.strip()]
-    
+
     # Safety Check: Prevent admins from accidentally disabling 'users' or 'permissions' for themselves
     if role == "admin":
         if "users" not in allowed_list:
@@ -2416,9 +2601,9 @@ def update_role_permissions(req: RolePermissionRequest, user: dict = Depends(get
             allowed_list.append("bot_auth")
         if "bots" not in allowed_list:
             allowed_list.append("bots")
-            
+
     allowed_tabs_str = ",".join(allowed_list)
-    
+
     from db import engine, RolePermissionDb, Session
     with Session(engine) as session:
         perm = session.get(RolePermissionDb, role)
@@ -2428,7 +2613,7 @@ def update_role_permissions(req: RolePermissionRequest, user: dict = Depends(get
             perm.allowed_tabs = allowed_tabs_str
         session.add(perm)
         session.commit()
-        
+
     return {"status": "success", "message": f"角色 {role} 的权限已更新"}
 
 # --- FRONTEND ROUTE ---
@@ -2453,7 +2638,7 @@ async def serve_index():
     }
     if frontend_index.exists():
         return HTMLResponse(content=frontend_index.read_text(encoding="utf-8"), status_code=200, headers=headers)
-        
+
     index_path = Path(__file__).resolve().parent / "templates" / "index.html"
     if not index_path.exists():
         raise HTTPException(status_code=404, detail="Index HTML not found")
@@ -2470,7 +2655,7 @@ async def serve_public_file(filename: str):
             if filename in (".env", "config.json", "package.json", "package-lock.json", "tsconfig.json", "vite.config.ts"):
                 raise HTTPException(status_code=403, detail="Access denied")
             return FileResponse(file_path)
-            
+
         # Fallback to check legacy templates folder
         legacy_dir = Path(__file__).resolve().parent / "templates"
         legacy_path = (legacy_dir / filename).resolve()
@@ -2496,14 +2681,14 @@ def _auto_save_2fa_to_db(pid: str, pass2fa: str):
             # 1. Try exact match on page_id
             stmt = select(AccountDb).where(AccountDb.page_id == pid)
             db_accs = session.exec(stmt).all()
-            
+
             # 2. If no match, try extracting UUID token and matching
             if not db_accs:
                 token_match = re.search(r"token=([a-zA-Z0-9\-]+)", pid)
                 token_val = token_match.group(1) if token_match else pid
                 stmt = select(AccountDb).where((AccountDb.page_id == token_val) | (AccountDb.page_id.like(f"%{token_val}%")))
                 db_accs = session.exec(stmt).all()
-                
+
             for db_acc in db_accs:
                 if db_acc.pass2fa != pass2fa:
                     db_acc.pass2fa = pass2fa
@@ -2525,7 +2710,7 @@ def _auto_save_2fa_to_db(pid: str, pass2fa: str):
 async def fetch_scraper_data(page_id: Optional[str] = None, user: dict = Depends(get_current_user)):
     """Fetches device verification code and 2fa password from the old target scraping URL."""
     pid = (page_id or DEFAULT_SCRAPER_PAGE_ID).strip()
-    
+
     # 如果是新接码平台链接，不进行自动爬取，直接返回空以等待用户手动输入
     if "add4533.com" in pid or "onlinestore-fx-jm" in pid:
         return {
@@ -2533,11 +2718,11 @@ async def fetch_scraper_data(page_id: Optional[str] = None, user: dict = Depends
             "pass2fa": None,
             "login_time": None
         }
-        
+
     code = None
     pass2fa = None
     login_time = None
-    
+
     try:
         # 旧版 HTML 平台 (feijige.shop) 爬虫
         uuid_val = pid
@@ -2545,7 +2730,7 @@ async def fetch_scraper_data(page_id: Optional[str] = None, user: dict = Depends
             uuid_match = re.search(r"/([a-zA-Z0-9\-]{36})", pid)
             if uuid_match:
                 uuid_val = uuid_match.group(1)
-                
+
         url = f"https://tgapi.feijige.shop/{uuid_val}/GetHTML"
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -2553,7 +2738,7 @@ async def fetch_scraper_data(page_id: Optional[str] = None, user: dict = Depends
         loop = asyncio.get_running_loop()
         resp = await loop.run_in_executor(None, lambda: requests.get(url, headers=headers, timeout=8))
         resp.raise_for_status()
-        
+
         soup = BeautifulSoup(resp.text, 'html.parser')
         code_input = soup.find('input', id='code')
         if code_input:
@@ -2570,10 +2755,10 @@ async def fetch_scraper_data(page_id: Optional[str] = None, user: dict = Depends
                     login_time = inp.get('value')
     except Exception as e:
         print(f"[Scraper] Old platform fetch failed: {e}")
-        
+
     if pass2fa:
         _auto_save_2fa_to_db(pid, pass2fa)
-        
+
     return {
         "code": code,
         "pass2fa": pass2fa,
@@ -2607,7 +2792,7 @@ def get_accounts(scope: str = "mine", user: dict = Depends(get_current_user)):
             if not is_campaign_running:
                 is_campaign_running = find_campaign_process(acc.id) is not None
             campaign_scan_ms += int((time.time() - campaign_started) * 1000)
-            
+
             # Fetch status from account_status_store
             # Check persistent spambot cache as fallback if not in store yet
             cached = spambot_cache.get(acc.id)
@@ -2623,7 +2808,7 @@ def get_accounts(scope: str = "mine", user: dict = Depends(get_current_user)):
                 "spambot_details": default_spambot_details,
                 "spambot_time": default_spambot_time
             })
-            
+
             busy_started = time.time()
             busy_status = get_account_busy_status(acc.id)
             busy_scan_ms += int((time.time() - busy_started) * 1000)
@@ -2706,6 +2891,7 @@ def serialize_private_dialog(dialog) -> Optional[dict]:
     if bool(getattr(entity, "bot", False)):
         return None
     peer_id = str(entity.id)
+    cache_private_sender_entity("", entity)
     last_message = dialog.message
     last_date = getattr(last_message, "date", None)
     return {
@@ -2765,6 +2951,7 @@ def get_cached_private_dialogs(account_id: str, limit: int = 30) -> List[dict]:
         peer_id = str(event.get("sender_id") or event.get("peer_id") or "")
         if not peer_id:
             continue
+        cached_sender = get_private_sender_cache(peer_id) or {}
         timestamp = float(event.get("timestamp") or event.get("created_at") or 0)
         if timestamp > ack_ts and not bool(event.get("out", False)):
             unread_by_peer[peer_id] = unread_by_peer.get(peer_id, 0) + 1
@@ -2773,8 +2960,8 @@ def get_cached_private_dialogs(account_id: str, limit: int = 30) -> List[dict]:
             continue
         dialogs_by_peer[peer_id] = {
             "peer_id": peer_id,
-            "name": event.get("sender_name") or event.get("sender_username") or f"ID {peer_id}",
-            "username": event.get("sender_username") or "",
+            "name": cached_sender.get("sender_name") or event.get("sender_name") or event.get("sender_username") or f"ID {peer_id}",
+            "username": cached_sender.get("sender_username") or event.get("sender_username") or "",
             "phone": "",
             "is_bot": False,
             "unread_count": unread_by_peer.get(peer_id, 0),
@@ -2804,6 +2991,7 @@ def get_cached_private_messages(account_id: str, peer_id: str, limit: int = 30) 
 def cache_private_message(account_id: str, peer: types.User, message) -> None:
     if not isinstance(peer, types.User) or bool(getattr(peer, "bot", False)):
         return
+    cache_private_sender_entity(account_id, peer)
     msg_date = getattr(message, "date", None)
     timestamp = msg_date.timestamp() if msg_date else time.time()
     is_out = bool(getattr(message, "out", False))
@@ -2942,17 +3130,30 @@ def enqueue_private_send(account_id: str, peer_id: str, text: str, created_by: s
 async def send_private_message_with_client(account_id: str, client: TelegramClient, peer_id: str, text: str, reply_to_msg_id: Optional[int] = None) -> dict:
     if not await client.is_user_authorized():
         raise HTTPException(status_code=401, detail="账号未登录")
+    peer_key = str(peer_id)
+    entity = None
     try:
-        entity = await client.get_entity(int(peer_id))
-    except Exception as exc:
-        raise HTTPException(status_code=404, detail=f"私聊对象不存在: {exc}")
-    if not isinstance(entity, types.User):
-        raise HTTPException(status_code=400, detail="只支持私聊用户，不支持群聊或频道")
-    if bool(getattr(entity, "bot", False)):
-        raise HTTPException(status_code=400, detail="已排除 Bot 私聊")
-    sent = await client.send_message(entity, text, reply_to=reply_to_msg_id)
+        peer_ref = int(peer_key)
+    except ValueError:
+        peer_ref = peer_key
     try:
-        cache_private_message(account_id, entity, sent)
+        sent = await client.send_message(peer_ref, text, reply_to=reply_to_msg_id)
+    except Exception:
+        try:
+            entity = await client.get_entity(peer_ref)
+        except Exception as exc:
+            raise HTTPException(status_code=404, detail=f"私聊对象不存在: {exc}")
+        if not isinstance(entity, types.User):
+            raise HTTPException(status_code=400, detail="只支持私聊用户，不支持群聊或频道")
+        if bool(getattr(entity, "bot", False)):
+            raise HTTPException(status_code=400, detail="已排除 Bot 私聊")
+        sent = await client.send_message(entity, text, reply_to=reply_to_msg_id)
+    try:
+        if entity is None and not get_private_sender_cache(peer_key):
+            entity = await client.get_entity(peer_ref)
+        if entity is not None:
+            cache_private_sender_entity(account_id, entity)
+            cache_private_message(account_id, entity, sent)
     except Exception:
         pass
     message = serialize_private_message(sent)
@@ -2977,7 +3178,7 @@ async def drain_pending_private_sends(account_id: str, client: Optional[Telegram
             try:
                 item["status"] = "sending"
                 update_private_send_queue_record(str(item["id"]), "sending")
-                
+
                 # 从 created_by 解析 reply_to_msg_id
                 created_by = str(item.get("created_by") or "")
                 reply_to_msg_id = None
@@ -2986,11 +3187,11 @@ async def drain_pending_private_sends(account_id: str, client: Optional[Telegram
                         reply_to_msg_id = int(created_by.split("bot:reply_to:", 1)[1])
                     except Exception:
                         pass
-                
+
                 sent_message = await send_private_message_with_client(
-                    account_id, 
-                    client, 
-                    str(item["peer_id"]), 
+                    account_id,
+                    client,
+                    str(item["peer_id"]),
                     str(item["text"]),
                     reply_to_msg_id=reply_to_msg_id
                 )
@@ -3390,7 +3591,7 @@ async def bot_reply_private_dm(req: BotReplyPrivateDmRequest):
     customer_id = req.customer_id
     reply_text = req.reply_text
     reply_to_msg_id = req.reply_to_msg_id
-    
+
     # 检查逻辑忙碌状态
     busy_reason = get_account_operation_block_reason(account_id, block_task_busy=True)
     if busy_reason:
@@ -3398,7 +3599,7 @@ async def bot_reply_private_dm(req: BotReplyPrivateDmRequest):
         created_by_str = "bot"
         if reply_to_msg_id is not None:
             created_by_str = f"bot:reply_to:{reply_to_msg_id}"
-            
+
         try:
             item = enqueue_private_send(
                 account_id=account_id,
@@ -3411,29 +3612,22 @@ async def bot_reply_private_dm(req: BotReplyPrivateDmRequest):
             return {"ok": True, "queued": True, "queue_id": item["id"]}
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"加入发送队列失败: {exc}")
-            
+
     # 若账号闲置，直接并发安全发送，实现毫秒级送达
     async with account_operation_guard(account_id, "bot_reply", label="Bot中转回复"):
         try:
             client = await get_client(account_id)
             if not await client.is_user_authorized():
                 raise HTTPException(status_code=401, detail="账号未登录")
-            
-            try:
-                peer = int(customer_id)
-            except ValueError:
-                peer = customer_id
-            
-            sent_msg = await client.send_message(peer, reply_text, reply_to=reply_to_msg_id)
-            
-            # 缓存发送出去的消息
-            try:
-                entity = await client.get_entity(peer)
-                cache_private_message(account_id, entity, sent_msg)
-            except Exception:
-                pass
-            
-            return {"ok": True, "queued": False, "message_id": sent_msg.id}
+
+            sent_msg = await send_private_message_with_client(
+                account_id,
+                client,
+                str(customer_id),
+                reply_text,
+                reply_to_msg_id=reply_to_msg_id,
+            )
+            return {"ok": True, "queued": False, "message_id": sent_msg.get("id")}
         except Exception as exc:
             detail = getattr(exc, "detail", None) or str(exc)
             if "Could not find the input entity" in detail:
@@ -3452,14 +3646,14 @@ async def bot_reply_via_thread(req: BotReplyViaThreadRequest):
     thread_id = req.thread_id
     reply_text = req.reply_text
     chat_id = req.chat_id
-    
+
     from private_dm_events import get_info_by_thread_id
     info = get_info_by_thread_id(thread_id, chat_id=chat_id)
     if not info:
         raise HTTPException(status_code=404, detail="找不到该主题(Thread)对应的会话映射，请确保已通过系统建立会话")
-        
+
     account_id, customer_id = info
-    
+
     sub_req = BotReplyPrivateDmRequest(
         account_id=account_id,
         customer_id=str(customer_id),
@@ -3474,13 +3668,13 @@ async def bot_export_folders(account_id: str):
     busy_reason = get_account_operation_block_reason(account_id, block_task_busy=True)
     if busy_reason:
         raise HTTPException(status_code=400, detail=f"账号当前正忙 ({busy_reason})，请稍后再试。")
-        
+
     async with account_operation_guard(account_id, "export_folders", label="导出文件夹"):
         try:
             client = await get_client(account_id)
             if not await client.is_user_authorized():
                 raise HTTPException(status_code=401, detail="账号未登录")
-                
+
             result = await client(functions.messages.GetDialogFiltersRequest())
             raw_filters = getattr(result, "filters", result)
             filters = [
@@ -3488,17 +3682,17 @@ async def bot_export_folders(account_id: str):
                 for item in raw_filters
                 if isinstance(item, (types.DialogFilter, types.DialogFilterChatlist))
             ]
-            
+
             from sync_folder_groups import collect_records, normalize_title
             include_types = {"group", "supergroup", "channel"}
-            
+
             from db import engine, AccountDb, Session
             db_account_name = account_id
             with Session(engine) as db_session:
                 acc_rec = db_session.get(AccountDb, account_id)
                 if acc_rec and acc_rec.account_name:
                     db_account_name = acc_rec.account_name
-                    
+
             output_lines = [
                 f"=========================================",
                 f" 托管账号: {db_account_name} (ID: {account_id})",
@@ -3509,7 +3703,7 @@ async def bot_export_folders(account_id: str):
             for item in filters:
                 folder_title = normalize_title(item.title)
                 output_lines.append(f"{folder_title} (文件夹)")
-                
+
                 try:
                     records = await collect_records(client, item, include_types)
                     if records:
@@ -3522,8 +3716,8 @@ async def bot_export_folders(account_id: str):
                         output_lines.append("- (空)")
                 except Exception as e:
                     output_lines.append(f"- (读取出错: {e})")
-                output_lines.append("") 
-                
+                output_lines.append("")
+
             txt_content = "\n".join(output_lines)
             return {"ok": True, "content": txt_content}
         except Exception as exc:
@@ -3534,7 +3728,7 @@ async def bot_export_folders(account_id: str):
 @app.get("/api/bot/get-private-messages")
 async def bot_get_private_messages(account_id: str, peer_id: str, limit: int = 15):
     cached_messages = get_cached_private_messages(account_id, peer_id, limit)
-    
+
     if len(cached_messages) < 3:
         try:
             async with account_operation_guard(account_id, "bot_private_messages", label="Bot读取私聊历史"):
@@ -3555,7 +3749,7 @@ async def bot_get_private_messages(account_id: str, peer_id: str, limit: int = 1
                     cached_messages.reverse()
         except Exception as exc:
             print(f"[BotGetMessages] Failed to fetch live messages: {exc}")
-            
+
     return {"ok": True, "messages": cached_messages}
 
 
@@ -3751,16 +3945,16 @@ def toggle_account_status(account_id: str, user: dict = Depends(get_current_user
         db_account = session.get(AccountDb, account_id)
         if not db_account:
             raise HTTPException(status_code=404, detail="Account not found")
-        
+
         # Check permissions
         if user["username"] not in ("eason", "admin") and user["company"] != "admin" and db_account.company != user["company"]:
             raise HTTPException(status_code=403, detail="Permission denied")
-            
+
         db_account.is_available = not db_account.is_available
         session.add(db_account)
         session.commit()
         session.refresh(db_account)
-        
+
         # Sync changes to JSON configs
         try:
             from account_manager import account_config_path, save_json
@@ -3776,7 +3970,7 @@ def toggle_account_status(account_id: str, user: dict = Depends(get_current_user
             },
             source="toggle-status"
         )
-            
+
         return {"status": "success", "is_available": db_account.is_available}
 
 @app.post("/api/accounts/{account_id}/reset-lock")
@@ -3809,7 +4003,7 @@ def check_local_bot_approval(telegram_id: int, phone: str) -> bool:
         from pathlib import Path
         bot_dir = Path("E:/telegram_translate_bot_workspace")
         access_path = bot_dir / "data" / "translate_access.json"
-        
+
         # Check translate_access.json
         if access_path.exists():
             with open(access_path, "r", encoding="utf-8") as f:
@@ -3817,7 +4011,7 @@ def check_local_bot_approval(telegram_id: int, phone: str) -> bool:
                 allowed_ids = data.get("allowed_user_ids", [])
                 if telegram_id in allowed_ids or str(telegram_id) in allowed_ids:
                     return True
-                    
+
         # Check access_requests.json
         requests_path = bot_dir / "data" / "access_requests.json"
         if requests_path.exists():
@@ -3846,7 +4040,7 @@ def approve_local_bot_access(telegram_id: int, phone: str, name: str, username: 
         bot_dir = Path("E:/telegram_translate_bot_workspace")
         data_dir = bot_dir / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # 1. Update translate_access.json
         access_path = data_dir / "translate_access.json"
         access_data = {"allowed_usernames": [], "allowed_user_ids": [], "allowed_chat_ids": [], "owner_chat_ids": []}
@@ -3856,15 +4050,15 @@ def approve_local_bot_access(telegram_id: int, phone: str, name: str, username: 
                     access_data = json.load(f)
             except Exception:
                 pass
-        
+
         allowed_ids = access_data.setdefault("allowed_user_ids", [])
         if telegram_id not in allowed_ids:
             allowed_ids.append(telegram_id)
         access_data["allowed_user_ids"] = sorted(list(set(allowed_ids)))
-        
+
         with open(access_path, "w", encoding="utf-8") as f:
             json.dump(access_data, f, indent=2, ensure_ascii=False)
-            
+
         # 2. Update access_requests.json
         requests_path = data_dir / "access_requests.json"
         requests_data = {"requests": {}}
@@ -3874,7 +4068,7 @@ def approve_local_bot_access(telegram_id: int, phone: str, name: str, username: 
                     requests_data = json.load(f)
             except Exception:
                 pass
-                
+
         requests = requests_data.setdefault("requests", {})
         clean_phone = phone if phone.startswith("+") else f"+{phone}"
         requests[str(telegram_id)] = {
@@ -3886,10 +4080,10 @@ def approve_local_bot_access(telegram_id: int, phone: str, name: str, username: 
             "created_at": int(time.time()),
             "reviewed_at": int(time.time())
         }
-        
+
         with open(requests_path, "w", encoding="utf-8") as f:
             json.dump(requests_data, f, indent=2, ensure_ascii=False)
-            
+
         print(f"Successfully wrote local bot authorization for Telegram ID {telegram_id} ({phone})")
     except Exception as e:
         print(f"Error writing local bot authorization: {e}")
@@ -3903,18 +4097,18 @@ async def auto_trigger_bot_setup_for_account(account_id: str, client):
                 return
             if db_acc.bot_setup_status == "approved":
                 return
-                
+
             bot_username = "RosePay_translation_bot"
             import asyncio
             if not client.is_connected():
                 await client.connect()
             if not await client.is_user_authorized():
                 return
-                
+
             me = await client.get_me()
             if not me or not me.phone:
                 return
-                
+
             # 1. Check if already approved locally
             if check_local_bot_approval(me.id, me.phone):
                 db_acc.bot_setup_status = "approved"
@@ -3927,14 +4121,14 @@ async def auto_trigger_bot_setup_for_account(account_id: str, client):
                 except Exception:
                     pass
                 return
-                
+
             # 2. Send /start
             bot_entity = await client.get_input_entity(bot_username)
             await client.send_message(bot_entity, "/start")
-            
+
             # 3. Wait 1.5 seconds
             await asyncio.sleep(1.5)
-            
+
             # 4. Click the "apply_access" callback button if present
             try:
                 messages = await client.get_messages(bot_entity, limit=5)
@@ -3953,10 +4147,10 @@ async def auto_trigger_bot_setup_for_account(account_id: str, client):
                             break
             except Exception as btn_ex:
                 print(f"Failed to click callback button: {btn_ex}")
-            
+
             # 5. Wait 1.5 seconds
             await asyncio.sleep(1.5)
-            
+
             # 6. Send contact card
             from telethon import types
             await client.send_message(
@@ -3968,10 +4162,10 @@ async def auto_trigger_bot_setup_for_account(account_id: str, client):
                     vcard=""
                 )
             )
-            
+
             # 7. Wait 1.5 seconds for bot to process
             await asyncio.sleep(1.5)
-            
+
             # 8. Pin Dialog
             try:
                 from telethon.tl.functions.messages import ToggleDialogPinRequest
@@ -3981,12 +4175,12 @@ async def auto_trigger_bot_setup_for_account(account_id: str, client):
                     pass
             except Exception:
                 pass
-            
+
             # 9. Write local authorization to files
             name = f"{me.first_name or ''} {me.last_name or ''}".strip() or f"User_{me.id}"
             username = me.username or ""
             approve_local_bot_access(me.id, me.phone, name, username)
-            
+
             # 10. Send message from bot
             bot_token = None
             try:
@@ -4002,34 +4196,34 @@ async def auto_trigger_bot_setup_for_account(account_id: str, client):
                 pass
             if not bot_token:
                 bot_token = "8998918901:AAFSSlT0P1pWUdXgpVZ4weDFMUdcmTdCheI"
-            
+
             if bot_token:
                 try:
                     import httpx
                     notification_text = "✅ 你的 RosePay 翻译机器人使用权限已通过。\n现在可以直接发送文字或使用 /tr 翻译。"
                     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-                    async with httpx.AsyncClient() as http_client:
+                    async with httpx.AsyncClient(**telegram_httpx_client_kwargs("web_server_translate_bot_api")) as http_client:
                         await http_client.post(url, json={
                             "chat_id": me.id,
                             "text": notification_text
                         })
                 except Exception:
                     pass
-            
+
             # 11. Update DB to approved
             db_acc.bot_setup_status = "approved"
             db_acc.bot_username = bot_username
             db_acc.bot_step_1_input = me.phone
             session.add(db_acc)
             session.commit()
-            
+
             # Sync to disk
             try:
                 from account_manager import account_config_path, save_json
                 save_json(account_config_path(db_acc.id), db_acc.to_dict())
             except Exception:
                 pass
-                
+
             print(f"Successfully auto-configured BOT for imported/logged in account {account_id}")
     except Exception as e:
         print(f"Failed to auto-configure BOT for account {account_id}: {e}")
@@ -4042,17 +4236,17 @@ async def check_and_update_bot_approval_status(account_id: str, client, session)
     """
     from db import AccountDb
     from telethon import types
-    
+
     db_acc = session.get(AccountDb, account_id)
     if not db_acc:
         return "not_started"
-        
+
     current_status = db_acc.bot_setup_status or "not_started"
     if current_status == "approved":
         return "approved"
-        
+
     bot_username = db_acc.bot_username or "RosePay_translation_bot"
-    
+
     # 1. First check if logged in and check local bot authorization files
     try:
         if client.is_connected() and await client.is_user_authorized():
@@ -4071,24 +4265,24 @@ async def check_and_update_bot_approval_status(account_id: str, client, session)
                     return "approved"
     except Exception as local_ex:
         print(f"Error in check_local_bot_approval within check_and_update: {local_ex}")
-        
+
     # 2. Fallback to Telegram message check
     if account_id not in client_locks:
         client_locks[account_id] = asyncio.Lock()
-        
+
     try:
         async with client_locks[account_id]:
             if not client.is_connected():
                 await client.connect()
             if not await client.is_user_authorized():
                 return current_status
-                
+
             # Get last 10 messages from bot
             messages = await client.get_messages(bot_username, limit=10)
-            
+
             is_approved = False
             has_contact_card = False
-            
+
             for m in messages:
                 text = m.text or ""
                 if "使用权限已通过" in text or "拥有使用权限" in text:
@@ -4098,7 +4292,7 @@ async def check_and_update_bot_approval_status(account_id: str, client, session)
                 if m.out and getattr(m, 'media', None):
                     if isinstance(m.media, types.MessageMediaContact):
                         has_contact_card = True
-                        
+
             new_status = current_status
             if is_approved:
                 new_status = "approved"
@@ -4113,7 +4307,7 @@ async def check_and_update_bot_approval_status(account_id: str, client, session)
                     print(f"Failed to sync approved state to local files: {sync_ex}")
             elif has_contact_card and current_status == "not_started":
                 new_status = "pending_approval"
-                
+
             if new_status != current_status:
                 db_acc.bot_setup_status = new_status
                 db_acc.bot_username = bot_username
@@ -4125,7 +4319,7 @@ async def check_and_update_bot_approval_status(account_id: str, client, session)
                     save_json(account_config_path(db_acc.id), db_acc.to_dict())
                 except Exception as e:
                     print(f"Failed to sync bot status to config: {e}")
-                    
+
             return new_status
     except Exception as e:
         print(f"Error checking bot approval status for {account_id}: {e}")
@@ -4141,10 +4335,10 @@ async def get_account_bot_status(account_id: str, user: dict = Depends(get_curre
             raise HTTPException(status_code=404, detail="Account not found")
         if user["username"] not in ("eason", "admin") and user["company"] != "admin" and db_acc.company != user["company"]:
             raise HTTPException(status_code=403, detail="Permission denied")
-        
+
         bot_username = db_acc.bot_username or "RosePay_translation_bot"
         current_status = db_acc.bot_setup_status or "not_started"
-        
+
         # If it is not approved yet, check message history with the bot to see if approval text exists
         if current_status != "approved":
             try:
@@ -4153,7 +4347,7 @@ async def get_account_bot_status(account_id: str, user: dict = Depends(get_curre
                     current_status = await check_and_update_bot_approval_status(account_id, client, session)
             except Exception as e:
                 print(f"Error checking bot approval status for {account_id}: {e}")
-                
+
         return {
             "account_id": account_id,
             "bot_setup_status": current_status,
@@ -4170,7 +4364,7 @@ async def start_account_bot_setup(account_id: str, user: dict = Depends(get_curr
             raise HTTPException(status_code=404, detail="Account not found")
         if user["username"] not in ("eason", "admin") and user["company"] != "admin" and db_acc.company != user["company"]:
             raise HTTPException(status_code=403, detail="Permission denied")
-            
+
         bot_username = "RosePay_translation_bot"
         try:
             import asyncio
@@ -4180,11 +4374,11 @@ async def start_account_bot_setup(account_id: str, user: dict = Depends(get_curr
                     await client.connect()
                 if not await client.is_user_authorized():
                     raise HTTPException(status_code=400, detail="账号未登录，无法配置 Bot")
-                
+
                 me = await client.get_me()
                 if not me or not me.phone:
                     raise HTTPException(status_code=400, detail="获取当前账号手机号失败")
-                
+
                 # 1. Check if already approved locally
                 if check_local_bot_approval(me.id, me.phone):
                     db_acc.bot_setup_status = "approved"
@@ -4197,14 +4391,14 @@ async def start_account_bot_setup(account_id: str, user: dict = Depends(get_curr
                     except Exception:
                         pass
                     return {"status": "success", "bot_setup_status": "approved"}
-                
+
                 # 2. Send /start
                 bot_entity = await client.get_input_entity(bot_username)
                 await client.send_message(bot_entity, "/start")
-                
+
                 # 3. Wait 1.5 seconds
                 await asyncio.sleep(1.5)
-                
+
                 # 4. Click the "apply_access" callback button if present
                 try:
                     messages = await client.get_messages(bot_entity, limit=5)
@@ -4223,10 +4417,10 @@ async def start_account_bot_setup(account_id: str, user: dict = Depends(get_curr
                                 break
                 except Exception as btn_ex:
                     print(f"Failed to click callback button: {btn_ex}")
-                
+
                 # 5. Wait 1.5 seconds
                 await asyncio.sleep(1.5)
-                
+
                 # 6. Send contact card
                 from telethon import types
                 await client.send_message(
@@ -4238,10 +4432,10 @@ async def start_account_bot_setup(account_id: str, user: dict = Depends(get_curr
                         vcard=""
                     )
                 )
-                
+
                 # 7. Wait 1.5 seconds for bot to process
                 await asyncio.sleep(1.5)
-                
+
                 # 8. Pin Dialog
                 try:
                     from telethon.tl.functions.messages import ToggleDialogPinRequest
@@ -4258,12 +4452,12 @@ async def start_account_bot_setup(account_id: str, user: dict = Depends(get_curr
                         ))
                 except Exception as pin_ex:
                     print(f"Pin dialog failed for {account_id}: {pin_ex}")
-                
+
                 # 9. Programmatically write local authorization to files
                 name = f"{me.first_name or ''} {me.last_name or ''}".strip() or f"User_{me.id}"
                 username = me.username or ""
                 approve_local_bot_access(me.id, me.phone, name, username)
-                
+
                 # 10. Send a message to the user from the bot using HTTP API
                 bot_token = None
                 try:
@@ -4277,16 +4471,16 @@ async def start_account_bot_setup(account_id: str, user: dict = Depends(get_curr
                                     break
                 except Exception as env_ex:
                     print(f"Failed to read BOT_TOKEN from bot .env: {env_ex}")
-                
+
                 if not bot_token:
                     bot_token = "8998918901:AAFSSlT0P1pWUdXgpVZ4weDFMUdcmTdCheI"
-                
+
                 if bot_token:
                     try:
                         import httpx
                         notification_text = "✅ 你的 RosePay 翻译机器人使用权限已通过。\n现在可以直接发送文字或使用 /tr 翻译。"
                         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-                        async with httpx.AsyncClient() as http_client:
+                        async with httpx.AsyncClient(**telegram_httpx_client_kwargs("web_server_translate_bot_api")) as http_client:
                             resp = await http_client.post(url, json={
                                 "chat_id": me.id,
                                 "text": notification_text
@@ -4297,21 +4491,21 @@ async def start_account_bot_setup(account_id: str, user: dict = Depends(get_curr
                                 print(f"Failed to send approval notification: {resp.text}")
                     except Exception as notify_ex:
                         print(f"Notification send exception: {notify_ex}")
-                    
+
             # 11. Update DB to approved
             db_acc.bot_setup_status = "approved"
             db_acc.bot_username = bot_username
             db_acc.bot_step_1_input = me.phone
             session.add(db_acc)
             session.commit()
-            
+
             # Sync to disk
             try:
                 from account_manager import account_config_path, save_json
                 save_json(account_config_path(db_acc.id), db_acc.to_dict())
             except Exception:
                 pass
-                
+
             return {"status": "success", "bot_setup_status": "approved"}
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"与 Bot 静默配置并自动审批失败: {str(e)}")
@@ -4335,11 +4529,11 @@ def create_new_account(req: AccountCreateRequest, user: dict = Depends(get_curre
     name = req.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Account name cannot be empty")
-    
+
     # Generate account ID
     from account_manager import account_id_from_name
     account_id = account_id_from_name(name)
-    
+
     # Check if exists in DB
     from db import engine, AccountDb, Session
     with Session(engine) as session:
@@ -4367,16 +4561,16 @@ def create_new_account(req: AccountCreateRequest, user: dict = Depends(get_curre
         config["created_by"] = user["username"]
         config["updated_by"] = user["username"]
         config["owner_username"] = user["username"]
-        
+
         # Save to DB
         db_account = AccountDb.from_dict(account_id, config)
         session.add(db_account)
         session.commit()
-        
+
         # Sync to disk
         path = account_config_path(account_id)
         save_json(path, db_account.to_dict())
-        
+
     return {"id": account_id, "name": name}
 
 @app.post("/api/accounts/{account_id}/config")
@@ -4400,7 +4594,7 @@ def update_account_config(account_id: str, req: AccountConfigRequest, user: dict
         db_account.proxy_username = req.proxy.username
         db_account.proxy_password = req.proxy.password
         db_account.updated_by = user["username"]
-        
+
         if user["role"] == "admin":
             if req.owner_username is not None:
                 db_account.owner_username = req.owner_username.strip()
@@ -4415,16 +4609,16 @@ def update_account_config(account_id: str, req: AccountConfigRequest, user: dict
                     if not target_user or target_user.company != user["company"]:
                         raise HTTPException(status_code=403, detail="只能指派归属给同公司的成员")
                     db_account.owner_username = target_owner
-        
+
         session.add(db_account)
         session.commit()
-        
+
         config = db_account.to_dict()
-        
+
         # Sync to disk
         path = account_config_path(account_id)
         save_json(path, config)
-        
+
     # Close any active client in memory to force reloading config
     close_active_client_after_config_change(account_id)
 
@@ -4453,20 +4647,20 @@ def update_local_credentials(account_id: str, req: LocalCredentialsRequest, user
     from db import engine, AccountDb, Session
     with Session(engine) as session:
         db_account = session.get(AccountDb, account_id)
-        
+
         if req.pass2fa is not None:
             db_account.pass2fa = req.pass2fa.strip() or None
         if req.page_id is not None:
             db_account.page_id = req.page_id.strip() or None
         db_account.updated_by = user["username"]
-            
+
         session.add(db_account)
         session.commit()
-        
+
         config = db_account.to_dict()
         path = account_config_path(account_id)
         save_json(path, config)
-        
+
     return {"status": "success", "config": config}
 
 @app.delete("/api/accounts/{account_id}")
@@ -4474,7 +4668,7 @@ async def delete_account(account_id: str, user: dict = Depends(get_current_user)
     """Deletes an account configuration and its session files.
     Admins can delete any account. Normal users (employees) can only delete accounts that are NOT authorized (never logged in successfully)."""
     db_account = check_account_company(account_id, user)
-    
+
     # 权限校验：如果当前账号已经是已登录成功状态，普通员工无权删除
     is_auth = False
     try:
@@ -4482,7 +4676,7 @@ async def delete_account(account_id: str, user: dict = Depends(get_current_user)
         is_auth = bool(status.get("is_authorized") or status.get("auth_status") == "authorized")
     except Exception:
         pass
-        
+
     if is_auth and user.get("role") != "admin" and user.get("username") not in ("eason", "admin"):
         raise HTTPException(status_code=403, detail="只有管理员才能删除已成功登录的托管账号")
 
@@ -4539,7 +4733,7 @@ async def delete_account(account_id: str, user: dict = Depends(get_current_user)
                 target.unlink()
             except Exception:
                 pass
-                
+
     # Also delete sessions directory if empty
     sessions_dir = base_dir / "sessions" / account_id
     if sessions_dir.exists() and sessions_dir.is_dir():
@@ -4608,7 +4802,7 @@ async def update_profile_name(account_id: str, req: ProfileNameRequest, user: di
             last_name=req.last_name or "",
             about=about_text
         ))
-        
+
         # Update database
         from db import engine, AccountDb, Session
         new_name = f"{req.first_name} {req.last_name or ''}".strip()
@@ -4875,11 +5069,11 @@ async def check_telegram_username(account_id: str, username: str, user: dict = D
         is_auth = await client.is_user_authorized()
         if not is_auth:
             raise HTTPException(status_code=401, detail="Account is not authorized")
-        
+
         clean_username = username.strip().replace("@", "")
         if len(clean_username) < 5:
             return {"available": False, "reason": "用户名必须至少5个字符"}
-            
+
         from telethon.tl import functions
         result = await client(functions.account.CheckUsernameRequest(username=clean_username))
         return {"available": bool(result)}
@@ -4948,13 +5142,13 @@ for c in CELEBRITIES:
 def generate_unique_fake_name(used_names: set) -> dict:
     import random
     from historical_names import HISTORICAL_FIGURES
-    
+
     # Filter candidates to avoid using names that are already taken
     candidates = [x for x in HISTORICAL_FIGURES if x["name"] not in used_names]
-    
+
     if candidates:
         return random.choice(candidates)
-        
+
     # Fallback to avoid infinite loops if the entire database of 400+ names is exhausted
     base = random.choice(HISTORICAL_FIGURES)
     suffix = str(random.randint(2, 99))
@@ -4978,7 +5172,7 @@ async def batch_update_profiles(req: BatchUpdateProfileRequest, user: dict = Dep
     import random
     success_list = []
     failed_list = []
-    
+
     used_names_set = set()
     try:
         from db import engine, AccountDb, Session, select
@@ -4993,7 +5187,7 @@ async def batch_update_profiles(req: BatchUpdateProfileRequest, user: dict = Dep
                         used_names_set.add(acc.profile_modified_name.strip())
     except Exception as dbe:
         print(f"Failed to fetch existing used names: {dbe}")
-        
+
     for idx, account_id in enumerate(req.account_ids):
         try:
             client = await get_client(account_id)
@@ -5001,7 +5195,7 @@ async def batch_update_profiles(req: BatchUpdateProfileRequest, user: dict = Dep
             if not is_authorized:
                 failed_list.append({"account_id": account_id, "error": "账号未登录"})
                 continue
-                
+
             if req.only_about:
                 about_text = req.about.strip() if req.about is not None else ""
                 if len(about_text) > 70:
@@ -5009,7 +5203,7 @@ async def batch_update_profiles(req: BatchUpdateProfileRequest, user: dict = Dep
                 await client(functions.account.UpdateProfileRequest(
                     about=about_text
                 ))
-                
+
                 # Update database and local configuration
                 try:
                     from db import engine, AccountDb, Session
@@ -5020,10 +5214,10 @@ async def batch_update_profiles(req: BatchUpdateProfileRequest, user: dict = Dep
                             db_account.updated_by = user["username"]
                             session.add(db_account)
                             session.commit()
-                            
+
                             path = account_config_path(account_id)
                             save_json(path, db_account.to_dict())
-                    
+
                     set_account_status(
                         account_id,
                         {"is_connected": True, "is_authorized": True},
@@ -5031,17 +5225,17 @@ async def batch_update_profiles(req: BatchUpdateProfileRequest, user: dict = Dep
                     )
                 except Exception as se:
                     print(f"Failed to save modified flag in DB: {str(se)}")
-                    
+
                 success_list.append({"account_id": account_id})
                 continue
-                
+
             last_name = req.last_name.strip()
-            
+
             username_success = False
             username_to_try = ""
             first_name = ""
             username_error = "未知错误"
-            
+
             # Try up to 8 different names to find a completely unique available username
             for attempt_name in range(8):
                 if req.virtual_modify:
@@ -5053,13 +5247,13 @@ async def batch_update_profiles(req: BatchUpdateProfileRequest, user: dict = Dep
                     first_name = req.custom_first_name.strip() or "User"
                     prefix = req.custom_username_prefix.strip() or f"{last_name}_user"
                     base_username = f"{prefix}_{idx + attempt_name + 1}".strip().replace("@", "")
-                
+
                 username_cleaned = re.sub(r'[^a-zA-Z0-9_]', '', base_username)
                 if len(username_cleaned) < 5:
                     username_cleaned = username_cleaned.ljust(5, '0')
-                
+
                 username_to_try = username_cleaned
-                
+
                 # Check username availability directly on Telegram
                 try:
                     from telethon.tl import functions
@@ -5070,7 +5264,7 @@ async def batch_update_profiles(req: BatchUpdateProfileRequest, user: dict = Dep
                         continue
                 except Exception as ce:
                     print(f"CheckUsernameRequest failed for {username_to_try}: {ce}")
-                    
+
                 # Attempt to set the username
                 try:
                     await client(functions.account.UpdateUsernameRequest(username=username_to_try))
@@ -5083,7 +5277,7 @@ async def batch_update_profiles(req: BatchUpdateProfileRequest, user: dict = Dep
                     print(f"UpdateUsernameRequest failed for {username_to_try}: {ue}")
                     if req.virtual_modify:
                         used_names_set.add(first_name)
-            
+
             # Suffix fallback if all 8 names are occupied
             if not username_success and username_to_try:
                 for fallback_attempt in range(5):
@@ -5098,19 +5292,19 @@ async def batch_update_profiles(req: BatchUpdateProfileRequest, user: dict = Dep
                         break
                     except Exception as fe:
                         username_error = str(fe)
-            
+
             # Now set the profile display name and about on Telegram
             about_text = req.about.strip() if req.about is not None else None
             if about_text and len(about_text) > 70:
                 about_text = about_text[:70]
-                
+
             from telethon.tl import functions
             await client(functions.account.UpdateProfileRequest(
                 first_name=last_name,
                 last_name=first_name,
                 about=about_text
             ))
-            
+
             # Update database and local configuration
             try:
                 from db import engine, AccountDb, Session
@@ -5125,10 +5319,10 @@ async def batch_update_profiles(req: BatchUpdateProfileRequest, user: dict = Dep
                         db_account.updated_by = user["username"]
                         session.add(db_account)
                         session.commit()
-                        
+
                         path = account_config_path(account_id)
                         save_json(path, db_account.to_dict())
-                
+
                 username_str = f"@{username_to_try}" if (username_success and username_to_try) else ""
                 set_account_status(
                     account_id,
@@ -5141,7 +5335,7 @@ async def batch_update_profiles(req: BatchUpdateProfileRequest, user: dict = Dep
                 )
             except Exception as se:
                 print(f"Failed to save modified flag in DB: {str(se)}")
-                
+
             if username_success:
                 success_list.append({
                     "account_id": account_id,
@@ -5156,10 +5350,10 @@ async def batch_update_profiles(req: BatchUpdateProfileRequest, user: dict = Dep
                     "last_name": last_name,
                     "username": "修改失败: " + username_error
                 })
-                
+
         except Exception as e:
             failed_list.append({"account_id": account_id, "error": str(e)})
-            
+
     return {
         "status": "success",
         "success_count": len(success_list),
@@ -5334,12 +5528,12 @@ async def upload_to_avatar_library(
             content = await file.read()
             if len(content) > 10 * 1024 * 1024:
                 raise HTTPException(status_code=400, detail=f"文件 {file.filename} 超过10MB大小限制")
-            
+
             # Sanitize filename
             safe_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', file.filename)
             if not safe_name or safe_name.startswith('.'):
                 safe_name = f"avatar_{int(time.time())}.jpg"
-                
+
             base, ext = os.path.splitext(safe_name)
             # Ensure unique name
             counter = 1
@@ -5347,7 +5541,7 @@ async def upload_to_avatar_library(
             while (AVATARS_DIR / filename).exists():
                 filename = f"{base}_{counter}{ext}"
                 counter += 1
-                
+
             target_path = AVATARS_DIR / filename
             target_path.write_bytes(content)
             uploaded_files.append(filename)
@@ -5362,11 +5556,11 @@ async def delete_from_avatar_library(filename: str, user: dict = Depends(get_cur
     """Deletes a file from the avatar library."""
     if '/' in filename or '\\' in filename or filename in ('.', '..'):
         raise HTTPException(status_code=400, detail="非法文件名")
-    
+
     target_path = AVATARS_DIR / filename
     if not target_path.exists():
         raise HTTPException(status_code=404, detail="文件不存在")
-        
+
     try:
         target_path.unlink()
         return {"status": "success", "message": "删除成功"}
@@ -5378,29 +5572,29 @@ async def rename_in_avatar_library(req: RenameRequest, user: dict = Depends(get_
     """Renames a file in the avatar library."""
     old_name = req.old_name.strip()
     new_name = req.new_name.strip()
-    
+
     if '/' in old_name or '\\' in old_name or old_name in ('.', '..'):
         raise HTTPException(status_code=400, detail="非法旧文件名")
     if '/' in new_name or '\\' in new_name or new_name in ('.', '..'):
         raise HTTPException(status_code=400, detail="非法新文件名")
-        
+
     old_path = AVATARS_DIR / old_name
     if not old_path.exists():
         raise HTTPException(status_code=404, detail="原文件不存在")
-        
+
     # Sanitize new_name
     new_name_clean = re.sub(r'[^a-zA-Z0-9_.-]', '_', new_name)
     old_base, old_ext = os.path.splitext(old_name)
     new_base, new_ext = os.path.splitext(new_name_clean)
-    
+
     # Force original extension if missing or altered
     if new_ext.lower() != old_ext.lower():
         new_name_clean = new_base + old_ext
-        
+
     new_path = AVATARS_DIR / new_name_clean
     if new_path.exists() and old_name != new_name_clean:
         raise HTTPException(status_code=400, detail="目标文件名已存在")
-        
+
     try:
         old_path.rename(new_path)
         return {"status": "success", "filename": new_name_clean}
@@ -5412,11 +5606,11 @@ async def serve_avatar_file(filename: str):
     """Serves a file from the avatar library for previewing."""
     if '/' in filename or '\\' in filename or filename in ('.', '..'):
         raise HTTPException(status_code=400, detail="非法文件名")
-    
+
     target_path = AVATARS_DIR / filename
     if not target_path.exists() or not target_path.is_file():
         raise HTTPException(status_code=404, detail="文件不存在")
-        
+
     return FileResponse(target_path)
 
 class LoginLogCreate(BaseModel):
@@ -5460,7 +5654,7 @@ def get_login_logs(limit: int = 100, user: dict = Depends(get_current_user)):
         else:
             stmt_check = select(LoginLogDb).where(LoginLogDb.company == user["company"]).limit(1)
         has_logs = session.exec(stmt_check).first()
-        
+
         if not has_logs:
             # Pre-populate with existing successful accounts from DB for this company (unless eason)
             stmt_accounts = query_allowed_accounts(session, user)
@@ -5480,7 +5674,7 @@ def get_login_logs(limit: int = 100, user: dict = Depends(get_current_user)):
                     )
                     session.add(new_log)
                 session.commit()
-                
+
         if user["role"] == "admin":
             stmt = select(LoginLogDb).order_by(LoginLogDb.id.desc()).limit(limit)
         else:
@@ -5587,7 +5781,7 @@ async def batch_update_accounts_2fa(req: BatchUpdate2faRequest, user: dict = Dep
     import string
     success_list = []
     failed_list = []
-    
+
     current_pwd = req.current_password.strip() if req.current_password else None
     hint = req.hint.strip() if (req.hint and req.hint.strip()) else "rosepay"
     def generate_secure_password(length=12):
@@ -5635,7 +5829,7 @@ async def batch_update_accounts_2fa(req: BatchUpdate2faRequest, user: dict = Dep
                     )
                 else:
                     raise e
-            
+
             # Update DB and JSON config
             with Session(engine) as session:
                 db_account = session.get(AccountDb, account_id)
@@ -5644,14 +5838,14 @@ async def batch_update_accounts_2fa(req: BatchUpdate2faRequest, user: dict = Dep
                     db_account.updated_by = user["username"]
                     session.add(db_account)
                     session.commit()
-                    
+
                     path = account_config_path(account_id)
                     save_json(path, db_account.to_dict())
             success_list.append({
                 "account_id": account_id,
                 "new_password": new_pwd
             })
-            
+
         except Exception as e:
             failed_list.append({"account_id": account_id, "error": str(e)})
     return {
@@ -5937,12 +6131,12 @@ def delete_group_category(name: str, user: dict = Depends(get_current_user)):
         cat = session.exec(stmt).first()
         if not cat:
             raise HTTPException(status_code=404, detail="未找到该类型")
-        
+
         # Check if in use by groups
         group_using = session.exec(select(GroupDb).where(GroupDb.category == name)).first()
         if group_using:
             raise HTTPException(status_code=400, detail=f"类型 '{name}' 正在被群组使用，请先修改这些群组的类型后再删除。")
-            
+
         session.delete(cat)
         session.commit()
     return {"status": "success"}
@@ -5960,20 +6154,20 @@ def rename_group_category(req: RenameCategoryRequest, user: dict = Depends(get_c
         cat = session.exec(select(GroupCategoryDb).where(GroupCategoryDb.name == old_name)).first()
         if not cat:
             raise HTTPException(status_code=404, detail="未找到该类型")
-        
+
         existing = session.exec(select(GroupCategoryDb).where(GroupCategoryDb.name == new_name)).first()
         if existing:
             raise HTTPException(status_code=400, detail=f"类型 '{new_name}' 已存在")
-            
+
         cat.name = new_name
         session.add(cat)
-        
+
         # Update all groups using this category
         groups_to_update = session.exec(select(GroupDb).where(GroupDb.category == old_name)).all()
         for g in groups_to_update:
             g.category = new_name
             session.add(g)
-            
+
         session.commit()
     return {"status": "success"}
 
@@ -6088,7 +6282,7 @@ async def sync_groups_status(user: dict = Depends(get_current_user)):
     import random
     logs = []
     logs.append("开始从 Telegram 更新群组状态与成员数。")
-    
+
     # 0. 重置 group_categories 表，确保系统内置分类为这四个新分类
     try:
         from sqlmodel import text
@@ -6103,7 +6297,7 @@ async def sync_groups_status(user: dict = Depends(get_current_user)):
     except Exception as reset_err:
         print(f"Failed to reset group categories: {reset_err}")
         logs.append(f"重置系统内置分类失败 (将继续同步): {reset_err}")
-    
+
     # Get all account IDs of this user's company
     with Session(engine) as session:
         stmt = query_allowed_accounts(session, user)
@@ -6118,7 +6312,7 @@ async def sync_groups_status(user: dict = Depends(get_current_user)):
             client = c
             selected_account_id = account_id
             break
-            
+
     if not client:
         # Check list of accounts to see if any can be connected and verified
         from account_manager import list_accounts
@@ -6138,7 +6332,7 @@ async def sync_groups_status(user: dict = Depends(get_current_user)):
 
     if not client:
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail="检测到未登录任何电报账号。请先到“账号登录”页面成功登录一个账号后重试。"
         )
     logs.append(f"执行账号：{account_names.get(selected_account_id or '', selected_account_id or '未知账号')}，开始建立群组缓存。")
@@ -6149,7 +6343,7 @@ async def sync_groups_status(user: dict = Depends(get_current_user)):
             groups = session.exec(select(GroupDb)).all()
         else:
             groups = session.exec(select(GroupDb).where(GroupDb.company == user["company"])).all()
-        
+
     if not groups:
         return {"status": "success", "message": "群组列表为空，无需同步", "groups": [], "logs": logs}
 
@@ -6170,7 +6364,7 @@ async def sync_groups_status(user: dict = Depends(get_current_user)):
     disabled_count = 0
     invalid_groups = []
     total_groups = len(groups)
-    
+
     # We will update groups one by one
     with Session(engine) as session:
         for index, group in enumerate(groups, start=1):
@@ -6178,7 +6372,7 @@ async def sync_groups_status(user: dict = Depends(get_current_user)):
             is_valid = True
             original_title = group.title
             logs.append(f"[{index}/{total_groups}] 开始检测群组：{group.title or group.id}，执行账号：{account_names.get(selected_account_id or '', selected_account_id or '未知账号')}。")
-            
+
             # Check if this is a private invite link group
             if group.id and group.id.startswith("invite_"):
                 invite_hash = group.id.replace("invite_", "")
@@ -6206,7 +6400,7 @@ async def sync_groups_status(user: dict = Depends(get_current_user)):
                 entity = entities_map.get(group.id)
                 if not entity and group.username:
                     entity = entities_map.get(group.username.lower())
-                    
+
             # If not in cache, try to resolve via API
             if is_valid and not entity:
                 try:
@@ -6219,7 +6413,7 @@ async def sync_groups_status(user: dict = Depends(get_current_user)):
                             clean_id = int(group.id)
                         except ValueError:
                             pass
-                        
+
                         if clean_id is not None:
                             try:
                                 # Try channel/supergroup peer first, then chat peer
@@ -6255,13 +6449,13 @@ async def sync_groups_status(user: dict = Depends(get_current_user)):
                     participants_count = getattr(entity, "participants_count", None)
                     if participants_count is not None:
                         group.memberCount = participants_count
-                    
+
                     # === 核心增加：跑消息分析，将广告分类划归为 "中文长", "中文短", "英文长", "英文短" ===
                     try:
                         import re
                         input_peer = await client.get_input_entity(entity)
                         msgs = await client.get_messages(input_peer, limit=10)
-                        
+
                         # 1. 判定字数限制
                         msg_lengths = [len(m.message) for m in msgs if m.message]
                         is_short_ad = False
@@ -6269,18 +6463,18 @@ async def sync_groups_status(user: dict = Depends(get_current_user)):
                             max_len = max(msg_lengths)
                             if max_len < 200:
                                 is_short_ad = True
-                                
+
                         # 2. 判定语言 (中英文)，综合考虑群名和活跃发言
                         has_chinese_name = False
                         g_title = getattr(entity, "title", "") or ""
                         if g_title:
                             has_chinese_name = bool(re.search(r"[\u4e00-\u9fa5]", g_title)) or "🇨🇳" in g_title
-                            
+
                         text_messages = [m.message for m in msgs if m.message]
                         has_messages = len(text_messages) > 0
                         combined_text = "".join(text_messages)
                         has_chinese_messages = bool(re.search(r"[\u4e00-\u9fa5]", combined_text))
-                        
+
                         is_chinese = False
                         if has_messages:
                             if has_chinese_messages:
@@ -6288,7 +6482,7 @@ async def sync_groups_status(user: dict = Depends(get_current_user)):
                         else:
                             if has_chinese_name:
                                 is_chinese = True
-                                
+
                         # 3. 决定新的 category
                         if is_chinese:
                             if is_short_ad:
@@ -6300,7 +6494,7 @@ async def sync_groups_status(user: dict = Depends(get_current_user)):
                                 new_cat = "英文短"
                             else:
                                 new_cat = "英文长"
-                                
+
                         group.category = new_cat
                         logs.append(f"[{index}/{total_groups}] 群组分类重构：'{group.title}' -> 判定为 '{new_cat}' (字数: {'短' if is_short_ad else '长'}, 语言: {'中文' if is_chinese else '英文'})")
                     except Exception as cat_err:
@@ -6310,7 +6504,7 @@ async def sync_groups_status(user: dict = Depends(get_current_user)):
                         new_cat = "中文长" if has_chinese_name else "英文长"
                         group.category = new_cat
                         logs.append(f"[{index}/{total_groups}] 拉取消息判定失败，退回名字判定：'{group.title}' -> 判定为 '{new_cat}'，原因：{cat_err}")
-                        
+
                     scores = apply_group_library_scores(group, is_valid=True)
                     session.add(group)
                     updated_count += 1
@@ -6338,7 +6532,7 @@ async def sync_groups_status(user: dict = Depends(get_current_user)):
                 logs.append(f"[{index}/{total_groups}] 等待 {wait_seconds} 秒后继续检测下一个群组。")
                 if wait_seconds:
                     await asyncio.sleep(wait_seconds)
-                    
+
         session.commit()
 
     logs.append(f"状态同步结束：检测 {total_groups} 个群组，更新 {updated_count} 个，本次禁用 {disabled_count} 个，失效 {len(invalid_groups)} 个。")
@@ -6360,29 +6554,29 @@ async def analyze_group_category_with_ai(title: str, description: str, recent_ms
     import json
     import re
     from datetime import datetime, timezone
-    
+
     # 动态获取系统中的 API 密钥
     deepseek_api_key = get_deepseek_api_key()
     gemini_api_key = get_gemini_api_key()
-    
+
     # 提取纯文本列表
     messages_text = [m.text for m in recent_msgs if m.text]
-    
+
     # 计算消息时间差与活跃指标
     time_metrics_str = "【近期消息时间分析】: 暂无消息时间指标"
     avg_interval_mins = 9999.0
     latest_age_hours = 9999.0
-    
+
     if len(recent_msgs) >= 2:
         first_date = recent_msgs[0].date
         last_date = recent_msgs[-1].date
-        
+
         total_span_secs = (first_date - last_date).total_seconds()
         avg_interval_mins = (total_span_secs / (len(recent_msgs) - 1)) / 60.0
-        
+
         now_utc = datetime.now(timezone.utc)
         latest_age_hours = (now_utc - first_date).total_seconds() / 3600.0
-        
+
         time_metrics_str = f"【近期消息时间分析】:\n"
         time_metrics_str += f"- 最新一条消息发送时间: {first_date.strftime('%Y-%m-%d %H:%M:%S')} UTC (距今约 {latest_age_hours:.2f} 小时)\n"
         time_metrics_str += f"- 最近 {len(recent_msgs)} 条消息时间总跨度: {total_span_secs/3600.0:.2f} 小时\n"
@@ -6399,7 +6593,7 @@ async def analyze_group_category_with_ai(title: str, description: str, recent_ms
         clean_msg = str(msg).replace("\n", " ").strip()[:100]
         formatted_msgs.append(f"{idx}. {clean_msg}")
     messages_str = "\n".join(formatted_msgs) if formatted_msgs else "(暂无近期文字消息)"
-    
+
     prompt = f"""
 你是一个专业的电报群发拓客与风控分析 AI。请根据以下电报群组的元数据、近期消息、发言权限及物理时间分析，进行全方位智能判定。
 
@@ -6492,16 +6686,16 @@ async def analyze_group_category_with_ai(title: str, description: str, recent_ms
     content_sample = (title + " " + " ".join(messages_text)).strip()
     chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', content_sample))
     english_words = len(re.findall(r'[a-zA-Z]+', content_sample))
-    
+
     lang = "中文" if chinese_chars * 2 > english_words else "英文"
-    
+
     # 判定长短：是否有消息大于 120 字符
     has_long = any(len(str(m)) > 120 for m in messages_text)
     length = "长" if has_long else "短"
-    
+
     is_active = len(messages_text) >= 3
     is_valid = len(messages_text) > 0
-    
+
     return {
         "category": f"{lang}{length}",
         "is_active": is_active,
@@ -6715,16 +6909,16 @@ async def stream_groups_sync(token: Optional[str] = None):
                             # 3. 调用 AI 智能进行分类诊断与风控评估
                             yield log(f"[{index}/{total_groups}] 正在请 AI 智能评估群组「{original_title}」的历史消息与风控...")
                             ai_res = await analyze_group_category_with_ai(group.title, getattr(entity, "about", "") or "", recent_msgs, perms_str)
-                            
+
                             # 4. 应用 AI 评估结论更新群组属性
                             if ai_res:
                                 old_cat = group.category
                                 group.category = ai_res.get("category", group.category)
-                                
+
                                 # 根据 AI 的有效性判定决定是否启用
                                 is_group_valid = bool(ai_res.get("is_valid", True))
                                 group.enabled = is_group_valid
-                                
+
                                 # 写入 AI 的判定日志到弹窗流中
                                 yield log(f"[{index}/{total_groups}] AI 评估 ➔ 类型: {group.category} | 活跃: {ai_res.get('is_active')} | 有效: {group.enabled} | 依据: {ai_res.get('reason')}")
                                 if ai_res.get("is_highly_moderated"):
@@ -6846,7 +7040,7 @@ async def resolve_group(req: GroupResolveRequest, user: dict = Depends(get_curre
         if account_id in allowed_account_ids and c.is_connected() and await c.is_user_authorized():
             client = c
             break
-            
+
     if not client:
         # Check list of accounts to see if any can be connected and verified
         from account_manager import list_accounts
@@ -6865,7 +7059,7 @@ async def resolve_group(req: GroupResolveRequest, user: dict = Depends(get_curre
 
     if not client:
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail="检测到未登录任何电报账号。请先到“账号登录”页面成功登录一个账号后重试。"
         )
 
@@ -6924,7 +7118,7 @@ async def resolve_group(req: GroupResolveRequest, user: dict = Depends(get_curre
                 raise HTTPException(status_code=400, detail="该链接指向的是个人账户，群组库只允许添加群组或频道。")
 
             chat_type = "channel" if getattr(entity, "broadcast", False) else "group"
-            
+
             # Get participant count
             member_count = 0
             try:
@@ -6932,7 +7126,7 @@ async def resolve_group(req: GroupResolveRequest, user: dict = Depends(get_curre
                     full_chat = await client(functions.messages.GetFullChatRequest(chat_id=entity.id))
                 else:
                     full_chat = await client(functions.channels.GetFullChannelRequest(channel=entity))
-                
+
                 if hasattr(full_chat, "full_chat") and hasattr(full_chat.full_chat, "participants_count"):
                     member_count = full_chat.full_chat.participants_count
                 elif hasattr(full_chat, "chats") and len(full_chat.chats) > 0:
@@ -6964,7 +7158,7 @@ async def resolve_group(req: GroupResolveRequest, user: dict = Depends(get_curre
         )
         if db_group:
             raise HTTPException(status_code=400, detail=f"群组/频道 '{res_data['title']}' 已在列表中，无需重复添加")
-        
+
         new_db_group = GroupDb(
             id=str(res_data["id"]),
             company=user["company"],
@@ -6993,7 +7187,7 @@ async def update_account_name_from_tg(account_id: str, client):
                 tg_name = f"{first_name} {last_name}".strip()
                 if not tg_name:
                     tg_name = me.username or "未命名电报号"
-                
+
                 from db import engine, AccountDb, Session
                 with Session(engine) as session:
                     db_account = session.get(AccountDb, account_id)
@@ -7001,28 +7195,28 @@ async def update_account_name_from_tg(account_id: str, client):
                         curr_name = db_account.account_name.strip() if db_account.account_name else ""
                         username_changed = False
                         name_changed = False
-                        
+
                         if curr_name != tg_name:
                             db_account.account_name = tg_name
                             name_changed = True
-                            
+
                         # Keep profile_modified_name in sync with tg_name if different
                         if db_account.profile_modified_name != tg_name:
                             db_account.profile_modified_name = tg_name
                             name_changed = True
-                            
+
                         # Save the current username in DB (even if deleted on TG)
                         clean_username = me.username.strip() if me.username else ""
                         current_db_username = db_account.profile_modified_username or ""
                         if current_db_username != clean_username:
                             db_account.profile_modified_username = clean_username if clean_username else None
                             username_changed = True
-                            
+
                         if name_changed or username_changed:
-                            
+
                             session.add(db_account)
                             session.commit()
-                            
+
                             # Also sync to disk JSON config
                             try:
                                 path = account_config_path(account_id)
@@ -7044,11 +7238,11 @@ async def get_spambot_status(client) -> dict:
         entity = await client.get_input_entity('spambot')
         # Send /start
         await client.send_message(entity, '/start')
-        
+
         # Wait a short moment for response to arrive
         import asyncio
         await asyncio.sleep(1.5)
-        
+
         # Fetch the latest message from @SpamBot
         messages = await client.get_messages(entity, limit=1)
         if messages:
@@ -7080,7 +7274,7 @@ async def get_login_status(account_id: str, force: bool = False, user: dict = De
         spambot_time = None
         db_acc = None
         check_warnings = []
-        
+
         if is_authorized:
             try:
                 me = await asyncio.wait_for(client.get_me(), timeout=8)
@@ -7240,7 +7434,7 @@ async def login_send_code(req: LoginStartRequest, user: dict = Depends(get_curre
         from db import engine, AccountDb, Session
         with Session(engine) as session:
             db_account = session.get(AccountDb, account_id)
-            
+
         config_path = account_config_path(account_id)
         if not db_account:
             # Create config in DB and sync to disk
@@ -7258,7 +7452,7 @@ async def login_send_code(req: LoginStartRequest, user: dict = Depends(get_curre
                 }
             else:
                 template = load_json(template_path)
-            
+
             config = build_account_config(account_id, phone, template)
             config["company"] = user["company"]
             config["created_by"] = user["username"]
@@ -7266,7 +7460,7 @@ async def login_send_code(req: LoginStartRequest, user: dict = Depends(get_curre
             config["owner_username"] = user["username"]
             if req.page_id:
                 config["page_id"] = req.page_id
-            
+
             with Session(engine) as session:
                 new_db_acc = AccountDb.from_dict(account_id, config)
                 session.add(new_db_acc)
@@ -7356,7 +7550,7 @@ async def login_submit_code(req: LoginSubmitRequest, background_tasks: Backgroun
         except SessionPasswordNeededError:
             if not pass2fa:
                 return {"status": "2fa_required", "message": "Two-factor authentication (2FA) password is required"}
-            
+
             # Submit 2FA password
             await client.sign_in(password=pass2fa)
             login_states.pop(account_id, None)
@@ -7371,7 +7565,7 @@ async def login_submit_code(req: LoginSubmitRequest, background_tasks: Backgroun
                     db_account.profile_modified = (pass2fa != "" and pass2fa != "0000")
                     session.add(db_account)
                     session.commit()
-                    
+
                     # Sync back to json config file
                     path = account_config_path(account_id)
                     save_json(path, db_account.to_dict())
@@ -7407,7 +7601,7 @@ async def login_submit_code(req: LoginSubmitRequest, background_tasks: Backgroun
             background_tasks.add_task(auto_trigger_bot_setup_for_account, account_id, client)
 
             return {"status": "success", "message": "Logged in successfully with 2FA"}
-            
+
     except Exception as e:
         set_account_status(
             account_id,
@@ -7421,11 +7615,11 @@ async def login_quick_import(req: QuickImportRequest, background_tasks: Backgrou
     import_str = req.import_string.strip()
     if "----" not in import_str:
         raise HTTPException(status_code=400, detail="导入格式不正确。应为: 手机号----接码网址或UUID")
-        
+
     parts = import_str.split("----")
     phone = parts[0].strip()
     page_id = parts[1].strip()
-    
+
     # Clean phone number
     if phone.startswith("+"):
         phone_clean = "+" + "".join([c for c in phone[1:] if c.isdigit()])
@@ -7433,17 +7627,17 @@ async def login_quick_import(req: QuickImportRequest, background_tasks: Backgrou
         phone_clean = "".join([c for c in phone if c.isdigit()])
         if not phone_clean.startswith("+"):
             phone_clean = "+" + phone_clean
-            
+
     phone = phone_clean
 
     from account_manager import account_id_from_name
     account_id = account_id_from_name(phone)
-    
+
     # Check if exists in DB first
     from db import engine, AccountDb, Session
     with Session(engine) as session:
         db_account = session.get(AccountDb, account_id)
-        
+
     config_path = account_config_path(account_id)
 
     if not db_account:
@@ -7462,7 +7656,7 @@ async def login_quick_import(req: QuickImportRequest, background_tasks: Backgrou
             }
         else:
             template = load_json(template_path)
-        
+
         config = build_account_config(account_id, phone, template)
         config["company"] = user["company"]
         config["page_id"] = page_id
@@ -7545,13 +7739,13 @@ async def fetch_recent_official_codes(account_id: str, client: TelegramClient):
         if not await client.is_user_authorized():
             add_login_log(account_id, "获取历史消息失败：账号未授权")
             return
-        
+
         # Get messages from official sender 777000
         messages = await client.get_messages(777000, limit=5)
         if not messages:
             add_login_log(account_id, "未发现官方通知历史消息")
             return
-            
+
         import datetime
         added_count = 0
         for msg in messages:
@@ -7562,10 +7756,10 @@ async def fetch_recent_official_codes(account_id: str, client: TelegramClient):
                     timestamp = msg_date.timestamp()
                 else:
                     timestamp = time.time()
-                    
+
                 if account_id not in official_messages_store:
                     official_messages_store[account_id] = []
-                    
+
                 # Avoid duplicates
                 exists = any(m["text"] == text and abs(m["timestamp"] - timestamp) < 5 for m in official_messages_store[account_id])
                 if not exists:
@@ -7574,19 +7768,19 @@ async def fetch_recent_official_codes(account_id: str, client: TelegramClient):
                         "timestamp": timestamp
                     })
                     added_count += 1
-                    
+
                 # Also check for codes
                 match = re.search(r"Login code\s*:?\s*(\d+)", text, re.IGNORECASE)
                 if not match:
                     match = re.search(r"(?:code|验证码)[:：\s]+(\d+)", text, re.IGNORECASE)
                 if not match:
                     match = re.search(r"\b(\d{5,6})\b", text)
-                    
+
                 if match:
                     code = match.group(1)
                     if account_id not in captured_login_codes:
                         captured_login_codes[account_id] = []
-                    
+
                     exists_code = any(c["code"] == code and abs(c["timestamp"] - timestamp) < 10 for c in captured_login_codes[account_id])
                     if not exists_code:
                         captured_login_codes[account_id].append({
@@ -7596,14 +7790,14 @@ async def fetch_recent_official_codes(account_id: str, client: TelegramClient):
                         })
                         # Keep last 10 codes
                         captured_login_codes[account_id] = captured_login_codes[account_id][-10:]
-                        
+
         if account_id in official_messages_store:
             official_messages_store[account_id] = sorted(
                 official_messages_store[account_id],
                 key=lambda x: x["timestamp"],
                 reverse=True
             )[:5]
-            
+
         add_login_log(account_id, f"成功同步官方历史通知消息，共加载 {len(official_messages_store[account_id])} 条。")
     except Exception as e:
         error_msg = str(e)
@@ -7614,10 +7808,10 @@ async def bg_connect_client(account_id: str):
         connection_errors.pop(account_id, None)
         login_connection_logs[account_id] = []
         add_login_log(account_id, "开始连接电报客户端 (后台任务启动)...")
-        
+
         client = await get_client(account_id)
         add_login_log(account_id, "连接电报服务成功！")
-        
+
         # Fetch the official codes once connected in case the event listener was offline
         await fetch_recent_official_codes(account_id, client)
         add_login_log(account_id, "已开启实时新消息监听，等待接收验证码...")
@@ -7630,20 +7824,20 @@ async def bg_connect_client(account_id: str):
 async def get_captured_login_code(account_id: str, user: dict = Depends(get_current_user)):
     """Fetches captured Telegram official login codes for an account."""
     check_account_company(account_id, user)
-    
+
     is_connected = False
     client = None
-    
+
     # Initialize logs if not present
     if account_id not in login_connection_logs:
         login_connection_logs[account_id] = []
-        
+
     # Ensure client is connected and listening in the background if authorized
     try:
         from db import engine, AccountDb, Session
         with Session(engine) as session:
             db_account = session.get(AccountDb, account_id)
-            
+
         if db_account:
             session_name = db_account.session_name
             from sync_folder_groups import resolve_path
@@ -7651,18 +7845,18 @@ async def get_captured_login_code(account_id: str, user: dict = Depends(get_curr
             config_path = account_config_path(account_id)
             base_dir = config_path.parent.parent
             session_path = resolve_path(base_dir, session_name)
-            
+
             session_file = Path(f"{session_path}.session")
             if not session_file.exists():
                 session_file = Path(session_path)
-                
+
             if session_file.exists() and session_file.stat().st_size > 0:
                 # Account is authorized, check if client is already connected
                 if account_id in active_clients:
                     client = active_clients[account_id]
                     if client.is_connected():
                         is_connected = True
-                
+
                 # If not connected and no task is running, start connection task
                 if not is_connected:
                     task = bg_connect_tasks.get(account_id)
@@ -7674,28 +7868,28 @@ async def get_captured_login_code(account_id: str, user: dict = Depends(get_curr
             add_login_log(account_id, "错误: 数据库中不存在此账号。")
     except Exception as e:
         add_login_log(account_id, f"触发后台连接失败: {e}")
-        
+
     # If client is connected and logs are empty, log that it is connected
     if is_connected and not login_connection_logs[account_id]:
         add_login_log(account_id, "客户端已在线连接。")
-        
+
     # If the client is already connected, proactively trigger history check in background
     if is_connected and client:
         asyncio.create_task(fetch_recent_official_codes(account_id, client))
-        
+
     # Get official messages
     raw_msgs = official_messages_store.get(account_id, [])
     sorted_msgs = sorted(raw_msgs, key=lambda x: x["timestamp"], reverse=True)[:5]
-    
+
     # Get error if any
     error = connection_errors.get(account_id, None)
-    
+
     # Check if currently connecting
     is_connecting = False
     task = bg_connect_tasks.get(account_id)
     if task and not task.done():
         is_connecting = True
-        
+
     return {
         "status": "success",
         "raw_messages": sorted_msgs,
@@ -7719,7 +7913,7 @@ async def clean_idle_clients_loop():
                 is_campaign_running = account_id in active_processes and active_processes[account_id].poll() is None
                 if not is_campaign_running:
                     is_campaign_running = find_campaign_process(account_id) is not None
-                
+
                 if not is_campaign_running and not is_account_busy_with_task(account_id):
                     try:
                         print(f"Disconnecting idle client {account_id} to free resources...")
@@ -7769,10 +7963,14 @@ async def ensure_private_listener_for_account(account_id: str, account_label: st
 
 
 async def auto_private_listener_loop():
-    """Keeps idle authorized accounts online so private DMs can be received without a manual button."""
+    """Keeps authorized account listeners available without active heartbeat polling.
+
+    Receiving private DMs does not require periodically calling Telegram APIs.
+    Avoiding heartbeat probes prevents a reconnect/request storm while campaign
+    tasks are running or when several accounts recover at the same time.
+    """
     from db import engine, AccountDb, Session, select
     await asyncio.sleep(AUTO_PRIVATE_LISTENER_STARTUP_DELAY_SECONDS)
-    last_heartbeat_check = {}  # account_id -> timestamp
     while True:
         try:
             if not private_relay_enabled:
@@ -7796,41 +7994,30 @@ async def auto_private_listener_loop():
 
                 live_client = active_clients.get(account_id)
                 if live_client and live_client.is_connected():
-                    # 每 5 分钟 (300 秒) 进行一次轻量级心跳自愈检测，避免 session 在线状态挂死
-                    last_check = last_heartbeat_check.get(account_id, 0)
-                    if now - last_check > 300:
-                        try:
-                            # 尝试获取自身信息，设置 15 秒超时防止因代理瞬时延迟导致误判
-                            await asyncio.wait_for(live_client.get_me(), timeout=15)
-                            last_heartbeat_check[account_id] = now
-                        except Exception as heartbeat_exc:
-                            print(f"[Heartbeat] Account {acc.account_name or account_id} failed heartbeat: {heartbeat_exc}. Disconnecting for self-healing...")
-                            try:
-                                await _disconnect_client_safely(account_id, live_client)
-                            except Exception:
-                                pass
-                            active_clients.pop(account_id, None)
-                            registered_listeners.discard(account_id)
-                            
-                            # Set cooldown on heartbeat exception to prevent infinite reconnect loop
-                            wait_time = getattr(heartbeat_exc, "seconds", AUTO_PRIVATE_LISTENER_FAILURE_COOLDOWN_SECONDS) or AUTO_PRIVATE_LISTENER_FAILURE_COOLDOWN_SECONDS
-                            auto_private_listener_cooldowns[account_id] = time.time() + wait_time
-                            
-                            set_account_status(
-                                account_id,
-                                {
-                                    "private_listener": False,
-                                    "last_error": f"连接心跳异常，正在自动重建监听: {heartbeat_exc}",
-                                },
-                                source="private-listener-heartbeat-fail",
-                            )
-                        else:
-                            auto_private_listener_accounts.add(account_id)
-                            active_clients_last_accessed[account_id] = now
-                    else:
-                        auto_private_listener_accounts.add(account_id)
-                        active_clients_last_accessed[account_id] = now
+                    auto_private_listener_accounts.add(account_id)
+                    active_clients_last_accessed[account_id] = now
+                    set_account_status(
+                        account_id,
+                        {
+                            "is_connected": True,
+                            "private_listener": True,
+                            "private_listener_source": "auto",
+                        },
+                        source="private-listener-passive",
+                    )
                     return
+                if live_client and not live_client.is_connected():
+                    auto_private_listener_accounts.discard(account_id)
+                    registered_listeners.discard(account_id)
+                    set_account_status(
+                        account_id,
+                        {
+                            "is_connected": False,
+                            "private_listener": False,
+                            "private_listener_source": None,
+                        },
+                        source="private-listener-disconnected",
+                    )
 
                 cooldown_until = auto_private_listener_cooldowns.get(account_id, 0)
                 if cooldown_until > now:
@@ -7839,23 +8026,13 @@ async def auto_private_listener_loop():
                 try:
                     await ensure_private_listener_for_account(account_id, acc.account_name or account_id)
                 except Exception as exc:
-                    # Dynamically extract wait_time if it is a FloodWaitError
-                    wait_time = getattr(exc, "seconds", AUTO_PRIVATE_LISTENER_FAILURE_COOLDOWN_SECONDS) or AUTO_PRIVATE_LISTENER_FAILURE_COOLDOWN_SECONDS
-                    auto_private_listener_cooldowns[account_id] = time.time() + wait_time
-                    set_account_status(
-                        account_id,
-                        {
-                            "private_listener": False,
-                            "last_error": f"自动私聊监听连接失败: {exc}",
-                        },
-                        source="private-listener-auto-error",
-                    )
+                    mark_private_listener_cooldown(account_id, exc, "auto private listener connect")
                     print(f"[PrivateListener] Failed to auto-connect {account_id}: {exc}")
 
-            # 并发执行所有账号的连接与自愈
-            tasks = [process_single_account(acc) for acc in accounts]
-            if tasks:
-                await asyncio.gather(*tasks)
+            # 串行连接，避免多个账号同时重连造成 Telegram transport 429。
+            for acc in accounts:
+                await process_single_account(acc)
+                await asyncio.sleep(AUTO_PRIVATE_LISTENER_CONNECT_GAP_SECONDS)
         except Exception as exc:
             print(f"[PrivateListener] Auto listener loop error: {exc}")
 
@@ -7866,7 +8043,7 @@ async def auto_connect_bg_task():
     from db import engine, AccountDb, Session, select
     await asyncio.sleep(0.5)
     print("Initializing account status store locally...")
-    
+
     try:
         with Session(engine) as session:
             db_accounts = session.exec(select(AccountDb)).all()
@@ -7879,13 +8056,13 @@ async def auto_connect_bg_task():
         try:
             config = acc.to_dict()
             session_name = config.get("session_name", f"sessions/{account_id}/telegram_user")
-            
+
             from sync_folder_groups import resolve_path
             from pathlib import Path
             config_path = account_config_path(account_id)
             base_dir = config_path.parent.parent
             session_path = resolve_path(base_dir, session_name)
-            
+
             session_file = Path(f"{session_path}.session")
             if not session_file.exists():
                 session_file = Path(session_path)
@@ -7988,7 +8165,7 @@ async def startup_event():
         print("[Startup] Realtime private DM listener is DISABLED.")
     load_pending_private_sends_from_db()
     resume_persistent_tasks_on_startup()
-    
+
     # 0. Migrate predefined_ads table to support group_type column
     try:
         import sqlite3
@@ -8003,7 +8180,7 @@ async def startup_event():
                 print("[Startup Migration] Successfully added 'group_type' column to 'predefined_ads' table.")
     except Exception as em:
         print(f"[Startup Migration] Failed to migrate predefined_ads table: {em}")
-    
+
     # Perform startup database sync: Category auto-fill and Channel deletion
     try:
         from db import engine, GroupDb, GroupCategoryDb, Session, select
@@ -8016,14 +8193,14 @@ async def startup_event():
                 for ch in channels_to_delete:
                     session.delete(ch)
                 session.commit()
-                
+
             # 2. Compare all current group categories to see if any are not in the category list, and automatically add them.
             stmt_groups = select(GroupDb)
             all_groups = session.exec(stmt_groups).all()
-            
+
             stmt_categories = select(GroupCategoryDb)
             all_categories = session.exec(stmt_categories).all()
-            
+
             # GroupCategoryDb.name is globally unique in the current schema.
             # Keep startup sync aligned with that constraint instead of trying
             # to create the same category name once per company.
@@ -8032,13 +8209,13 @@ async def startup_event():
                 for cat in all_categories
                 if cat.name and cat.name.strip()
             }
-                
+
             for g in all_groups:
                 if not g.category:
                     continue
                 g_cat_clean = g.category.strip()
                 g_cat_lower = g_cat_clean.lower()
-                
+
                 if g_cat_lower not in existing_category_names:
                     new_cat = GroupCategoryDb(name=g_cat_clean, company=g.company)
                     session.add(new_cat)
@@ -8052,7 +8229,7 @@ async def startup_event():
                             existing_category_names.add(g_cat_lower)
                         else:
                             raise
-                    
+
     except Exception as se:
         print(f"[Startup Sync] Error running category/channel sync: {se}")
 
@@ -8083,6 +8260,75 @@ async def get_account_folders(account_id: str, user: dict = Depends(get_current_
 # --- DYNAMIC CAMPAIGN TASK SYSTEM ---
 
 active_campaign_tasks: Dict[str, asyncio.Task] = {}
+active_campaign_schedules: Dict[str, asyncio.Task] = {}
+
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+UTC_TZ = ZoneInfo("UTC")
+
+def campaign_now_utc() -> datetime.datetime:
+    return datetime.datetime.now(UTC_TZ)
+
+def campaign_now_beijing() -> datetime.datetime:
+    return datetime.datetime.now(BEIJING_TZ)
+
+def parse_campaign_scheduled_start(value: str | None) -> tuple[datetime.datetime | None, str | None]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None, None
+    normalized = raw.replace("Z", "+00:00")
+    try:
+        parsed = datetime.datetime.fromisoformat(normalized)
+    except Exception:
+        for fmt in ("%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M", "%Y-%m-%dT%H:%M"):
+            try:
+                parsed = datetime.datetime.strptime(raw, fmt)
+                break
+            except Exception:
+                parsed = None
+        if parsed is None:
+            raise HTTPException(status_code=400, detail="定时启动时间格式不正确")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=BEIJING_TZ)
+    scheduled_bj = parsed.astimezone(BEIJING_TZ)
+    if scheduled_bj <= campaign_now_beijing():
+        raise HTTPException(status_code=400, detail="定时启动时间必须晚于当前北京时间")
+    return scheduled_bj.astimezone(UTC_TZ), scheduled_bj.strftime("%Y-%m-%d %H:%M:%S")
+
+def campaign_task_config(task_record) -> dict:
+    try:
+        payload = json.loads(getattr(task_record, "task_config_json", "") or "{}")
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+def campaign_task_schedule_utc(task_record) -> datetime.datetime | None:
+    payload = campaign_task_config(task_record)
+    raw = str(payload.get("scheduled_start_at_utc") or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC_TZ)
+        return parsed.astimezone(UTC_TZ)
+    except Exception:
+        return None
+
+def campaign_duration_text(total_seconds: float) -> str:
+    seconds = max(0, int(total_seconds))
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}天")
+    if hours:
+        parts.append(f"{hours}小时")
+    if minutes:
+        parts.append(f"{minutes}分钟")
+    if not parts:
+        parts.append(f"{seconds}秒")
+    return "".join(parts)
 
 def parse_campaign_account_ids(task_record) -> List[str]:
     """Return all accounts bound to a campaign task, preserving legacy tasks."""
@@ -8111,12 +8357,134 @@ def parse_campaign_phones(task_record) -> Dict[str, str]:
 def campaign_task_uses_account(task_record, account_id: str) -> bool:
     return account_id in parse_campaign_account_ids(task_record)
 
+def campaign_account_lines(account_ids: List[str], limit: int = 12) -> str:
+    lines = [
+        f"• {html.escape(get_account_notify_label(acc_id))}"
+        for acc_id in account_ids[:limit]
+    ]
+    if len(account_ids) > limit:
+        lines.append(f"• ... +{len(account_ids) - limit}")
+    return "\n".join(lines) or "未选择账号"
+
+def send_campaign_start_notification(task_id: str, scheduled: bool = False):
+    from db import engine, CampaignTaskDb, Session
+    try:
+        with Session(engine) as session:
+            task = session.get(CampaignTaskDb, task_id)
+            if not task:
+                return
+            account_ids = parse_campaign_account_ids(task)
+            config = campaign_task_config(task)
+            target_groups = []
+            try:
+                target_groups = json.loads(task.target_groups_json or "[]")
+            except Exception:
+                target_groups = []
+            owner_username = task.owner_username or ""
+            target_mention = get_ops_target_mention(owner_username)
+            max_cycles_label = "持续运行" if int(task.max_cycles or 0) <= 0 else f"{task.max_cycles} 轮"
+            safety_label = "多账号安全随机" if bool(config.get("multi_account_safety_enabled")) else "普通轮询"
+            strategy_label = "智能广告语匹配" if bool(config.get("strategy_enabled")) else "手动广告池"
+            scheduled_label = config.get("scheduled_start_at_beijing") or ""
+            intro = "定时广告任务开始执行" if scheduled else "广告任务开始执行"
+            lines = [
+                f"{html.escape(target_mention)} {html.escape(intro)}",
+                html_line("任务ID", task_id[:8]),
+                html_line("启动方式", "北京时间定时启动" if scheduled else "立即启动"),
+            ]
+            if scheduled_label:
+                lines.append(html_line("预约时间", f"{scheduled_label} 北京时间"))
+            lines.extend([
+                html_line("参与账号", len(account_ids)),
+                campaign_account_lines(account_ids),
+                html_line("目标群组", len(target_groups)),
+                html_line("总轮数", max_cycles_label),
+                html_line("每轮间隔", f"{task.round_interval_minutes} 分钟"),
+                html_line("群间隔", f"{task.group_interval_seconds} 秒"),
+                html_line("执行策略", f"{safety_label} / {strategy_label}"),
+                html_line("时间", ops_event_time()),
+            ])
+            event = {
+                "type": "campaign_started",
+                "task_id": task_id,
+                "owner_username": owner_username,
+                "allowed_username": get_user_telegram_contact(owner_username).lstrip("@"),
+                "company": task.company or "",
+                "status": "running",
+                "account_labels": [get_account_notify_label(acc_id) for acc_id in account_ids],
+            }
+            send_ops_bot_notification_with_buttons(
+                "\n".join(lines),
+                event,
+                [[{"text": "查看任务", "callback_data": "opslog:{event_id}"}]],
+            )
+    except Exception as exc:
+        print(f"[OpsNotify] Failed to send campaign start notification: {exc}")
+
+async def launch_campaign_task(task_id: str, scheduled: bool = False):
+    from db import engine, CampaignTaskDb, Session
+    from datetime import datetime
+    with Session(engine) as session:
+        task = session.get(CampaignTaskDb, task_id)
+        if not task or task.status == "stopped":
+            return
+        if task.status not in {"scheduled", "running"}:
+            return
+        account_ids = parse_campaign_account_ids(task)
+        for acc_id in account_ids:
+            if is_account_busy_with_task(acc_id):
+                task.status = "failed"
+                task.error_detail = f"定时任务启动时账号 {acc_id} 正在执行其他任务，已取消启动"
+                task.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                session.add(task)
+                session.commit()
+                return
+        task.status = "running"
+        task.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        session.add(task)
+        session.commit()
+        register_account_task_usage(
+            "campaign",
+            task_id,
+            account_ids,
+            {"company": task.company, "created_by": task.created_by, "scheduled": scheduled},
+        )
+    send_campaign_start_notification(task_id, scheduled=scheduled)
+    worker = asyncio.create_task(campaign_worker_task(task_id))
+    active_campaign_tasks[task_id] = worker
+
+async def scheduled_campaign_runner(task_id: str):
+    from db import engine, CampaignTaskDb, Session
+    try:
+        with Session(engine) as session:
+            task = session.get(CampaignTaskDb, task_id)
+            if not task or task.status != "scheduled":
+                return
+            scheduled_utc = campaign_task_schedule_utc(task)
+            if not scheduled_utc:
+                task.status = "failed"
+                task.error_detail = "定时启动时间缺失或格式错误"
+                task.updated_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                session.add(task)
+                session.commit()
+                return
+        delay = max(0.0, (scheduled_utc - campaign_now_utc()).total_seconds())
+        if delay > 0:
+            await asyncio.sleep(delay)
+        await launch_campaign_task(task_id, scheduled=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        print(f"[CampaignScheduler] Failed to launch scheduled campaign {task_id}: {exc}")
+    finally:
+        active_campaign_schedules.pop(task_id, None)
+
 async def campaign_worker_task(task_id: str):
     from db import engine, CampaignTaskDb, CampaignLogDb, Session, select
     import json
     import random
     from datetime import datetime
-    
+
     with Session(engine) as session:
         task_record = session.get(CampaignTaskDb, task_id)
         if not task_record:
@@ -8144,7 +8512,7 @@ async def campaign_worker_task(task_id: str):
         safe_group_interval = max(5, int(group_interval or 5))
         account_pool_size = max(1, len(account_ids))
         dynamic_cooldown_seconds = max(3, min(90, int(safe_group_interval * max(1, min(account_pool_size - 1, 4)) * random.uniform(0.65, 1.35))))
-        
+
         # Parse message pool
         msg_pool = []
         try:
@@ -8153,7 +8521,7 @@ async def campaign_worker_task(task_id: str):
                 msg_pool = [str(x) for x in parsed if str(x).strip()]
         except Exception:
             pass
-            
+
         if not msg_pool:
             msg_pool = [message]
         register_account_task_usage(
@@ -8491,7 +8859,7 @@ async def campaign_worker_task(task_id: str):
                 title = group["title"]
                 username = group.get("username")
                 selected_msg, current_gtype, selected_ad_ref = choose_campaign_message_for_group(group, chat_id, title, username)
-                
+
                 log_status = "success"
                 log_detail = ""
                 selected_account_id = ""
@@ -8511,7 +8879,7 @@ async def campaign_worker_task(task_id: str):
                         selected_ad_ref,
                     )
                     continue
-                
+
                 try:
                     candidate_ids = await build_campaign_candidate_order()
                     skipped_prepare_details: List[str] = []
@@ -8622,10 +8990,10 @@ async def campaign_worker_task(task_id: str):
                                         db_g = temp_session.exec(select(GroupDb).where(GroupDb.username == username.lstrip("@").strip(), GroupDb.company == task_company)).first()
                                         if not db_g:
                                             db_g = temp_session.exec(select(GroupDb).where(GroupDb.username == username.lstrip("@").strip())).first()
-                                    
+
                                     if db_g:
                                         current_gtype = db_g.category
-                                    
+
                                     db_sg = None
                                     if chat_id:
                                         g_ids = [str(chat_id), f"-{chat_id}", f"-100{chat_id}"]
@@ -8640,7 +9008,7 @@ async def campaign_worker_task(task_id: str):
                                 print(f"Error resolving group type: {gtype_err}")
                             if not current_gtype:
                                 current_gtype = "英文短"
-                            
+
                             try:
                                 with Session(engine) as temp_session:
                                     from db import PredefinedAdDb
@@ -8909,9 +9277,12 @@ async def campaign_worker_task(task_id: str):
             task = session.get(CampaignTaskDb, task_id)
             if task and task.status == "running":
                 task.status = "stopped"
+                task.error_detail = "任务协程被取消，但未收到停止接口请求；请检查同时间 Telethon/代理 429、服务关闭或事件循环取消日志。"
                 task.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 session.add(task)
                 session.commit()
+                print(f"[Campaign] Worker task {task_id} was cancelled unexpectedly while running.")
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -9012,12 +9383,12 @@ async def get_account_folders_groups(account_id: str, user: dict = Depends(get_c
     from sync_folder_groups import normalize_title, entity_type
     from telethon.tl.types import DialogFilter, DialogFilterChatlist
     from telethon import utils
-    
+
     try:
         client = await get_client(account_id)
         if not await client.is_user_authorized():
             raise HTTPException(status_code=401, detail="Account is not authorized")
-            
+
         # 1. Fetch filters (folders)
         result = await client(functions.messages.GetDialogFiltersRequest())
         raw_filters = getattr(result, "filters", result)
@@ -9026,29 +9397,29 @@ async def get_account_folders_groups(account_id: str, user: dict = Depends(get_c
             for item in raw_filters
             if isinstance(item, (DialogFilter, DialogFilterChatlist))
         ]
-        
+
         # 2. Fetch dialogs once to lookup
         dialogs = await client.get_dialogs()
-        
+
         # 3. Scan
         include_types = {"group", "supergroup"}
         folders_groups = {}
         for folder in filters:
             folder_title = normalize_title(folder.title)
             folder_groups = []
-            
+
             explicit_peers = list(getattr(folder, "include_peers", []) or []) + list(getattr(folder, "pinned_peers", []) or [])
             exclude_peers = list(getattr(folder, "exclude_peers", []) or [])
-            
+
             exclude_ids = set()
             for p in exclude_peers:
                 try:
                     exclude_ids.add(utils.get_peer_id(p))
                 except Exception:
                     pass
-            
+
             seen_ids = set()
-            
+
             # Resolve explicit peers
             for peer in explicit_peers:
                 peer_id = None
@@ -9058,7 +9429,7 @@ async def get_account_folders_groups(account_id: str, user: dict = Depends(get_c
                     pass
                 if not peer_id or peer_id in seen_ids or peer_id in exclude_ids:
                     continue
-                    
+
                 dlg = next((d for d in dialogs if utils.get_peer_id(d.entity) == peer_id), None)
                 if dlg:
                     t = entity_type(dlg.entity)
@@ -9069,7 +9440,7 @@ async def get_account_folders_groups(account_id: str, user: dict = Depends(get_c
                             "title": dlg.name or "未命名群组",
                             "username": getattr(dlg.entity, "username", None) or ""
                         })
-            
+
             # Dynamic rules
             has_dynamic_groups = bool(getattr(folder, "groups", False))
             if has_dynamic_groups:
@@ -9085,9 +9456,9 @@ async def get_account_folders_groups(account_id: str, user: dict = Depends(get_c
                             "title": dlg.name or "未命名群组",
                             "username": getattr(dlg.entity, "username", None) or ""
                         })
-            
+
             folders_groups[folder_title] = folder_groups
-            
+
         # Build virtual folders for all groups and non-folder groups
         all_groups = []
         for dlg in dialogs:
@@ -9134,7 +9505,7 @@ async def create_campaign_task(req: MessageCampaignTaskRequest, user: dict = Dep
     for selected_account_id in requested_account_ids:
         if is_account_busy_with_task(selected_account_id):
             raise HTTPException(status_code=400, detail=f"账号 {selected_account_id} 有未完成的任务，无法启动新任务。")
-        
+
     if req.group_interval_seconds < 5:
         raise HTTPException(status_code=400, detail="单个群发送间隔不能小于 5 秒，以防触发 Telegram 风控锁定！")
 
@@ -9152,24 +9523,27 @@ async def create_campaign_task(req: MessageCampaignTaskRequest, user: dict = Dep
         acc.id: (acc.account_name or acc.id)
         for acc in selected_accounts
     }
-    
+
     from db import engine, CampaignTaskDb, Session
     import uuid
     import json
     from datetime import datetime
 
+    scheduled_utc, scheduled_bj_label = parse_campaign_scheduled_start(req.scheduled_start_at)
+    is_scheduled_task = scheduled_utc is not None
+
     # Save last params
     try:
         last_params_path = Path("data/campaign_last_params.json")
         last_params_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         last_params = {}
         if last_params_path.exists():
             try:
                 last_params = json.loads(last_params_path.read_text(encoding="utf-8"))
             except Exception:
                 pass
-                
+
         for selected_account_id in requested_account_ids:
             last_params[selected_account_id] = {
             "max_cycles": req.max_cycles,
@@ -9180,7 +9554,8 @@ async def create_campaign_task(req: MessageCampaignTaskRequest, user: dict = Dep
             "target_groups": [g.model_dump() for g in req.target_groups],
             "account_ids": requested_account_ids,
             "multi_account_safety_enabled": req.multi_account_safety_enabled,
-            "strategy_enabled": req.strategy_enabled
+            "strategy_enabled": req.strategy_enabled,
+            "scheduled_start_at": req.scheduled_start_at or ""
             }
         last_params_path.write_text(json.dumps(last_params, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
@@ -9188,7 +9563,16 @@ async def create_campaign_task(req: MessageCampaignTaskRequest, user: dict = Dep
 
     task_id = str(uuid.uuid4())
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
+    task_config = {
+        "multi_account_safety_enabled": req.multi_account_safety_enabled,
+        "strategy_enabled": req.strategy_enabled,
+    }
+    if is_scheduled_task and scheduled_utc and scheduled_bj_label:
+        task_config.update({
+            "scheduled_start_at_utc": scheduled_utc.isoformat(),
+            "scheduled_start_at_beijing": scheduled_bj_label,
+        })
+
     with Session(engine) as session:
         new_task = CampaignTaskDb(
             id=task_id,
@@ -9198,7 +9582,7 @@ async def create_campaign_task(req: MessageCampaignTaskRequest, user: dict = Dep
             phone=phone,
             account_ids_json=json.dumps(requested_account_ids, ensure_ascii=False),
             phones_json=json.dumps(phones_by_id, ensure_ascii=False),
-            status="running",
+            status="scheduled" if is_scheduled_task else "running",
             max_cycles=req.max_cycles,
             current_cycle=0,
             round_interval_minutes=req.round_interval_minutes,
@@ -9206,10 +9590,7 @@ async def create_campaign_task(req: MessageCampaignTaskRequest, user: dict = Dep
             is_safety=req.is_safety,
             message=req.message,
             target_groups_json=json.dumps([g.model_dump() for g in req.target_groups], ensure_ascii=False),
-            task_config_json=json.dumps({
-                "multi_account_safety_enabled": req.multi_account_safety_enabled,
-                "strategy_enabled": req.strategy_enabled
-            }, ensure_ascii=False),
+            task_config_json=json.dumps(task_config, ensure_ascii=False),
             success_count=0,
             fail_count=0,
             created_at=now_str,
@@ -9220,15 +9601,20 @@ async def create_campaign_task(req: MessageCampaignTaskRequest, user: dict = Dep
         session.add(new_task)
         session.commit()
 
-    t = asyncio.create_task(campaign_worker_task(task_id))
-    active_campaign_tasks[task_id] = t
-    register_account_task_usage(
-        "campaign",
-        task_id,
-        requested_account_ids,
-        {"company": user["company"], "created_by": user["username"]},
-    )
-    
+    if is_scheduled_task:
+        t = asyncio.create_task(scheduled_campaign_runner(task_id))
+        active_campaign_schedules[task_id] = t
+        delay_seconds = max(0, int((scheduled_utc - campaign_now_utc()).total_seconds())) if scheduled_utc else 0
+        return {
+            "status": "scheduled",
+            "task_id": task_id,
+            "scheduled_start_at_beijing": scheduled_bj_label,
+            "remaining_seconds": delay_seconds,
+            "remaining_text": campaign_duration_text(delay_seconds),
+        }
+
+    await launch_campaign_task(task_id, scheduled=False)
+
     return {"status": "success", "task_id": task_id}
 
 @app.get("/api/campaign/tasks")
@@ -9252,7 +9638,7 @@ def list_campaign_tasks(user: dict = Depends(get_current_user)):
 async def stop_campaign_task(task_id: str, user: dict = Depends(get_current_user)):
     from db import engine, CampaignTaskDb, Session, AccountDb
     from datetime import datetime
-    
+
     with Session(engine) as session:
         task = session.get(CampaignTaskDb, task_id)
         if not task:
@@ -9266,30 +9652,34 @@ async def stop_campaign_task(task_id: str, user: dict = Depends(get_current_user
         t = active_campaign_tasks.get(task_id)
         if t:
             t.cancel()
-            
-        if task.status == "running":
+        scheduled_t = active_campaign_schedules.get(task_id)
+        if scheduled_t:
+            scheduled_t.cancel()
+            active_campaign_schedules.pop(task_id, None)
+
+        if task.status in {"running", "scheduled"}:
             task.status = "stopped"
             task.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             task.updated_by = user["username"]
             session.add(task)
             session.commit()
         release_account_task_usage(task_id, affected_account_ids, source="campaign-task-stop")
-            
+
     return {"status": "success"}
 
 @app.post("/api/campaign/stop-all")
 async def stop_all_campaigns(user: dict = Depends(get_current_user)):
     from db import engine, AccountDb, CampaignTaskDb, Session, select
     from datetime import datetime
-    
+
     with Session(engine) as session:
         if user["role"] == "admin":
-            stmt = select(CampaignTaskDb).where(CampaignTaskDb.status == "running")
+            stmt = select(CampaignTaskDb).where(CampaignTaskDb.status.in_(["running", "scheduled"]))
             running_tasks = session.exec(stmt).all()
         else:
             stmt_acc = query_allowed_accounts(session, user)
             allowed_ids = {acc.id for acc in session.exec(stmt_acc).all()}
-            stmt = select(CampaignTaskDb).where(CampaignTaskDb.status == "running")
+            stmt = select(CampaignTaskDb).where(CampaignTaskDb.status.in_(["running", "scheduled"]))
             running_tasks = [
                 task for task in session.exec(stmt).all()
                 if any(acc_id in allowed_ids for acc_id in parse_campaign_account_ids(task))
@@ -9301,6 +9691,13 @@ async def stop_all_campaigns(user: dict = Depends(get_current_user)):
                 t.cancel()
                 try:
                     del active_campaign_tasks[task.id]
+                except KeyError:
+                    pass
+            scheduled_t = active_campaign_schedules.get(task.id)
+            if scheduled_t:
+                scheduled_t.cancel()
+                try:
+                    del active_campaign_schedules[task.id]
                 except KeyError:
                     pass
             task.status = "stopped"
@@ -9325,7 +9722,7 @@ def get_campaign_task_logs(task_id: str, limit: int = 200, user: dict = Depends(
             allowed_ids = {acc.id for acc in session.exec(query_allowed_accounts(session, user)).all()}
             if not any(acc_id in allowed_ids for acc_id in parse_campaign_account_ids(task)):
                 raise HTTPException(status_code=403, detail="没有权限操作此任务")
-            
+
         stmt = select(CampaignLogDb).where(CampaignLogDb.task_id == task_id).order_by(CampaignLogDb.id.desc()).limit(limit)
         results = session.exec(stmt).all()
         target_groups = []
@@ -9458,7 +9855,7 @@ def create_predefined_ad(req: PredefinedAdRequest, user: dict = Depends(get_curr
         raise HTTPException(status_code=400, detail="内容不能为空")
     if gtype not in ("中文长", "中文短", "英文长", "英文短"):
         raise HTTPException(status_code=400, detail="非法的群组类型")
-        
+
     content_len = len(cnt)
     content_bytes = len(cnt.encode("utf-8"))
     if content_bytes > 350:
@@ -9471,7 +9868,7 @@ def create_predefined_ad(req: PredefinedAdRequest, user: dict = Depends(get_curr
     elif "长" in gtype:
         if content_len < 200:
             raise HTTPException(status_code=400, detail=f"长广告内容长度必须在 200 字及以上（当前 {content_len} 字）")
-        
+
     with Session(engine) as session:
         new_ad = PredefinedAdDb(
             description=desc,
@@ -9552,12 +9949,12 @@ async def send_strategy_message(req: SendStrategyMessageRequest):
     """
     from db import engine, PredefinedAdDb, Session, select
     import random
-    
+
     chat_id = req.chat_id
     gtype = req.gtype
     fallback_message = req.fallback_message
     company = req.company
-    
+
     # 1. Find all logged-in and active accounts for this company
     allowed_clients = []
     for account_id, client in list(active_clients.items()):
@@ -9571,13 +9968,13 @@ async def send_strategy_message(req: SendStrategyMessageRequest):
                         allowed_clients.append((account_id, client, db_acc.account_name or account_id))
         except Exception:
             continue
-            
+
     if not allowed_clients:
         raise HTTPException(status_code=400, detail="没有可用的在线电报账号")
-        
+
     # Randomly pick an account client
     selected_account_id, selected_client, selected_account_name = random.choice(allowed_clients)
-    
+
     # 2. Select a random ad matching the gtype from predefined_ads
     selected_message = fallback_message
     try:
@@ -9600,18 +9997,18 @@ async def send_strategy_message(req: SendStrategyMessageRequest):
                     selected_message = random.choice(ads_admin).content
     except Exception as e:
         print(f"Error fetching predefined ads in internal API: {e}")
-        
+
     # 3. Perform sending message using the selected client
     try:
         try:
             peer = int(chat_id)
         except ValueError:
             peer = chat_id
-            
+
         if not await check_can_speak(selected_client, peer):
             raise Exception("无该群发言权限，已跳过未发送")
         await selected_client.send_message(peer, selected_message)
-        
+
         # Log this send operation
         try:
             from db import AdLogDb
@@ -9631,7 +10028,7 @@ async def send_strategy_message(req: SendStrategyMessageRequest):
                 session.commit()
         except Exception as log_err:
             print(f"Failed to write strategy ad log: {log_err}")
-            
+
         return {
             "status": "success",
             "account_id": selected_account_id,
@@ -9650,7 +10047,7 @@ async def start_campaign(req: CampaignStartRequest, user: dict = Depends(get_cur
     account_id = req.account_id
     if is_account_busy_with_task(account_id):
         raise HTTPException(status_code=400, detail="该账号有未完成的任务，无法启动新任务。")
-        
+
     folder_name = req.folder_name.strip()
     message_text = req.message_text.strip()
     task_interval_minutes = req.task_interval_minutes
@@ -9680,15 +10077,15 @@ async def start_campaign(req: CampaignStartRequest, user: dict = Depends(get_cur
     with Session(engine) as session:
         # Re-fetch in local session context to write changes safely
         db_account = session.get(AccountDb, account_id)
-        
+
         db_account.campaign_folder = folder_name
         db_account.campaign_message = message_text
         db_account.campaign_interval_minutes = task_interval_minutes
         db_account.campaign_group_interval_seconds = group_interval_seconds
-        
+
         session.add(db_account)
         session.commit()
-        
+
         # Sync the .json file so that CLI scripts can also run if needed
         path = account_config_path(account_id)
         save_json(path, db_account.to_dict())
@@ -9713,7 +10110,7 @@ async def start_campaign(req: CampaignStartRequest, user: dict = Depends(get_cur
         python_exe = str(root_dir / ".venv" / "bin" / "python")
         if not os.path.exists(python_exe):
             python_exe = sys.executable
-            
+
     script_path = str(root_dir / "ad_sender.py")
 
     command = [
@@ -9853,7 +10250,7 @@ def get_account_busy_status(account_id: str) -> str:
     for t in active_join_tasks.values():
         if t.get("status") == "running" and account_id in t.get("params", {}).get("account_ids", []):
             return "join"
-            
+
     # 2. Check active campaign tasks in database and memory
     from db import engine, CampaignTaskDb, Session, select
     with Session(engine) as session:
@@ -10003,7 +10400,8 @@ load_last_join_task_on_startup()
 
 def resume_persistent_tasks_on_startup():
     """Resume durable tasks that were running before a server restart."""
-    if not persistent_task_resume_enabled():
+    resume_enabled = persistent_task_resume_enabled()
+    if not resume_enabled:
         paused_count = 0
         for task_id, task_data in list(active_join_tasks.items()):
             if task_data.get("status") == "running":
@@ -10014,19 +10412,28 @@ def resume_persistent_tasks_on_startup():
                 save_last_join_task(task_id)
                 paused_count += 1
         print(f"[Startup Resume] Disabled by RESUME_PERSISTENT_TASKS=0; paused {paused_count} loaded join task(s).")
-        return
 
     try:
         from db import engine, CampaignTaskDb, Session, select
         with Session(engine) as session:
-            stmt = select(CampaignTaskDb).where(CampaignTaskDb.status == "running")
-            running_campaigns = session.exec(stmt).all()
-            for task in running_campaigns:
-                if task.id not in active_campaign_tasks:
-                    active_campaign_tasks[task.id] = asyncio.create_task(campaign_worker_task(task.id))
-                    print(f"[Startup Resume] Resumed campaign task {task.id} for account {task.account_id}")
+            if resume_enabled:
+                stmt = select(CampaignTaskDb).where(CampaignTaskDb.status == "running")
+                running_campaigns = session.exec(stmt).all()
+                for task in running_campaigns:
+                    if task.id not in active_campaign_tasks:
+                        active_campaign_tasks[task.id] = asyncio.create_task(campaign_worker_task(task.id))
+                        print(f"[Startup Resume] Resumed campaign task {task.id} for account {task.account_id}")
+            scheduled_stmt = select(CampaignTaskDb).where(CampaignTaskDb.status == "scheduled")
+            scheduled_campaigns = session.exec(scheduled_stmt).all()
+            for task in scheduled_campaigns:
+                if task.id not in active_campaign_schedules:
+                    active_campaign_schedules[task.id] = asyncio.create_task(scheduled_campaign_runner(task.id))
+                    print(f"[Startup Resume] Restored scheduled campaign task {task.id} for account {task.account_id}")
     except Exception as e:
         print(f"[Startup Resume] Failed to resume campaign tasks: {e}")
+
+    if not resume_enabled:
+        return
 
     for task_id, task_data in list(active_join_tasks.items()):
         try:
@@ -10187,7 +10594,7 @@ async def try_create_folder_early(client, folder_name: str):
 async def determine_group_folder_name(client, entity, link: str, company: str) -> str:
     import re
     from db import engine, GroupDb, Session, select
-    
+
     # 公开群严格按 username 匹配群库分类；不再抓消息临时猜中文/英文长短。
     valid_categories = {"中文长", "中文短", "英文长", "英文短"}
     public_match = re.search(r'(?:t\.me|telegram\.me)/([a-zA-Z0-9_]{5,32})', link)
@@ -10195,7 +10602,7 @@ async def determine_group_folder_name(client, entity, link: str, company: str) -
         username = public_match.group(1)
     else:
         username = getattr(entity, "username", None) or link.replace("@", "").strip()
-        
+
     try:
         with Session(engine) as session:
             db_group = find_group_by_username_or_id(
@@ -10237,7 +10644,7 @@ async def add_peer_to_folder(client, entity, folder_name: str):
 
     result = await client(functions.messages.GetDialogFiltersRequest())
     raw_filters = getattr(result, "filters", result) or []
-    
+
     folder = next((item for item in raw_filters if hasattr(item, "title") and normalize_title(item.title) == folder_name), None)
     auto_category_folders = {"中文长", "中文短", "英文长", "英文短"}
 
@@ -10288,27 +10695,27 @@ async def add_peer_to_folder(client, entity, folder_name: str):
 
     if folder_name in auto_category_folders:
         await remove_peer_from_other_category_folders()
-    
+
     if folder:
         if not isinstance(folder, types.DialogFilter):
             print(f"Folder '{folder_name}' exists but is not a standard DialogFilter (type: {type(folder).__name__}), skipping peer add.")
             return
-            
+
         if not hasattr(folder, "include_peers") or folder.include_peers is None:
             folder.include_peers = []
-            
+
         already_exists = False
         for p in folder.include_peers:
             if get_peer_id(p) == new_peer_id:
                 already_exists = True
                 break
-        
+
         if not already_exists:
             updated_peers = list(folder.include_peers) + [peer]
             clean_include = await clean_and_convert_peers_async(client, updated_peers)
             clean_pinned = await clean_and_convert_peers_async(client, getattr(folder, "pinned_peers", []) or [])
             clean_exclude = await clean_and_convert_peers_async(client, getattr(folder, "exclude_peers", []) or [])
-            
+
             new_filter = types.DialogFilter(
                 id=folder.id,
                 title=folder.title if not isinstance(folder.title, str) else types.TextWithEntities(text=folder.title, entities=[]),
@@ -10330,7 +10737,7 @@ async def add_peer_to_folder(client, entity, folder_name: str):
         next_id = 2
         while next_id in existing_ids:
             next_id += 1
-            
+
         new_filter = types.DialogFilter(
             id=next_id,
             title=types.TextWithEntities(text=folder_name, entities=[]),
@@ -10362,27 +10769,27 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
         req.account_ids,
         {"company": task.get("company"), "owner_username": task.get("owner_username")},
     )
-    
+
     results = task["results"]
-    
+
     try:
         account_ids = req.account_ids
         links = req.links
         mode = req.mode
         strategy = req.strategy
-        
+
         # New parameters
         max_rounds = req.max_rounds
         groups_per_round = req.groups_per_round if req.groups_per_round > 0 else 10
         round_interval_minutes = req.round_interval_minutes if req.round_interval_minutes > 0 else 5
-        
+
         if strategy == "fixed":
             base_delay = req.fixed_delay
         else:
             base_delay = (req.safety_minutes * 60) / req.safety_groups
-            
+
         task["logs"].append(f"基准延迟设为: {base_delay:.1f} 秒")
-        
+
         from db import engine, AccountDb, Session, GroupDb, select
         accounts_info = []
         with Session(engine) as session:
@@ -10390,10 +10797,10 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                 db_acc = session.get(AccountDb, acc_id)
                 if db_acc:
                     accounts_info.append((acc_id, db_acc.account_name))
-                    
+
         task["logs"].append("开始执行账号已入群检测排重...")
         accounts_todo_links = {}
-        
+
         async def check_account_todo(acc_id, phone):
             import re
             from telethon.tl import functions, types
@@ -10402,11 +10809,11 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                 is_auth = await client.is_user_authorized()
                 if not is_auth:
                     return acc_id, [], 0
-                
+
                 dialogs = await client.get_dialogs(limit=None)
                 joined_usernames = {d.entity.username.lower() for d in dialogs if getattr(d.entity, 'username', None)}
                 joined_ids = {d.entity.id for d in dialogs}
-                
+
                 todo_links = []
                 skipped_count = 0
                 for link in links:
@@ -10428,12 +10835,12 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                         username = public_match.group(1) if public_match else link.replace("@", "").strip()
                         if username and username.lower() in joined_usernames:
                             is_joined = True
-                            
+
                     if is_joined:
                         skipped_count += 1
                     else:
                         todo_links.append(link)
-                        
+
                 if skipped_count > 0:
                     task["logs"].append(f"账号 {phone} 检测到已加入其中 {skipped_count} 个群组，已自动跳过，不占任务数。")
                 return acc_id, todo_links, skipped_count
@@ -10446,21 +10853,21 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
         for acc_id, todo, skipped_count in results_precheck:
             accounts_todo_links[acc_id] = todo
             precheck_skipped_total += int(skipped_count or 0)
-            
+
         task["progress"]["total"] = sum(len(todo) for todo in accounts_todo_links.values())
         task["precheck"] = {
             "target_groups": len(links),
             "dedup_skipped": precheck_skipped_total,
             "todo_total": task["progress"]["total"],
         }
-        
+
         if req.move_to_folder:
             target_folders = []
             if req.folder_by_type:
                 target_folders = ["中文长", "中文短", "英文长", "英文短"]
             elif req.target_folder_name and req.target_folder_name.strip():
                 target_folders = [req.target_folder_name.strip()]
-                
+
             if target_folders:
                 task["logs"].append(f"开始执行前置检测并创建聊天文件夹: {target_folders}...")
                 for acc_id, phone in accounts_info:
@@ -10473,15 +10880,15 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                                 await try_create_folder_early(client, folder_name_clean)
                     except Exception as ex:
                         print(f"Failed early folder check/creation for {phone}: {ex}")
-                        
+
         # Keep track of links index per account
         accounts_link_index = {acc_id: 0 for acc_id, _ in accounts_info}
-        
+
         async def join_single_account_links_this_round(account_id: str, phone: str):
             from db import engine, GroupDb, Session, select
             import re
             from telethon import errors as telethon_errors
-            
+
             def find_group_id_by_link_or_entity(session, link: str, entity=None) -> tuple[Optional[str], Optional[str]]:
                 if entity:
                     stmt = select(GroupDb).where(GroupDb.id == str(entity.id))
@@ -10490,7 +10897,7 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                     db_group = session.exec(stmt).first()
                     if db_group:
                         return db_group.id, db_group.title
-                
+
                 public_match = re.search(r'(?:t\.me|telegram\.me)/([a-zA-Z0-9_]{5,32})', link)
                 username = public_match.group(1) if public_match else link.replace("@", "").strip()
                 if username:
@@ -10502,24 +10909,24 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
 
             todo_links = accounts_todo_links.get(account_id, [])
             start_idx = accounts_link_index.get(account_id, 0)
-            
+
             added_this_round = 0
             idx = start_idx
-            
+
             while idx < len(todo_links) and added_this_round < groups_per_round:
                 if task["status"] == "stopped":
                     task["logs"].append(f"账号 {phone} 的入群任务已被手动停止。")
                     break
-                    
+
                 link = todo_links[idx]
                 idx += 1
                 accounts_link_index[account_id] = idx # Update pointer
-                
+
                 task["logs"].append(f"账号 {phone} 正在处理链接 ({idx}/{len(todo_links)}): {link} ...")
-                
+
                 # Not a duplicate, proceed with joining
                 task["logs"].append(f"账号 {phone} 正在尝试加入: {link} ...")
-                
+
                 async def join_link_logic():
                     nonlocal added_this_round
                     try:
@@ -10529,14 +10936,14 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                             mark_account_runtime_status(account_id, is_connected=client.is_connected(), is_authorized=False)
                             raise Exception("账号未登录")
                         mark_account_runtime_status(account_id, is_connected=True, is_authorized=True)
-                            
+
                         # Pre-check entity restriction
                         entity = None
                         try:
                             entity = await join_group_or_channel_get_entity_only(client, link)
                         except Exception:
                             pass
-                            
+
                         is_restricted = False
                         restriction_reason_str = ""
                         is_channel = False
@@ -10546,13 +10953,13 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                                 reasons = getattr(entity, 'restriction_reason', []) or []
                                 reasons_text = [getattr(r, 'text', '') for r in reasons]
                                 restriction_reason_str = "; ".join(filter(None, reasons_text)) or "该群组已被屏蔽限制 (restricted)"
-                            
+
                             from telethon.tl.types import Channel, ChatInvite
                             if isinstance(entity, Channel) and getattr(entity, 'broadcast', False):
                                 is_channel = True
                             elif isinstance(entity, ChatInvite) and getattr(entity, 'broadcast', False):
                                 is_channel = True
-                                
+
                         if is_channel:
                             task["logs"].append(f"账号 {phone} 检测到 {link} 是频道，触发‘频道不自动加入’规则，跳过。")
                             results.append({
@@ -10567,7 +10974,7 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                             task["progress"]["current"] += 1
                             save_last_join_task(task_id)
                             return
-                            
+
                         if is_restricted:
                             with Session(engine) as session:
                                 db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link, entity)
@@ -10584,17 +10991,17 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                             task["progress"]["current"] += 1
                             save_last_join_task(task_id)
                             return
-                        
+
                         # Try to join
                         entity = await join_group_or_channel(client, link)
-                        
+
                         # Check restriction after join
                         if getattr(entity, 'restricted', False):
                             is_restricted = True
                             reasons = getattr(entity, 'restriction_reason', []) or []
                             reasons_text = [getattr(r, 'text', '') for r in reasons]
                             restriction_reason_str = "; ".join(filter(None, reasons_text)) or "该群组已被屏蔽限制 (restricted)"
-                            
+
                         if is_restricted:
                             with Session(engine) as session:
                                 db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link, entity)
@@ -10611,7 +11018,7 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                             task["progress"]["current"] += 1
                             save_last_join_task(task_id)
                             return
-                            
+
                         can_speak = await check_can_speak(client, entity)
                         status_str = "success" if can_speak else "restricted"
                         err_msg = ""
@@ -10620,7 +11027,7 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                             task["logs"].append(f"账号 {phone} 成功加入 {link}，但检测到无法直接发言。")
                         else:
                             task["logs"].append(f"账号 {phone} 成功加入 {link} 并确认可以直接发言！")
-                            
+
                         with Session(engine) as session:
                             db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link, entity)
                         results.append({
@@ -10633,7 +11040,7 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                             "title": db_group_title or getattr(entity, 'title', '')
                         })
                         added_this_round += 1
-                        
+
                         if req.move_to_folder:
                             folder_name_clean = ""
                             if req.folder_by_type:
@@ -10646,26 +11053,26 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                                     folder_name_clean = "中文长"
                             elif req.target_folder_name and req.target_folder_name.strip():
                                 folder_name_clean = req.target_folder_name.strip()
-                                
+
                             if folder_name_clean:
                                 try:
                                     await add_peer_to_folder(client, entity, folder_name_clean)
                                     task["logs"].append(f"已成功将群组移入文件夹: '{folder_name_clean}'")
                                 except Exception as fe:
                                     task["logs"].append(f"移动群组到文件夹 '{folder_name_clean}' 失败: {str(fe)}")
-                        
+
                     except errors.UserAlreadyParticipantError:
                         try:
                             client = await get_client(account_id)
                             entity = await join_group_or_channel_get_entity_only(client, link)
-                            
+
                             is_restricted = getattr(entity, 'restricted', False) if entity else False
                             restriction_reason_str = ""
                             if is_restricted:
                                 reasons = getattr(entity, 'restriction_reason', []) or []
                                 reasons_text = [getattr(r, 'text', '') for r in reasons]
                                 restriction_reason_str = "; ".join(filter(None, reasons_text)) or "该群组已被屏蔽限制 (restricted)"
-                                
+
                             if is_restricted:
                                 with Session(engine) as session:
                                     db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link, entity)
@@ -10695,10 +11102,10 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                                     "title": db_group_title or getattr(entity, 'title', '')
                                 })
                                 task["logs"].append(f"账号 {phone} 已经在 {link} 中。是否可发言: {can_speak}")
-                                
+
                                 # Since we were already a participant, count as success added
                                 added_this_round += 1
-                                
+
                                 if req.move_to_folder:
                                     folder_name_clean = ""
                                     if req.folder_by_type:
@@ -10711,7 +11118,7 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                                             folder_name_clean = "中文长"
                                     elif req.target_folder_name and req.target_folder_name.strip():
                                         folder_name_clean = req.target_folder_name.strip()
-                                        
+
                                     if folder_name_clean:
                                         try:
                                             await add_peer_to_folder(client, entity, folder_name_clean)
@@ -10726,7 +11133,7 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                                 is_invalid = True
                             if isinstance(ex, (telethon_errors.ChannelPrivateError, telethon_errors.ChatForbiddenError, telethon_errors.ChannelInvalidError)):
                                 is_invalid = True
-                                
+
                             with Session(engine) as session:
                                 db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link)
                             results.append({
@@ -10755,10 +11162,10 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                             is_invalid = True
                         if isinstance(e, (telethon_errors.ChannelPrivateError, telethon_errors.ChatForbiddenError, telethon_errors.ChannelInvalidError)):
                             is_invalid = True
-                            
+
                         with Session(engine) as session:
                             db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link)
-                        
+
                         if is_invalid:
                             task["logs"].append(f"账号 {phone} 检测到 {link} 为无效群组: {err_msg}")
                             results.append({
@@ -10797,10 +11204,10 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                         "group_id": db_group_id,
                         "title": db_group_title
                     })
-                    
+
                 task["progress"]["current"] += 1
                 save_last_join_task(task_id)
-                
+
                 if idx < len(todo_links) and added_this_round < groups_per_round:
                     delay = base_delay * random.uniform(0.85, 1.15)
                     task["logs"].append(f"账号 {phone} 等待延迟 {delay:.1f} 秒...")
@@ -10808,7 +11215,7 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                     while slept_links < delay and task["status"] == "running":
                         await asyncio.sleep(1)
                         slept_links += 1
-            
+
             task["logs"].append(f"账号 {phone} 本轮执行完毕，本轮成功加入 {added_this_round} 个群组。")
 
         # Outer loop to run rounds
@@ -10822,17 +11229,17 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                 if idx < len(todo):
                     all_accounts_done = False
                     break
-                    
+
             if all_accounts_done:
                 task["logs"].append("所有账号的所有目标链接均已处理完毕！")
                 break
-                
+
             if max_rounds and current_round > max_rounds:
                 task["logs"].append(f"已达到设定的执行轮数上限 ({max_rounds} 轮)，任务结束。")
                 break
-                
+
             task["logs"].append(f"--- 启动第 {current_round} 轮加群 ---")
-            
+
             if mode == "simultaneous":
                 await asyncio.gather(*(join_single_account_links_this_round(acc_id, phone) for acc_id, phone in accounts_info))
             else:
@@ -10840,10 +11247,10 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                     if task["status"] == "stopped":
                         break
                     await join_single_account_links_this_round(acc_id, phone)
-            
+
             if task["status"] == "stopped":
                 break
-                
+
             # Verify again if we should run next round
             all_accounts_done = True
             for acc_id, _ in accounts_info:
@@ -10852,11 +11259,11 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                 if idx < len(todo):
                     all_accounts_done = False
                     break
-                    
+
             if all_accounts_done:
                 task["logs"].append("所有链接处理完毕！")
                 break
-                
+
             # Wait between rounds
             if not max_rounds or current_round < max_rounds:
                 task["logs"].append(f"第 {current_round} 轮执行完毕。进入轮次休眠间隔，等待 {round_interval_minutes} 分钟开始下一轮...")
@@ -10865,9 +11272,9 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                 while slept_sec < sleep_time_sec and task["status"] == "running":
                     await asyncio.sleep(5)
                     slept_sec += 5
-                    
+
                 current_round += 1
-                
+
         if task["status"] != "stopped":
             task["status"] = "completed"
         task["logs"].append("入群任务执行完毕！")
@@ -10991,7 +11398,7 @@ def start_join_task(req: JoinTaskRequest, background_tasks: BackgroundTasks, use
         avg_delay = (req.safety_minutes * 60) / req.safety_groups
         if avg_delay < 30:
             raise HTTPException(status_code=400, detail=f"安全模式的平均时间间隔 ({avg_delay:.1f} 秒) 小于 30 秒限额，已被系统拦截，请增加间隔分钟数或减少群组数量。")
-            
+
     global last_join_task_id
     import uuid
     import datetime
@@ -11028,7 +11435,7 @@ def start_join_task(req: JoinTaskRequest, background_tasks: BackgroundTasks, use
         req.account_ids,
         {"company": user["company"], "owner_username": user["username"]},
     )
-    
+
     background_tasks.add_task(join_worker_task, task_id, req)
     return {"status": "started", "task_id": task_id}
 
@@ -11053,7 +11460,7 @@ def get_join_task_status(task_id: str, user: dict = Depends(get_current_user)):
                 raise HTTPException(status_code=500, detail=f"Failed to read task data: {e}")
         else:
             raise HTTPException(status_code=404, detail="Task not found")
-            
+
     task = active_join_tasks[task_id]
     if user["username"] not in ("eason", "admin") and user["company"] != "admin" and task.get("company") != user["company"]:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -11094,7 +11501,7 @@ def get_last_join_task(user: dict = Depends(get_current_user)):
             "logs": list(latest_task.get("logs")),
             "params": latest_task.get("params")
         }
-        
+
     # Try reading from company-specific last file
     sanitized_company = "".join(c for c in company if c.isalnum() or c in "._-")
     task_file = Path("data") / f"last_join_task_{sanitized_company}.json"
@@ -11124,7 +11531,7 @@ def get_last_join_task(user: dict = Depends(get_current_user)):
                 }
         except Exception:
             pass
-            
+
     return {"status": "none"}
 
 @app.get("/api/groups/join-task/history")
@@ -11211,7 +11618,7 @@ async def get_account_devices(account_id: str, user: dict = Depends(get_current_
         is_authorized = await client.is_user_authorized()
         if not is_authorized:
             raise HTTPException(status_code=401, detail="Account is not authorized")
-            
+
         authorizations = await client(functions.account.GetAuthorizationsRequest())
         devices = []
         for auth in authorizations.authorizations:
@@ -11244,7 +11651,7 @@ async def kick_account_device(account_id: str, req: KickDeviceRequest, user: dic
         is_authorized = await client.is_user_authorized()
         if not is_authorized:
             raise HTTPException(status_code=401, detail="Account is not authorized")
-            
+
         session_hash = int(req.hash)
         await client(functions.account.ResetAuthorizationRequest(hash=session_hash))
         return {"status": "success", "message": "Device terminated successfully"}
@@ -11274,18 +11681,18 @@ async def toggle_profile_modified(account_id: str, user: dict = Depends(get_curr
             db_account = session.get(AccountDb, account_id)
             if not db_account:
                 raise HTTPException(status_code=404, detail="Account not found")
-            
+
             db_account.profile_modified = not db_account.profile_modified
             db_account.updated_by = user["username"]
             session.add(db_account)
             session.commit()
-            
+
             path = account_config_path(account_id)
             if os.path.exists(path):
                 save_json(path, db_account.to_dict())
-                
+
             return {
-                "status": "success", 
+                "status": "success",
                 "profile_modified": db_account.profile_modified
             }
     except HTTPException:
@@ -11525,7 +11932,7 @@ async def run_group_scraping_task(
     active_scraper_task["progress"] = {"current": 0, "total": 0}
     active_scraper_task["logs"] = []
     active_scraper_task["error"] = None
-    
+
     def log(msg):
         timestamp = datetime.now().strftime("%H:%M:%S")
         active_scraper_task["logs"].append(f"[{timestamp}] {msg}")
@@ -11539,22 +11946,22 @@ async def run_group_scraping_task(
             active_scraper_task["status"] = "failed"
             active_scraper_task["error"] = "未配置 AI API Key"
             return
-            
+
         while active_scraper_task["status"] == "running":
             log(f"开始搜群任务 [第 {current_round} 轮]。目标保存群组数: {groups_per_round} 个 | 最少成员数: {min_members}")
-            
+
             added_this_round = 0
             history_skip_count = 0
             member_skip_count = 0
             fetch_fail_count = 0
-            
+
             # Step 1: Find a healthy, authorized Telegram account under this company
             from db import engine, AccountDb, Session, select, ScrapedGroupDb, GroupDb, GroupCategoryDb
-            
+
             authorized_account_id = None
             authorized_phone = None
             active_scraper_task["account_id"] = None
-            
+
             with Session(engine) as session:
                 if owner_username:
                     from sqlmodel import or_
@@ -11564,7 +11971,7 @@ async def run_group_scraping_task(
                 else:
                     stmt_acc = select(AccountDb).where(AccountDb.company == company)
                 accounts = filter_executable_accounts_for_task(session.exec(stmt_acc).all())
-                
+
             for acc in accounts:
                 try:
                     cl = await get_client(acc.id)
@@ -11574,13 +11981,13 @@ async def run_group_scraping_task(
                         break
                 except Exception:
                     pass
-                    
+
             if not authorized_account_id:
                 log("错误: 当前公司下没有可用的、已授权在线的电报账号，无法进行群消息获取。请至少登录一个账号！")
                 active_scraper_task["status"] = "failed"
                 active_scraper_task["error"] = "没有可在线 of 电报账号进行解析"
                 return
-                
+
             active_scraper_task["account_id"] = authorized_account_id
             register_account_task_usage(
                 "scraper",
@@ -11590,44 +11997,44 @@ async def run_group_scraping_task(
             )
             log(f"使用账号 [{authorized_phone}] 进行群组消息抓取 and 解析...")
             client = await get_client(authorized_account_id)
-            
+
             current_page = 0
             max_safety_pages = 30
             exhausted = False
-            
+
             while added_this_round < groups_per_round and current_page < max_safety_pages:
                 if active_scraper_task["status"] != "running":
                     break
-                    
+
                 log(f"正在搜寻第 {current_page + 1} 页的潜在公开群组链接 (当前本轮已保存: {added_this_round}/{groups_per_round}) ...")
                 from group_scraper import scrape_links_by_keywords_for_page, fetch_group_messages, analyze_group_with_gemini, analyze_group_with_deepseek, calculate_scraped_group_metrics
-                
+
                 links = scrape_links_by_keywords_for_page(keywords, current_page)
-                
+
                 if not links:
                     log(f"第 {current_page + 1} 页未找到任何潜在链接，搜索引擎结果已耗尽。")
                     exhausted = True
                     break
-                    
+
                 log(f"第 {current_page + 1} 页搜寻结束，共找到 {len(links)} 个潜在链接。开始进行提取与分析...")
-                
+
                 active_scraper_task["progress"]["total"] = len(links)
-                
+
                 for idx, link in enumerate(links):
                     if active_scraper_task["status"] != "running":
                         break
                     if added_this_round >= groups_per_round:
                         break
-                        
+
                     active_scraper_task["progress"]["current"] = idx + 1
-                    
+
                     # Extract username
                     public_match = re.search(r'(?:t\.me|telegram\.me)/(?:joinchat/|\+)?([a-zA-Z0-9_\+]{5,32})', link)
                     if not public_match:
                         continue
-                        
+
                     username = public_match.group(1)
-                    
+
                     # Deduplication check
                     with Session(engine) as session:
                         existing = session.get(ScrapedGroupDb, username)
@@ -11635,12 +12042,12 @@ async def run_group_scraping_task(
                         log(f"  [排重] 跳过历史已存在重复群组: @{username}")
                         history_skip_count += 1
                         continue
-                        
+
                     # Check if this is a joinchat/private hash
                     if "joinchat/" in link or "+" in link:
                         log(f"  [过滤] 跳过私有加群链接: {link}")
                         continue
-                        
+
                     log(f"  正在免加群提取群组信息: @{username} ...")
                     res = await fetch_group_messages(client, username)
                     if not res.get("success"):
@@ -11654,19 +12061,19 @@ async def run_group_scraping_task(
                         fetch_fail_count += 1
                         await asyncio.sleep(4)
                         continue
-                        
+
                     title = res["title"]
                     member_count = res["member_count"]
                     messages = res["messages"]
-                    
+
                     log(f"  获取成功! 标题: '{title}' | 成员数: {member_count}。")
-                    
+
                     if member_count < min_members:
                         log(f"  群成员数 ({member_count}) 低于最低成员数限制 ({min_members})。跳过。")
                         member_skip_count += 1
                         await asyncio.sleep(4)
                         continue
-                        
+
                     # Perform AI analysis
                     analysis = None
                     if deepseek_api_key:
@@ -11678,7 +12085,7 @@ async def run_group_scraping_task(
                     elif gemini_api_key:
                         log("  正在交由 Gemini 进行智能属性与业务粘合度评估...")
                         analysis = analyze_group_with_gemini(gemini_api_key, title, res.get("description", ""), messages, target_keywords=keywords)
-                        
+
                     if not analysis:
                         analysis = {
                             "category": "unknown",
@@ -11686,18 +12093,18 @@ async def run_group_scraping_task(
                             "analysis_summary": "未配置或调用 AI 接口失败，使用本地兜底计算",
                             "recommendation": "请在配置中保存有效的 AI 密钥"
                         }
-                    
+
                     category = analysis.get("category", "unknown")
                     relevance = analysis.get("relevance_score")
                     summary = analysis.get("analysis_summary", "")
                     recom = analysis.get("recommendation", "")
-                    
+
                     # Compute Python metrics and combined quality score
                     metrics = calculate_scraped_group_metrics(member_count, messages, keywords, api_relevance_score=relevance, group_type=res.get("group_type", "group"), is_dead=res.get("is_dead", False))
                     score = metrics["quality_score"]
-                    
+
                     log(f"  AI/Python 评估结果 -> 分类: {category} | 综合评分: {score}")
-                    
+
                     # Save/Update in DB
                     with Session(engine) as session:
                         db_group = session.get(ScrapedGroupDb, username)
@@ -11748,7 +12155,7 @@ async def run_group_scraping_task(
                             "unknown": "待测/私有"
                         }
                         group_category = category_mapping.get(category, "待测/私有")
-                        
+
                         is_duplicate = False
                         with Session(engine) as session:
                             stmt_dup = select(GroupDb).where(GroupDb.company == company)
@@ -11759,7 +12166,7 @@ async def run_group_scraping_task(
                                 if g_item.title and g_item.title.strip() == title.strip():
                                     is_duplicate = True
                                     break
-                        
+
                         if is_duplicate:
                             log(f"  [自动保存] 触发排重：群组 @{username} 已存在于主群组库中，跳过。")
                         else:
@@ -11774,7 +12181,7 @@ async def run_group_scraping_task(
                                         new_cat = GroupCategoryDb(name=group_category, company=company)
                                         session.add(new_cat)
                                         session.commit()
-                                
+
                                 group_id_str = username
                                 group_type_str = res.get("group_type", "group")
                                 try:
@@ -11784,7 +12191,7 @@ async def run_group_scraping_task(
                                         group_type_str = "channel" if getattr(entity, 'broadcast', False) else "group"
                                 except Exception as ee:
                                     log(f"  [自动保存] 获取实体ID失败: {ee}")
-                                
+
                                 if group_type_str == "channel":
                                     log(f"  [自动保存] 检测到 @{username} 是频道，触发‘频道不自动保存’规则，跳过。")
                                 else:
@@ -11803,7 +12210,7 @@ async def run_group_scraping_task(
                                         session.commit()
                                     log(f"  [自动保存] 自动保存群组成功: @{username} (分类: {group_category})")
                                     added_this_round += 1
-                                    
+
                                     with Session(engine) as session:
                                         db_group = session.get(ScrapedGroupDb, username)
                                         if db_group:
@@ -11817,37 +12224,37 @@ async def run_group_scraping_task(
                             added_this_round += 1
 
                     await asyncio.sleep(5)
-                
+
                 current_page += 1
-            
+
             # Summary report at the end of each round
             log("阶段性搜寻分析汇报：")
             log(f"- 本轮已搜寻并处理的新增/更新群组: {added_this_round}/{groups_per_round} 个")
             log(f"- 跳过历史已存在重复群组: {history_skip_count} 个")
             log(f"- 跳过成员数不达标群组: {member_skip_count} 个")
             log(f"- 跳过消息提取失败群组: {fetch_fail_count} 个")
-            
+
             if exhausted:
                 log("由于所有搜索页面均已被穷尽，本轮搜寻提前结束。")
-                
+
             if max_rounds is not None and current_round >= max_rounds:
                 log(f"已达到最大限制轮数 {max_rounds} 轮，任务正常结束。")
                 break
-                
+
             if not continuous:
                 break
-                
+
             log(f"本轮任务完成。休眠 {interval_minutes} 分钟后继续搜寻新群组...")
             current_round += 1
             for _ in range(interval_minutes * 60):
                 if active_scraper_task["status"] != "running":
                     break
                 await asyncio.sleep(1)
-                
+
         if active_scraper_task["status"] != "stopped":
             log("搜群与分析任务全部完成！")
             active_scraper_task["status"] = "completed"
-            
+
     except Exception as e:
         import traceback
         err_msg = f"任务运行异常: {str(e)}\n{traceback.format_exc()}"
@@ -11899,14 +12306,14 @@ def start_scraped_groups_search_task(req: ScrapedGroupsSearchRequest, background
     active_scraper_task = get_company_scraper_task(user["company"])
     if active_scraper_task["status"] == "running":
         raise HTTPException(status_code=400, detail="当前已有正在运行的搜群任务")
-        
+
     save_scraper_config(req.keywords, req.min_members, req.max_pages, req.continuous or False, req.interval_minutes or 30)
     active_scraper_task["keywords"] = req.keywords
     active_scraper_task["min_members"] = req.min_members
     active_scraper_task["max_pages"] = req.max_pages
     active_scraper_task["continuous"] = req.continuous or False
     active_scraper_task["interval_minutes"] = req.interval_minutes or 30
-    
+
     background_tasks.add_task(
         run_group_scraping_task,
         req.keywords,
@@ -11963,7 +12370,7 @@ def list_scraped_groups(
             stmt = stmt.where(ScrapedGroupDb.quality_score >= min_score)
         if keyword:
             stmt = stmt.where(ScrapedGroupDb.keyword.contains(keyword))
-            
+
         if sort_by == "score":
             stmt = stmt.order_by(ScrapedGroupDb.quality_score.desc())
         elif sort_by == "date":
@@ -11971,7 +12378,7 @@ def list_scraped_groups(
         else:
             # Default sorting: starred/important pinned first, then by created_at desc
             stmt = stmt.order_by(ScrapedGroupDb.is_important.desc(), ScrapedGroupDb.created_at.desc())
-            
+
         results = session.exec(stmt).all()
         return results
 
@@ -11993,17 +12400,17 @@ def toggle_scraped_group_important(group_id: str, user: dict = Depends(get_curre
 def batch_action_scraped_groups(req: ScrapedGroupsBatchActionRequest, user: dict = Depends(get_current_user)):
     """Applies action (join, ignore, delete) on multiple scraped groups."""
     from db import engine, ScrapedGroupDb, GroupDb, Session, select
-    
+
     with Session(engine) as session:
         is_admin = user["username"] in ("eason", "admin") or user["company"] == "admin"
         stmt = select(ScrapedGroupDb).where(ScrapedGroupDb.id.in_(req.ids))
         if not is_admin:
             stmt = stmt.where(ScrapedGroupDb.company == user["company"])
         scraped_items = session.exec(stmt).all()
-        
+
         if not scraped_items:
             return {"status": "success", "count": 0}
-            
+
         count = 0
         for item in scraped_items:
             if req.action == "delete":
@@ -12043,7 +12450,7 @@ def batch_action_scraped_groups(req: ScrapedGroupsBatchActionRequest, user: dict
                                 if not existing_admin:
                                     new_cat = GroupCategoryDb(name=cat_name, company=user["company"])
                                     session.add(new_cat)
-                                    
+
                     # Insert new group to GroupDb
                     new_group = GroupDb(
                         id=group_id_str,
@@ -12056,12 +12463,12 @@ def batch_action_scraped_groups(req: ScrapedGroupsBatchActionRequest, user: dict
                         category=req.category_to_assign
                     )
                     session.add(new_group)
-                
+
                 # Mark scraped status as joined
                 item.status = "joined"
                 session.add(item)
                 count += 1
-                
+
         session.commit()
         return {"status": "success", "count": count}
 
@@ -12087,7 +12494,7 @@ async def run_business_expansion_loop(
     active_expansion_task["target_desc"] = target_desc
     active_expansion_task["interval_minutes"] = interval_minutes
     active_expansion_task["error"] = None
-    
+
     def log(msg):
         from datetime import datetime
         timestamp = datetime.now().strftime("%m-%d %H:%M:%S")
@@ -12112,12 +12519,12 @@ async def run_business_expansion_loop(
         from db import engine, AccountDb, ScrapedGroupDb, GroupDb, Session, select
         from datetime import datetime
         import random
-        
+
         while active_expansion_task["status"] in ("running", "paused"):
             if active_expansion_task["status"] == "paused":
                 await asyncio.sleep(5)
                 continue
-                
+
             gemini_api_key = get_gemini_api_key()
             deepseek_api_key = get_deepseek_api_key()
             if not gemini_api_key and not deepseek_api_key:
@@ -12125,41 +12532,41 @@ async def run_business_expansion_loop(
                 active_expansion_task["status"] = "failed"
                 active_expansion_task["error"] = "未配置 AI API Key"
                 break
-                
+
             # 1. Gather previously searched keywords from DB to avoid duplication
             with Session(engine) as session:
                 stmt = select(ScrapedGroupDb.keyword).where(ScrapedGroupDb.company == company).distinct()
                 searched = list(session.exec(stmt).all())
                 searched = [s for s in searched if s]
-                
+
             log("正在请 AI 构思下一步搜寻的关键词...")
             res_kw = None
             if gemini_api_key:
                 res_kw = generate_keyword_with_gemini(gemini_api_key, active_expansion_task.get("target_desc", target_desc), searched)
             elif deepseek_api_key:
                 res_kw = generate_keyword_with_deepseek(deepseek_api_key, active_expansion_task.get("target_desc", target_desc), searched)
-                
+
             if not res_kw:
                 res_kw = {"keyword": "", "reasoning": "未配置有效的 AI 密钥"}
-                
+
             kw = res_kw.get("keyword", "").strip()
             reason = res_kw.get("reasoning", "未提供理由").strip()
-            
+
             if not kw:
                 log(f"AI 构思关键词失败或为空。原因: {reason}。将在 2 分钟后重试...")
                 await asyncio.sleep(120)
                 continue
-                
+
             active_expansion_task["current_keyword"] = kw
             log(f"[AI 思考结论] 决定搜寻关键词: '{kw}'")
             log(f"[AI 思考逻辑] {reason}")
-            
+
             # 2. Scrape group links using combined scraper
             log(f"正在抓取关键词 '{kw}' 相关的电报群链接...")
             active_expansion_task["account_id"] = None
             links = scrape_links_by_keywords([kw], max_pages=1)
             log(f"抓取完成。共找到 {len(links)} 个潜在公开群链接。")
-            
+
             if not links:
                 log("此轮未找到合适的新链接，等待下一个周期。")
             else:
@@ -12168,7 +12575,7 @@ async def run_business_expansion_loop(
                 authorized_phone = None
                 with Session(engine) as session:
                     accounts = filter_executable_accounts_for_task(session.exec(select(AccountDb).where(AccountDb.company == company)).all())
-                    
+
                 for acc in accounts:
                     try:
                         cl = await get_client(acc.id)
@@ -12178,7 +12585,7 @@ async def run_business_expansion_loop(
                             break
                     except Exception:
                         pass
-                        
+
                 if not authorized_account_id:
                     log("警告: 当前公司下没有在线已登录的电报账号！无法拉取群消息进行评估，此轮跳过。")
                 else:
@@ -12191,30 +12598,30 @@ async def run_business_expansion_loop(
                     )
                     log(f"使用账号 [{authorized_phone}] 进行群组消息拉取与 AI 质量评估...")
                     client = await get_client(authorized_account_id)
-                    
+
                     # 4. Iterate and analyze
                     for idx, link in enumerate(links):
                         if active_expansion_task["status"] != "running":
                             break
-                            
+
                         # Extract public username
                         public_match = re.search(r'(?:t\.me|telegram\.me)/(?:joinchat/|\+)?([a-zA-Z0-9_\+]{5,32})', link)
                         if not public_match or "joinchat/" in link or "+" in link:
                             # Skip private links
                             continue
-                            
+
                         username = public_match.group(1)
-                        
+
                         # Check if this group was already analyzed in database
                         with Session(engine) as session:
                             existing = session.get(ScrapedGroupDb, username)
                         if existing and existing.category != "unknown":
                             # Already processed
                             continue
-                            
+
                         log(f"正在拉取群组 @{username} 的详情与消息...")
                         fetch_res = await fetch_group_messages(client, username)
-                        
+
                         if not fetch_res.get("success"):
                             err_msg = fetch_res.get("error", "")
                             log(f"  拉取群组 @{username} 消息失败: {err_msg}")
@@ -12225,13 +12632,13 @@ async def run_business_expansion_loop(
                                 break
                             await asyncio.sleep(4)
                             continue
-                            
+
                         title = fetch_res["title"]
                         member_count = fetch_res["member_count"]
                         messages = fetch_res["messages"]
-                        
+
                         log(f"  拉取成功。标题: '{title}' | 成员数: {member_count}。提交 AI 进行质量打分...")
-                        
+
                         # Run AI analysis (Prioritize DeepSeek, fallback to Gemini, then local)
                         analysis = None
                         if deepseek_api_key:
@@ -12241,7 +12648,7 @@ async def run_business_expansion_loop(
                                 analysis = analyze_group_with_gemini(gemini_api_key, title, fetch_res.get("description", ""), messages, target_keywords=[kw], target_desc=target_desc)
                         elif gemini_api_key:
                             analysis = analyze_group_with_gemini(gemini_api_key, title, fetch_res.get("description", ""), messages, target_keywords=[kw], target_desc=target_desc)
-                            
+
                         if not analysis:
                             analysis = {
                                 "category": "unknown",
@@ -12249,18 +12656,18 @@ async def run_business_expansion_loop(
                                 "analysis_summary": "未配置或调用 AI 接口失败，使用本地兜底计算",
                                 "recommendation": "请在配置中保存有效的 AI 密钥"
                             }
-                            
+
                         category = analysis.get("category", "unknown")
                         relevance = analysis.get("relevance_score") # can be None
                         summary = analysis.get("analysis_summary", "")
                         recom = analysis.get("recommendation", "")
-                        
+
                         # Compute Python metrics and combined quality score
                         metrics = calculate_scraped_group_metrics(member_count, messages, [kw], api_relevance_score=relevance, group_type=fetch_res.get("group_type", "group"), is_dead=fetch_res.get("is_dead", False))
                         score = metrics["quality_score"]
-                        
+
                         log(f"  AI/Python 评估结果 -> 分类: {category} | 粘合度: {metrics['relevance_score']} | 活跃度: {metrics['activity_score']} | 互动率: {metrics['engagement_score']} | 垃圾扣分: {metrics['spam_penalty']} | 综合评分: {score}")
-                        
+
                         # Save in database
                         with Session(engine) as session:
                             db_group = session.get(ScrapedGroupDb, username)
@@ -12323,7 +12730,7 @@ async def run_business_expansion_loop(
                                         if g_item.title and g_item.title.strip() == title.strip():
                                             is_duplicate = True
                                             break
-                                
+
                                 if is_duplicate:
                                     log(f"  [加群控制] 触发排重机制跳过：群组 @{username} ('{title}') 已存在于群组库中，不往下执行。")
                                 else:
@@ -12340,7 +12747,7 @@ async def run_business_expansion_loop(
                                         current_round += 1
                                         added_this_round = 0
                                         log(f"  [加群控制] 休眠结束，进入第 {current_round} 轮。")
-                                    
+
                                     # Double check max_rounds after potential sleep round increments
                                     if max_rounds is None or current_round <= max_rounds:
                                         if active_expansion_task["status"] == "running":
@@ -12350,7 +12757,7 @@ async def run_business_expansion_loop(
                                                 entity = await join_group_or_channel(client, username)
                                                 log(f"  [加群控制] 自动加入成功: @{username}")
                                                 added_this_round += 1
-                                                
+
                                                 # Save to GroupDb
                                                 from db import GroupDb
                                                 with Session(engine) as session:
@@ -12366,7 +12773,7 @@ async def run_business_expansion_loop(
                                                     )
                                                     session.merge(db_g)
                                                     session.commit()
-                                                    
+
                                                 # Mark scraped status as joined
                                                 with Session(engine) as session:
                                                     db_group = session.get(ScrapedGroupDb, username)
@@ -12379,7 +12786,7 @@ async def run_business_expansion_loop(
 
                         # Avoid Telegram rate limits
                         await asyncio.sleep(5)
-                        
+
             # Sleep for the interval
             current_interval = active_expansion_task.get("interval_minutes", interval_minutes)
             log(f"此轮自主搜群拓展完成。休眠 {current_interval} 分钟后继续...")
@@ -12387,9 +12794,9 @@ async def run_business_expansion_loop(
                 if active_expansion_task["status"] != "running":
                     break
                 await asyncio.sleep(1)
-                
+
         log("自主业务拓展任务已终止。")
-        
+
     except Exception as e:
         import traceback
         err_msg = f"自主业务拓展循环异常: {str(e)}\n{traceback.format_exc()}"
@@ -12404,22 +12811,22 @@ async def run_business_expansion_loop(
 async def start_business_expansion(req: StartExpansionRequest, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
     active_expansion_task = get_company_expansion_task(user["company"])
     from datetime import datetime
-    
+
     interval = req.loop_interval_minutes or 15
     save_expansion_config(req.target_desc, interval)
-    
+
     active_expansion_task["target_desc"] = req.target_desc
     active_expansion_task["interval_minutes"] = interval
-    
+
     if active_expansion_task["status"] == "running":
         return {"status": "success", "message": "业务拓展目标已更新"}
-        
+
     if active_expansion_task["status"] == "paused":
         active_expansion_task["status"] = "running"
         timestamp = datetime.now().strftime("%m-%d %H:%M:%S")
         active_expansion_task["logs"].append(f"[{timestamp}] 业务拓展已恢复运行。")
         return {"status": "success", "message": "业务拓展已恢复运行"}
-        
+
     background_tasks.add_task(
         run_business_expansion_loop,
         req.target_desc,
@@ -12488,7 +12895,7 @@ def get_internal_bot_status():
     """Internal endpoint for Telegram Bot to query real-time account and task statuses."""
     from db import engine, AccountDb, CampaignTaskDb, Session, select
     import time
-    
+
     with Session(engine) as session:
         # 1. Fetch all accounts
         db_accounts = session.exec(select(AccountDb)).all()
@@ -12497,7 +12904,7 @@ def get_internal_bot_status():
             # Check memory connection state
             live_client = active_clients.get(acc.id)
             live_connected = bool(live_client and live_client.is_connected())
-            
+
             # Fetch statuses from memory store
             status = account_status_store.get(acc.id, {
                 "is_connected": False,
@@ -12507,7 +12914,7 @@ def get_internal_bot_status():
                 "spambot_details": "",
                 "spambot_time": None
             })
-            
+
             # Compute listener health state
             health = "disabled"
             cooldown_until = auto_private_listener_cooldowns.get(acc.id, 0)
@@ -12527,7 +12934,7 @@ def get_internal_bot_status():
                         health = "disabled"
             else:
                 health = "disabled"
-            
+
             accounts_result.append({
                 "id": acc.id,
                 "account_name": acc.account_name or acc.id,
@@ -12539,7 +12946,7 @@ def get_internal_bot_status():
                 "listener_health": health,
                 "cooldown_left": max(0, int(cooldown_until - time.time()))
             })
-            
+
         # 2. Fetch all campaign tasks
         db_tasks = session.exec(select(CampaignTaskDb)).all()
         tasks_result = []
@@ -12548,7 +12955,7 @@ def get_internal_bot_status():
             is_running = task.id in active_processes and active_processes[task.id].poll() is None
             if not is_running:
                 is_running = find_campaign_process(task.id) is not None
-                
+
             tasks_result.append({
                 "id": task.id,
                 "account_id": task.account_id,
@@ -12560,7 +12967,7 @@ def get_internal_bot_status():
                 "round_interval_minutes": task.round_interval_minutes,
                 "message": task.message[:100] if task.message else "",
             })
-            
+
         return {
             "ok": True,
             "accounts": accounts_result,
@@ -12575,7 +12982,7 @@ async def run_account_cleanup_process(account_id: str):
     import datetime
     import re
     from datetime import timezone
-    
+
     progress = {
         "status": "running",
         "started_at": time.time(),
@@ -12587,19 +12994,19 @@ async def run_account_cleanup_process(account_id: str):
     }
     failed_folders = set()
     cleanup_tasks_progress[account_id] = progress
-    
+
     def log(msg):
         print(f"[{account_id} Cleanup] {msg}")
         progress["logs"].append(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}")
 
     log("初始化账号整理任务...")
-    
+
     client = None
     try:
         # 获取 Telethon 客户端，必须在 locks 保护内获取以防写冲突
         if account_id not in client_locks:
             client_locks[account_id] = asyncio.Lock()
-            
+
         async with client_locks[account_id]:
             # 假定此时账号已经在线，如果没有连上，则临时 connect
             client = active_clients.get(account_id)
@@ -12613,13 +13020,13 @@ async def run_account_cleanup_process(account_id: str):
                 client = await build_client(config, base_dir)
                 await client.connect()
                 active_clients[account_id] = client
-                
+
             if not await client.is_user_authorized():
                 raise Exception("账号未授权登录，请先登录")
-                
+
             if not client.is_connected():
                 await client.connect()
-                
+
             # 获取翻译 Bot 和 AI Bot 的 InputPeer
             ai_bot_username = "RosePayTest_bot"
             translate_bot_username = "RosePay_translation_bot"
@@ -12637,7 +13044,7 @@ async def run_account_cleanup_process(account_id: str):
                             translate_bot_username = row["bot_username"]
             except Exception as e:
                 log(f"查询数据库 bots 失败，使用默认值: {e}")
-                
+
             translate_bot_peer = None
             ai_bot_peer = None
             try:
@@ -12645,20 +13052,20 @@ async def run_account_cleanup_process(account_id: str):
                     translate_bot_peer = await client.get_input_entity(translate_bot_username)
             except Exception as e:
                 log(f"获取翻译 Bot '{translate_bot_username}' InputPeer 失败: {e}")
-                
+
             try:
                 if ai_bot_username:
                     ai_bot_peer = await client.get_input_entity(ai_bot_username)
             except Exception as e:
                 log(f"获取 AI Bot '{ai_bot_username}' InputPeer 失败: {e}")
-                
+
             # 开始获取会话列表
             log("正在拉取对话列表...")
             dialogs = await client.get_dialogs()
             log(f"拉取完成。共发现 {len(dialogs)} 个对话窗口")
-            
+
             now_dt = datetime.datetime.now(timezone.utc)
-            
+
             # --- 第一阶段：清理不活跃群组 ---
             log("=== 第一阶段：检测并退出不活跃群组 ===")
             groups_to_cleanup = []
@@ -12668,16 +13075,16 @@ async def run_account_cleanup_process(account_id: str):
                     if not is_megagroup and dialog.is_channel:
                         # 排除纯频道，只清理群组
                         continue
-                        
+
                     last_msg_date = None
                     if dialog.message and dialog.message.date:
                         last_msg_date = dialog.message.date
-                        
+
                     if last_msg_date:
                         diff = now_dt - last_msg_date
                         if diff.days >= 7:
                             groups_to_cleanup.append(dialog)
-            
+
             log(f"共检测到 {len(groups_to_cleanup)} 个超过 7 天无新发言的不活跃群组。")
             for idx, g in enumerate(groups_to_cleanup):
                 try:
@@ -12696,20 +13103,20 @@ async def run_account_cleanup_process(account_id: str):
                 except Exception as e:
                     log(f"退出群组 {g.name} 失败: {e}")
                     await asyncio.sleep(2)
-            
+
             # 重新拉取一次 Dialog 列表，以排除已经退出的群
             log("重新刷新对话列表以准备分类文件夹...")
             dialogs = await client.get_dialogs()
-            
+
             # --- 第二阶段：分析字数与中英文，即时分配并写入文件夹 ---
             log("=== 第二阶段：群组字数/语言特征判别、即时归类与文件夹写入 ===")
-            
+
             # 在第二阶段开始前，先清理所有旧的文件夹分类
             log("正在清理云端旧的分类文件夹...")
             try:
                 filters_res = await client(functions.messages.GetDialogFiltersRequest())
                 current_filters = filters_res.filters
-                
+
                 old_titles_to_remove = ["中文广告群", "英文广告群", "短广告群", "DM", "中文长", "中文短", "英文长", "英文短"]
                 for f in current_filters:
                     if isinstance(f, types.DialogFilter):
@@ -12725,9 +13132,9 @@ async def run_account_cleanup_process(account_id: str):
                             await asyncio.sleep(1)
             except Exception as e:
                 log(f"清理旧分类文件夹失败: {e}")
-                
+
             all_classified_peers = set() # 记录已命中规则的所有 Peer 引用，方便后续归档
-            
+
             # 归类群组
             for idx, dialog in enumerate(dialogs):
                 if dialog.is_group or (dialog.is_channel and getattr(dialog.entity, 'megagroup', False)):
@@ -12735,10 +13142,10 @@ async def run_account_cleanup_process(account_id: str):
                         # 拉取最近 10 条消息来判定发言限制和中英文
                         msgs = await client.get_messages(dialog.input_entity, limit=10)
                         await asyncio.sleep(2) # 每次拉取消息静默 2 秒
-                        
+
                         if not msgs:
                             continue
-                            
+
                         # 1. 判定字数限制
                         msg_lengths = [len(m.message) for m in msgs if m.message]
                         is_short_ad = False
@@ -12746,17 +13153,17 @@ async def run_account_cleanup_process(account_id: str):
                             max_len = max(msg_lengths)
                             if max_len < 200:
                                 is_short_ad = True
-                        
+
                         # 2. 判定语言 (中英文)，综合考虑群名和活跃发言
                         has_chinese_name = False
                         if dialog.name:
                             has_chinese_name = bool(re.search(r"[\u4e00-\u9fa5]", dialog.name)) or "🇨🇳" in dialog.name
-                        
+
                         text_messages = [m.message for m in msgs if m.message]
                         has_messages = len(text_messages) > 0
                         combined_text = "".join(text_messages)
                         has_chinese_messages = bool(re.search(r"[\u4e00-\u9fa5]", combined_text))
-                        
+
                         is_chinese = False
                         if has_messages:
                             # 活跃发言中必须包含中文，方可判定为中文群（起到了中英文的区别）
@@ -12766,10 +13173,10 @@ async def run_account_cleanup_process(account_id: str):
                             # 如果最近没有发言，降级使用群名判定
                             if has_chinese_name:
                                 is_chinese = True
-                        
+
                         input_peer = dialog.input_entity
                         all_classified_peers.add(dialog.id)
-                        
+
                         if is_chinese:
                             if is_short_ad:
                                 title = "中文短"
@@ -12780,18 +13187,18 @@ async def run_account_cleanup_process(account_id: str):
                                 title = "英文短"
                             else:
                                 title = "英文长"
-                            
+
                         log_info = f"群组: {dialog.name} | 判定类别: {title} | 字数: {'短' if is_short_ad else '长'} | 语言: {'中文' if is_chinese else '英文'}"
                         log(log_info)
-                        
+
                         if title in failed_folders:
                             continue
-                            
+
                         # 即时写入/更新 Telegram 文件夹
                         try:
                             filters_res = await client(functions.messages.GetDialogFiltersRequest())
                             current_filters = filters_res.filters
-                            
+
                             f_obj = None
                             for f in current_filters:
                                 if isinstance(f, types.DialogFilter) and normalize_title(f.title) == normalize_title(title):
@@ -12817,29 +13224,29 @@ async def run_account_cleanup_process(account_id: str):
                                 )
                                 current_filters.append(f_obj)
                                 log(f"已新建文件夹: '{title}'")
-                                
+
                             existing_peer_ids = []
                             for p in f_obj.include_peers:
                                 p_id = getattr(p, 'user_id', None) or getattr(p, 'channel_id', None) or getattr(p, 'chat_id', None)
                                 if p_id:
                                     existing_peer_ids.append(p_id)
-                                    
+
                             new_p_id = dialog.entity.id
                             peer_obj = await client.get_input_entity(dialog.entity)
-                                
+
                             if new_p_id and new_p_id not in existing_peer_ids:
                                 # 重新实例化一个全新的 DialogFilter，清洗所有的 include_peers/pinned_peers/exclude_peers
                                 updated_peers = list(f_obj.include_peers) + [peer_obj]
                                 clean_include = await clean_and_convert_peers_async(client, updated_peers)
                                 clean_pinned = await clean_and_convert_peers_async(client, getattr(f_obj, "pinned_peers", []) or [])
                                 clean_exclude = await clean_and_convert_peers_async(client, getattr(f_obj, "exclude_peers", []) or [])
-                                
+
                                 title_text = getattr(f_obj, "title", title)
                                 if isinstance(title_text, str):
                                     title_obj = types.TextWithEntities(text=title_text, entities=[])
                                 else:
                                     title_obj = title_text
-                                
+
                                 new_filter = types.DialogFilter(
                                     id=f_obj.id,
                                     title=title_obj,
@@ -12862,7 +13269,7 @@ async def run_account_cleanup_process(account_id: str):
                                 log(f"账号文件夹数量已达 Telegram 上限，无法创建新文件夹 '{title}'，请手动清理一些不用的文件夹后再试。")
                             else:
                                 log(f"即时移动群组 {dialog.name} 到文件夹 {title} 失败: {fe}")
-                            
+
                         progress["grouped_channels"] += 1
                     except errors.FloodWaitError as fwe:
                         log(f"分析群组时遭遇 429 频限，需要等待 {fwe.seconds} 秒。跳过其余群递析。")
@@ -12871,19 +13278,19 @@ async def run_account_cleanup_process(account_id: str):
                     except Exception as e:
                         err_str = str(e)
                         log(f"分析群组 {dialog.name} 异常: {e}")
-                        
+
                         # 判定是否为失效群组，如果是则直接退群（删掉）
                         is_invalid_group = False
                         if any(k in err_str for k in [
-                            "CHANNEL_PRIVATE", 
-                            "CHAT_WRITE_FORBIDDEN", 
-                            "USER_BANNED_IN_CHANNEL", 
+                            "CHANNEL_PRIVATE",
+                            "CHAT_WRITE_FORBIDDEN",
+                            "USER_BANNED_IN_CHANNEL",
                             "CHAT_ADMIN_REQUIRED",
                             "ChannelPrivateError",
                             "ChatWriteForbiddenError"
                         ]):
                             is_invalid_group = True
-                            
+
                         if is_invalid_group:
                             try:
                                 log(f"检测到群组 '{dialog.name}' 已失效，正在执行退群物理删除...")
@@ -12896,7 +13303,7 @@ async def run_account_cleanup_process(account_id: str):
                                 await asyncio.sleep(3)
                             except Exception as le:
                                 log(f"退出失效群组 '{dialog.name}' 失败: {le}")
-            
+
             # --- 第三阶段：私聊同步 DM 文件夹 (即时同步) ---
             log("=== 第三阶段：同步私聊窗口至 DM 文件夹 ===")
             dm_count = 0
@@ -12904,13 +13311,13 @@ async def run_account_cleanup_process(account_id: str):
                 if dialog.is_user and getattr(dialog.entity, 'bot', False) is False:
                     try:
                         all_classified_peers.add(dialog.id)
-                        
+
                         if "DM" in failed_folders:
                             continue
-                            
+
                         filters_res = await client(functions.messages.GetDialogFiltersRequest())
                         current_filters = filters_res.filters
-                        
+
                         f_obj = None
                         for f in current_filters:
                             if isinstance(f, types.DialogFilter) and normalize_title(f.title) == normalize_title("DM"):
@@ -12936,13 +13343,13 @@ async def run_account_cleanup_process(account_id: str):
                             )
                             current_filters.append(f_obj)
                             log("已新建文件夹: 'DM'")
-                            
+
                         existing_peer_ids = []
                         for p in f_obj.include_peers:
                             p_id = getattr(p, 'user_id', None) or getattr(p, 'channel_id', None) or getattr(p, 'chat_id', None)
                             if p_id:
                                 existing_peer_ids.append(p_id)
-                                
+
                         new_p_id = dialog.entity.id
                         peer_obj = await client.get_input_entity(dialog.entity)
                         if new_p_id and new_p_id not in existing_peer_ids:
@@ -12951,13 +13358,13 @@ async def run_account_cleanup_process(account_id: str):
                             clean_include = await clean_and_convert_peers_async(client, updated_peers)
                             clean_pinned = await clean_and_convert_peers_async(client, getattr(f_obj, "pinned_peers", []) or [])
                             clean_exclude = await clean_and_convert_peers_async(client, getattr(f_obj, "exclude_peers", []) or [])
-                            
+
                             title_text = getattr(f_obj, "title", "DM")
                             if isinstance(title_text, str):
                                 title_obj = types.TextWithEntities(text=title_text, entities=[])
                             else:
                                 title_obj = title_text
-                                
+
                             new_filter = types.DialogFilter(
                                 id=f_obj.id,
                                 title=title_obj,
@@ -12973,7 +13380,7 @@ async def run_account_cleanup_process(account_id: str):
                             await client(functions.messages.UpdateDialogFilterRequest(id=f_obj.id, filter=new_filter))
                             log(f"已即时将私聊 '{dialog.name}' 移入文件夹 'DM'。")
                             await asyncio.sleep(0.5)
-                            
+
                         dm_count += 1
                         progress["synced_dms"] = dm_count
                     except Exception as fe:
@@ -12983,16 +13390,16 @@ async def run_account_cleanup_process(account_id: str):
                             log("账号文件夹数量已达 Telegram 上限，无法创建新文件夹 'DM'，请手动清理一些不用的文件夹后再试。")
                         else:
                             log(f"同步私聊 {dialog.name} 失败: {fe}")
-                    
+
             # --- 第五阶段：将所有整理命中会话进行“归档隐藏” ---
             log("=== 第五阶段：批量隐藏归档会话 (Archive) ===")
             peers_to_archive = []
-            
+
             for dialog in dialogs:
                 if dialog.id in all_classified_peers:
                     if dialog.folder_id != 1:
                         peers_to_archive.append(dialog)
-                        
+
             if peers_to_archive:
                 log(f"共有 {len(peers_to_archive)} 个会话需要进行归档隐藏...")
                 for i in range(0, len(peers_to_archive), 20):
@@ -13014,17 +13421,17 @@ async def run_account_cleanup_process(account_id: str):
                         await asyncio.sleep(2)
             else:
                 log("没有检测到需要移动归档的非归档会话。")
-                
+
             # --- 第六阶段：确保翻译 Bot 存在于每一个分类文件夹中，并且置顶 ---
             log("=== 第六阶段：将翻译 Bot 同步并置顶到每一个分类文件夹 ===")
             if translate_bot_peer:
                 try:
                     filters_res = await client(functions.messages.GetDialogFiltersRequest())
                     current_filters = filters_res.filters
-                    
+
                     # 4个我们要管理的文件夹名称
                     target_folder_titles = ["中文长", "中文短", "英文长", "英文短"]
-                    
+
                     for f_obj in current_filters:
                         if isinstance(f_obj, types.DialogFilter):
                             f_title = getattr(f_obj, "title", "")
@@ -13033,13 +13440,13 @@ async def run_account_cleanup_process(account_id: str):
                                 if normalize_title(f_title) == normalize_title(target_title):
                                     is_target = True
                                     break
-                            
+
                             if is_target:
                                 # 清洗现有的 include/pinned/exclude
                                 clean_include = await clean_and_convert_peers_async(client, list(f_obj.include_peers) or [])
                                 clean_pinned = await clean_and_convert_peers_async(client, getattr(f_obj, "pinned_peers", []) or [])
                                 clean_exclude = await clean_and_convert_peers_async(client, getattr(f_obj, "exclude_peers", []) or [])
-                                
+
                                 t_user_id = getattr(translate_bot_peer, 'user_id', None)
                                 if t_user_id:
                                     # 1. 确保翻译 Bot 存在于 include 中
@@ -13050,18 +13457,18 @@ async def run_account_cleanup_process(account_id: str):
                                             break
                                     if not exists_in_include:
                                         clean_include.append(translate_bot_peer)
-                                    
+
                                     # 2. 确保翻译 Bot 在 pinned 中且在第一位
                                     clean_pinned = [p for p in clean_pinned if getattr(p, 'user_id', None) != t_user_id]
                                     clean_pinned.insert(0, translate_bot_peer)
-                                    
+
                                     # 构造更新后的 DialogFilter
                                     title_text = getattr(f_obj, "title", f_title)
                                     if isinstance(title_text, str):
                                         title_obj = types.TextWithEntities(text=title_text, entities=[])
                                     else:
                                         title_obj = title_text
-                                        
+
                                     new_filter = types.DialogFilter(
                                         id=f_obj.id,
                                         title=title_obj,
@@ -13079,7 +13486,7 @@ async def run_account_cleanup_process(account_id: str):
                                     await asyncio.sleep(1)
                 except Exception as fe:
                     log(f"同步/置顶翻译 Bot 到分类文件夹失败: {fe}")
-                    
+
             # --- 第七阶段：把 aibot 在主文件夹（默认会话列表）置顶 ---
             if ai_bot_peer:
                 try:
@@ -13091,10 +13498,10 @@ async def run_account_cleanup_process(account_id: str):
                     log(f"AI Bot '{ai_bot_username}' 置顶在主文件夹成功。")
                 except Exception as e:
                     log(f"置顶 AI Bot 失败 (可能已置顶或已达上限): {e}")
-                    
+
             progress["status"] = "success"
             log("🎉 账号整理整理完毕！完美闭环成功。")
-            
+
     except Exception as exc:
         progress["status"] = "failed"
         log(f"❌ 账号整理失败中断: {exc}")
@@ -13105,10 +13512,10 @@ async def trigger_cleanup_tasks(background_tasks: BackgroundTasks, payload: dict
     account_ids = payload.get("account_ids", [])
     if not account_ids:
         raise HTTPException(status_code=400, detail="account_ids is required")
-        
+
     for acc_id in account_ids:
         background_tasks.add_task(run_account_cleanup_process, acc_id)
-        
+
     return {"ok": True, "message": f"已提交 {len(account_ids)} 个账号的后台整理任务"}
 
 
@@ -13145,7 +13552,7 @@ def list_telegram_bots(user: dict = Depends(get_current_user)):
     """列出系统里所有已注册的电报 Bot"""
     from db import engine, Session, select
     import sqlite3
-    
+
     # 统计每个 Bot 绑定的账号数量
     stats = {}
     try:
@@ -13178,7 +13585,7 @@ def list_telegram_bots(user: dict = Depends(get_current_user)):
                     elif b_type == "translate_bot":
                         cursor.execute("SELECT COUNT(*) FROM bot_authorized_users WHERE bot_type = 'translate_bot';")
                         linked_count = cursor.fetchone()[0]
-                        
+
                     bots.append({
                         "id": row["id"],
                         "bot_username": row["bot_username"],
@@ -13194,7 +13601,7 @@ def list_telegram_bots(user: dict = Depends(get_current_user)):
             raise HTTPException(status_code=500, detail=f"Failed to load bots: {str(e)}")
 
         return {"bots": bots}
-        
+
         return bots
 
 @app.post("/api/bots")
@@ -13203,10 +13610,10 @@ def create_telegram_bot(req: TelegramBotRequest, user: dict = Depends(get_curren
     import sqlite3
     import datetime
     from db import DB_PATH
-    
+
     bot_username_clean = req.bot_username.strip().lstrip("@")
     now_str = datetime.datetime.now().isoformat()
-    
+
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
             cursor = conn.cursor()
@@ -13219,7 +13626,7 @@ def create_telegram_bot(req: TelegramBotRequest, user: dict = Depends(get_curren
         raise HTTPException(status_code=400, detail=f"Bot 用户名 @{bot_username_clean} 已经存在，无法重复创建")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"创建 Bot 失败: {str(e)}")
-        
+
     if req.bot_type == "ai_bot" and req.is_active == 1:
         try:
             import subprocess
@@ -13228,7 +13635,7 @@ def create_telegram_bot(req: TelegramBotRequest, user: dict = Depends(get_curren
                 subprocess.run(["systemctl", "restart", "rosepay-bot.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
-            
+
     return {"ok": True, "message": "Bot 创建成功"}
 
 @app.put("/api/bots/{bot_id}")
@@ -13236,23 +13643,23 @@ def update_telegram_bot(bot_id: int, req: TelegramBotRequest, user: dict = Depen
     """编辑修改现有的电报 Bot 参数"""
     import sqlite3
     from db import DB_PATH
-    
+
     bot_username_clean = req.bot_username.strip().lstrip("@")
-    
+
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            
+
             cursor.execute("SELECT bot_token, bot_type, is_active FROM telegram_bots WHERE id = ?", (bot_id,))
             old_row = cursor.fetchone()
-            
+
             cursor.execute(
                 "UPDATE telegram_bots SET bot_username = ?, bot_token = ?, bot_type = ?, title = ?, description = ?, is_active = ? WHERE id = ?",
                 (bot_username_clean, req.bot_token.strip(), req.bot_type, req.title.strip(), req.description.strip(), req.is_active, bot_id)
             )
             conn.commit()
-            
+
             if old_row and (old_row["bot_token"] != req.bot_token.strip() or old_row["bot_type"] != req.bot_type or old_row["is_active"] != req.is_active):
                 if req.bot_type == "ai_bot" or old_row["bot_type"] == "ai_bot":
                     try:
@@ -13264,7 +13671,7 @@ def update_telegram_bot(bot_id: int, req: TelegramBotRequest, user: dict = Depen
                         pass
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"更新 Bot 失败: {str(e)}")
-        
+
     return {"ok": True, "message": "Bot 更新成功"}
 
 @app.delete("/api/bots/{bot_id}")
@@ -13272,7 +13679,7 @@ def delete_telegram_bot(bot_id: int, user: dict = Depends(get_current_user)):
     """删除已注销的电报 Bot"""
     import sqlite3
     from db import DB_PATH
-    
+
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
             cursor = conn.cursor()
@@ -13280,7 +13687,7 @@ def delete_telegram_bot(bot_id: int, user: dict = Depends(get_current_user)):
             conn.commit()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"删除 Bot 失败: {str(e)}")
-        
+
     return {"ok": True, "message": "Bot 已成功删除"}
 
 
@@ -13298,7 +13705,7 @@ def list_bot_authorizations(bot_type: str, user: dict = Depends(get_current_user
     """获取某个特定 Bot 节点下的所有授权账号和群组"""
     import sqlite3
     from db import DB_PATH
-    
+
     auths = []
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
@@ -13334,7 +13741,7 @@ def list_bot_authorizations(bot_type: str, user: dict = Depends(get_current_user
                 })
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch bot auths: {str(e)}")
-        
+
     return {"authorizations": auths}
 
 @app.post("/api/bots/{bot_type}/authorizations")
@@ -13343,11 +13750,11 @@ def create_bot_authorization(bot_type: str, req: BotAuthRequest, user: dict = De
     import sqlite3
     import datetime
     from db import DB_PATH
-    
+
     now_str = datetime.datetime.now().isoformat()
     chat_id_clean = req.telegram_chat_id.strip()
     username_clean = req.telegram_username.strip().lstrip("@")
-    
+
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
             cursor = conn.cursor()
@@ -13355,18 +13762,18 @@ def create_bot_authorization(bot_type: str, req: BotAuthRequest, user: dict = De
                 "INSERT OR REPLACE INTO bot_authorized_users (telegram_chat_id, bot_type, telegram_username, role, owner_username, approved_at, approved_by, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (chat_id_clean, bot_type, username_clean, req.role, req.owner_username.strip(), now_str, user["username"], req.is_active)
             )
-            
+
             # 如果角色是系统管理员或普通员工，且关联了后台 admins 表中已有的用户名，同步更新其 telegram_chat_id
             if req.role in ["admin", "employee"] and username_clean:
                 cursor.execute("SELECT username FROM admins WHERE username = ? OR telegram_contact = ?", (username_clean, f"@{username_clean}"))
                 admin_row = cursor.fetchone()
                 if admin_row:
                     cursor.execute("UPDATE admins SET telegram_chat_id = ? WHERE username = ?", (chat_id_clean, admin_row[0]))
-                    
+
             conn.commit()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create bot auth: {str(e)}")
-        
+
     return {"ok": True, "message": "授权添加成功"}
 
 @app.put("/api/bots/{bot_type}/authorizations/{chat_id}")
@@ -13374,34 +13781,34 @@ def update_bot_authorization(bot_type: str, chat_id: str, req: BotAuthRequest, u
     """编辑修改某个 Bot 的授权账号或中转群配置"""
     import sqlite3
     from db import DB_PATH
-    
+
     username_clean = req.telegram_username.strip().lstrip("@")
     chat_id_clean = req.telegram_chat_id.strip()
-    
+
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
             cursor = conn.cursor()
-            
+
             # 如果 Chat ID 发生改变，先删掉旧的再插入新的以保证主键唯一
             if chat_id_clean != chat_id:
                 cursor.execute("DELETE FROM bot_authorized_users WHERE telegram_chat_id = ? AND bot_type = ?", (chat_id, bot_type))
-            
+
             cursor.execute(
                 "INSERT OR REPLACE INTO bot_authorized_users (telegram_chat_id, bot_type, telegram_username, role, owner_username, is_active) VALUES (?, ?, ?, ?, ?, ?)",
                 (chat_id_clean, bot_type, username_clean, req.role, req.owner_username.strip(), req.is_active)
             )
-            
+
             # 同步更新 admins 表的关联
             if req.role in ["admin", "employee"] and username_clean:
                 cursor.execute("SELECT username FROM admins WHERE username = ? OR telegram_contact = ?", (username_clean, f"@{username_clean}"))
                 admin_row = cursor.fetchone()
                 if admin_row:
                     cursor.execute("UPDATE admins SET telegram_chat_id = ? WHERE username = ?", (chat_id_clean, admin_row[0]))
-                    
+
             conn.commit()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update bot auth: {str(e)}")
-        
+
     return {"ok": True, "message": "授权修改成功"}
 
 @app.delete("/api/bots/{bot_type}/authorizations/{chat_id}")
@@ -13409,7 +13816,7 @@ def delete_bot_authorization(bot_type: str, chat_id: str, user: dict = Depends(g
     """解除某个电报账号或中转群对该 Bot 的授权"""
     import sqlite3
     from db import DB_PATH
-    
+
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
             cursor = conn.cursor()
@@ -13417,7 +13824,7 @@ def delete_bot_authorization(bot_type: str, chat_id: str, user: dict = Depends(g
             conn.commit()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete bot auth: {str(e)}")
-        
+
     return {"ok": True, "message": "已解除授权"}
 
 
@@ -13432,7 +13839,7 @@ def list_bot_auto_replies(bot_type: str, user: dict = Depends(get_current_user))
     """获取某个 Bot 节点下的所有自动回复模板"""
     import sqlite3
     from db import DB_PATH
-    
+
     replies = []
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
@@ -13461,7 +13868,7 @@ def list_bot_auto_replies(bot_type: str, user: dict = Depends(get_current_user))
                 })
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch auto replies: {str(e)}")
-        
+
     return {"replies": replies}
 
 @app.post("/api/bots/{bot_type}/auto-replies")
@@ -13470,9 +13877,9 @@ def create_bot_auto_reply(bot_type: str, req: AutoReplyRequest, user: dict = Dep
     import sqlite3
     import datetime
     from db import DB_PATH
-    
+
     now_str = datetime.datetime.now().isoformat()
-    
+
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
             cursor = conn.cursor()
@@ -13483,7 +13890,7 @@ def create_bot_auto_reply(bot_type: str, req: AutoReplyRequest, user: dict = Dep
             conn.commit()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create auto reply: {str(e)}")
-        
+
     return {"ok": True, "message": "添加自动回复模板成功"}
 
 @app.put("/api/bots/{bot_type}/auto-replies/{reply_id}")
@@ -13491,7 +13898,7 @@ def update_bot_auto_reply(bot_type: str, reply_id: int, req: AutoReplyRequest, u
     """编辑修改某个自动回复模板的内容"""
     import sqlite3
     from db import DB_PATH
-    
+
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
             cursor = conn.cursor()
@@ -13502,7 +13909,7 @@ def update_bot_auto_reply(bot_type: str, reply_id: int, req: AutoReplyRequest, u
             conn.commit()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update auto reply: {str(e)}")
-        
+
     return {"ok": True, "message": "修改自动回复模板成功"}
 
 @app.delete("/api/bots/{bot_type}/auto-replies/{reply_id}")
@@ -13510,7 +13917,7 @@ def delete_bot_auto_reply(bot_type: str, reply_id: int, user: dict = Depends(get
     """删除某个自动回复模板"""
     import sqlite3
     from db import DB_PATH
-    
+
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
             cursor = conn.cursor()
@@ -13518,7 +13925,7 @@ def delete_bot_auto_reply(bot_type: str, reply_id: int, user: dict = Depends(get
             conn.commit()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete auto reply: {str(e)}")
-        
+
     return {"ok": True, "message": "已删除该回复模板"}
 
 

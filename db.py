@@ -40,9 +40,9 @@ DATABASE_URL = f"sqlite:///{DB_PATH}"
 
 engine = create_engine(
 
-    DATABASE_URL, 
+    DATABASE_URL,
 
-    echo=False, 
+    echo=False,
 
     connect_args={"check_same_thread": False}
 
@@ -55,7 +55,7 @@ def migrate_bot_authorized_users():
     import os
     import sqlite3
     import datetime
-    
+
     # 1. 迁移翻译 Bot
     json_path = "/opt/rosepay-translate-bot/data/translate_access.json"
     if os.path.exists(json_path):
@@ -64,7 +64,7 @@ def migrate_bot_authorized_users():
                 data = json.load(f)
             allowed_ids = data.get("allowed_user_ids", [])
             owner_ids = data.get("owner_chat_ids", [])
-            
+
             with sqlite3.connect(str(DB_PATH)) as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT COUNT(*) FROM bot_authorized_users WHERE bot_type = 'translate_bot';")
@@ -150,7 +150,7 @@ class GroupDb(SQLModel, table=True):
 
     __tablename__ = "groups_library"
 
-    
+
 
     # Using string id matching the original groups.json IDs
 
@@ -176,6 +176,8 @@ class GroupDb(SQLModel, table=True):
     engagement_score: int = Field(default=0)
     created_by: str = Field(default="admin")
     updated_by: str = Field(default="admin")
+    bot_rules_summary: Optional[str] = Field(default=None)
+    bot_rules_raw_logs: Optional[str] = Field(default=None)
 
 
 
@@ -183,7 +185,7 @@ class AdLogDb(SQLModel, table=True):
 
     __tablename__ = "ad_logs"
 
-    
+
 
     id: Optional[int] = Field(default=None, primary_key=True)
 
@@ -209,7 +211,7 @@ class CampaignTaskDb(SQLModel, table=True):
 
     __tablename__ = "campaign_tasks"
 
-    
+
 
     id: str = Field(default=None, primary_key=True)
 
@@ -261,7 +263,7 @@ class CampaignLogDb(SQLModel, table=True):
 
     __tablename__ = "campaign_logs"
 
-    
+
 
     id: Optional[int] = Field(default=None, primary_key=True)
 
@@ -357,7 +359,7 @@ class AccountDb(SQLModel, table=True):
 
     connection_retries: int = 2
 
-    
+
 
     proxy_enabled: bool = True
 
@@ -371,7 +373,7 @@ class AccountDb(SQLModel, table=True):
 
     proxy_password: str = ""
 
-    
+
 
     # profile mod
 
@@ -393,7 +395,7 @@ class AccountDb(SQLModel, table=True):
 
     campaign_group_interval_seconds: int = 5
 
-    
+
 
     # 2FA password cache
 
@@ -515,7 +517,7 @@ class AccountDb(SQLModel, table=True):
 
             include_types_str = str(include_types or "group,supergroup")
 
-            
+
 
         return cls(
 
@@ -616,7 +618,7 @@ class CompanyDb(SQLModel, table=True):
 
 class TelegramBotDb(SQLModel, table=True):
     __tablename__ = "telegram_bots"
-    
+
     id: Optional[int] = Field(default=None, primary_key=True)
     bot_username: str = Field(unique=True, index=True)
     bot_token: str
@@ -970,7 +972,7 @@ def migrate_columns():
                 cursor.execute("ALTER TABLE predefined_ads ADD COLUMN group_type TEXT DEFAULT '英文短'")
 
                 conn.commit()
-                
+
                 # Update existing records to '英文短'
                 cursor.execute("UPDATE predefined_ads SET group_type = '英文短' WHERE group_type IS NULL OR group_type = ''")
                 conn.commit()
@@ -1301,7 +1303,7 @@ def init_db():
 
     SQLModel.metadata.create_all(engine)
 
-    
+
 
     # Run migrations
 
@@ -1314,7 +1316,7 @@ def init_db():
     init_categories()
     migrate_bot_authorized_users()
     migrate_telegram_bots()
-    
+
     # 自动清理管理员表里误建的普通账号
     try:
         import sqlite3
@@ -1548,7 +1550,7 @@ def migrate_telegram_bots():
     import datetime
     import os
     from pathlib import Path
-    
+
     try:
         with sqlite3.connect(str(DB_PATH)) as conn:
             cursor = conn.cursor()
@@ -1564,7 +1566,7 @@ def migrate_telegram_bots():
                     created_at TEXT
                 );
             """)
-            
+
             # 创建自动回复文本模板表
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS bot_auto_replies (
@@ -1575,7 +1577,7 @@ def migrate_telegram_bots():
                     created_at TEXT
                 );
             """)
-            
+
             # 初始化一条默认自动回复模板
             cursor.execute("SELECT COUNT(*) FROM bot_auto_replies;")
             reply_count = cursor.fetchone()[0]
@@ -1602,7 +1604,7 @@ def migrate_telegram_bots():
                     bot_env_path = Path("/opt/rosepay-telegram-bot/.env")
                 else:
                     bot_env_path = Path(__file__).resolve().parent.parent / "telegram_bot_workspace" / ".env"
-                
+
                 if bot_env_path.exists():
                     try:
                         with bot_env_path.open("r", encoding="utf-8") as f:
@@ -1612,12 +1614,12 @@ def migrate_telegram_bots():
                                     break
                     except Exception:
                         pass
-                
+
                 if not ai_token:
                     ai_token = os.getenv("BOT_TOKEN", "").strip() or "YOUR_AI_BOT_TOKEN_HERE"
-                    
+
                 now_str = datetime.datetime.now().isoformat()
-                
+
                 cursor.execute(
                     "INSERT OR REPLACE INTO telegram_bots (bot_username, bot_token, bot_type, title, description, is_active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     ("RosePayTest_bot", ai_token, "ai_bot", "AI 控制助手", "控制台接管、私聊中转及绑定的电报账号自动整理通知 Bot", 1, now_str)
@@ -1649,3 +1651,33 @@ def migrate_default_company_to_admin():
         except Exception as e:
             print(f"Failed to migrate '默认公司' to 'admin' in database tables: {e}")
             session.rollback()
+
+def migrate_groups_library_bot_rules():
+    import sqlite3
+    print("=== 开始检测 groups_library 数据库字段升级 ===", flush=True)
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(groups_library);")
+        columns = [row[1] for row in cursor.fetchall()]
+
+        if "bot_rules_summary" not in columns:
+            print("正在向 groups_library 动态新增 bot_rules_summary 字段...", flush=True)
+            cursor.execute("ALTER TABLE groups_library ADD COLUMN bot_rules_summary TEXT;")
+            conn.commit()
+            print("✓ bot_rules_summary 字段新增成功。", flush=True)
+
+        if "bot_rules_raw_logs" not in columns:
+            print("正在向 groups_library 动态新增 bot_rules_raw_logs 字段...", flush=True)
+            cursor.execute("ALTER TABLE groups_library ADD COLUMN bot_rules_raw_logs TEXT;")
+            conn.commit()
+            print("✓ bot_rules_raw_logs 字段新增成功。", flush=True)
+
+        conn.close()
+    except Exception as exc:
+        print(f"❌ 自动迁移 groups_library 表结构失败: {exc}", flush=True)
+
+try:
+    migrate_groups_library_bot_rules()
+except Exception:
+    pass

@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { pinyin } from 'pinyin-pro';
 
-import { 
+import {
 
   User,
 
@@ -9,25 +9,25 @@ import {
 
   Image,
 
-  Users, 
+  Users,
 
-  UserCheck, Menu, 
+  UserCheck, Menu,
 
-  PlusCircle, 
+  PlusCircle,
 
-  MessageSquare, 
+  MessageSquare,
 
-  FileText, 
+  FileText,
 
-  Settings, 
+  Settings,
 
-  RefreshCw, 
+  RefreshCw,
 
-  Trash2, 
+  Trash2,
 
-  X, 
+  X,
 
-  Shield, 
+  Shield,
 
   Bell,
   Bot,
@@ -68,7 +68,11 @@ import {
 
   Star,
 
-  Send
+  Send,
+
+  CalendarClock,
+
+  Timer
 
 } from 'lucide-react';
 
@@ -307,7 +311,7 @@ export default function App() {
 
   const [isAutoPolling, setIsAutoPolling] = useState<boolean>(false);
 
-  
+
 
   // Auth state
 
@@ -369,7 +373,7 @@ export default function App() {
 
   const [selectedAdFilter, setSelectedAdFilter] = useState<string>('全部');
 
-  
+
 
   // Login input states
 
@@ -377,7 +381,7 @@ export default function App() {
 
   const [loginPassword, setLoginPassword] = useState<string>('');
 
-  
+
 
   // Setup admin input states
 
@@ -748,6 +752,91 @@ export default function App() {
 
   // Dynamic Campaign Task states
 
+  const BEIJING_TIME_ZONE = 'Asia/Shanghai';
+
+  const formatDateTimeLocalInZone = (date: Date, timeZone = BEIJING_TIME_ZONE) => {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23'
+    }).formatToParts(date).reduce<Record<string, string>>((acc, part) => {
+      if (part.type !== 'literal') acc[part.type] = part.value;
+      return acc;
+    }, {});
+    return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}`;
+  };
+
+  const getDefaultCampaignScheduleAt = () => (
+    formatDateTimeLocalInZone(new Date(Date.now() + 30 * 60 * 1000))
+  );
+
+  const parseBeijingDateTimeLocal = (value: string) => {
+    const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+    if (!match) return null;
+    const [, year, month, day, hour, minute] = match;
+    return new Date(Date.UTC(
+      Number(year),
+      Number(month) - 1,
+      Number(day),
+      Number(hour) - 8,
+      Number(minute),
+      0
+    ));
+  };
+
+  const formatCampaignCountdown = (target: Date | null) => {
+    if (!target) return '时间格式异常';
+    const totalSeconds = Math.max(0, Math.floor((target.getTime() - Date.now()) / 1000));
+    const days = Math.floor(totalSeconds / 86400);
+    const hours = Math.floor((totalSeconds % 86400) / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    if (days > 0) return `${days}天${hours}小时${minutes}分钟`;
+    if (hours > 0) return `${hours}小时${minutes}分钟`;
+    if (minutes > 0) return `${minutes}分钟`;
+    return `${totalSeconds}秒`;
+  };
+
+  const formatCampaignScheduleLabel = (value: string) => {
+    const date = parseBeijingDateTimeLocal(value);
+    if (!date) return '时间格式异常';
+    return new Intl.DateTimeFormat('zh-CN', {
+      timeZone: BEIJING_TIME_ZONE,
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23'
+    }).format(date).replace(/\//g, '-');
+  };
+
+  const parseCampaignTaskConfig = (task: { task_config_json?: string }) => {
+    try {
+      const parsed = JSON.parse(task.task_config_json || '{}');
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (e) {
+      return {};
+    }
+  };
+
+  const getCampaignScheduledLabel = (task: { task_config_json?: string }) => {
+    const config: any = parseCampaignTaskConfig(task);
+    return String(config.scheduled_start_at_beijing || '').trim();
+  };
+
+  const getCampaignScheduledCountdown = (task: { task_config_json?: string }) => {
+    const config: any = parseCampaignTaskConfig(task);
+    const utcValue = String(config.scheduled_start_at_utc || '').trim();
+    if (utcValue) {
+      return formatCampaignCountdown(new Date(utcValue));
+    }
+    const beijingValue = String(config.scheduled_start_at_beijing || '').trim();
+    return formatCampaignCountdown(parseBeijingDateTimeLocal(beijingValue.replace(' ', 'T').slice(0, 16)));
+  };
+
   interface CampaignTask {
 
     id: string;
@@ -760,7 +849,7 @@ export default function App() {
 
     phones_json?: string;
 
-    status: 'running' | 'stopped' | 'completed' | 'failed';
+    status: 'running' | 'scheduled' | 'stopped' | 'completed' | 'failed';
 
     max_cycles: number;
 
@@ -775,6 +864,8 @@ export default function App() {
     message: string;
 
     target_groups_json: string;
+
+    task_config_json?: string;
 
     success_count: number;
 
@@ -796,7 +887,7 @@ export default function App() {
     id: string;
     task_ids: string[];
     created_at: string;
-    status: 'running' | 'completed' | 'stopped' | 'failed';
+    status: 'running' | 'scheduled' | 'completed' | 'stopped' | 'failed';
     max_cycles: number;
     current_cycle: number;
     round_interval_minutes: number;
@@ -804,6 +895,8 @@ export default function App() {
     is_safety: boolean;
     message: string;
     target_groups_json: string;
+
+    task_config_json?: string;
     success_count: number;
     fail_count: number;
     created_by?: string;
@@ -838,6 +931,7 @@ export default function App() {
           is_safety: task.is_safety,
           message: task.message,
           target_groups_json: task.target_groups_json,
+          task_config_json: task.task_config_json,
           success_count: task.success_count,
           fail_count: task.fail_count,
           created_by: task.created_by,
@@ -857,10 +951,12 @@ export default function App() {
         g.success_count += task.success_count;
         g.fail_count += task.fail_count;
         g.current_cycle = Math.max(g.current_cycle, task.current_cycle);
-        
+
         const statuses = g.subtasks.map(s => s.status);
         if (statuses.includes('running')) {
           g.status = 'running';
+        } else if (statuses.includes('scheduled')) {
+          g.status = 'scheduled';
         } else if (statuses.includes('failed')) {
           g.status = 'failed';
         } else if (statuses.includes('stopped')) {
@@ -870,14 +966,24 @@ export default function App() {
         }
       }
     });
-    return Object.values(groups).sort((a, b) => b.created_at.localeCompare(a.created_at));
+    const statusPriority: Record<GroupedCampaignTask['status'], number> = {
+      running: 0,
+      scheduled: 1,
+      failed: 2,
+      stopped: 3,
+      completed: 4
+    };
+    return Object.values(groups).sort((a, b) => (
+      (statusPriority[a.status] ?? 9) - (statusPriority[b.status] ?? 9)
+      || b.created_at.localeCompare(a.created_at)
+    ));
   };
 
   const [campaignTasks, setCampaignTasks] = useState<CampaignTask[]>([]);
 
   const [showCreateCampaignModal, setShowCreateCampaignModal] = useState<boolean>(false);
 
-  const [campaignMaxCycles, setCampaignMaxCycles] = useState<number | ''>(0); 
+  const [campaignMaxCycles, setCampaignMaxCycles] = useState<number | ''>(0);
 
   const [campaignRoundInterval, setCampaignRoundInterval] = useState<number | ''>(60);
 
@@ -889,6 +995,10 @@ export default function App() {
 
   const [campaignStrategyEnabled, setCampaignStrategyEnabled] = useState<boolean>(false);
 
+  const [campaignScheduleEnabled, setCampaignScheduleEnabled] = useState<boolean>(false);
+
+  const [campaignScheduledAt, setCampaignScheduledAt] = useState<string>(getDefaultCampaignScheduleAt());
+
   const handleToggleCampaignStrategy = (enabled: boolean) => {
     setCampaignStrategyEnabled(enabled);
     if (enabled) {
@@ -896,7 +1006,7 @@ export default function App() {
     }
   };
 
-  
+
 
   const [newCampaignAccountId, setNewCampaignAccountId] = useState<string>('');
   const [campaignInputMode, setCampaignInputMode] = useState<'folders' | 'library' | 'manual'>('folders');
@@ -917,7 +1027,7 @@ export default function App() {
 
   const [selectedCampaignLibraryGroupIds, setSelectedCampaignLibraryGroupIds] = useState<string[]>([]);
 
-  
+
 
   const [showCampaignLogsModal, setShowCampaignLogsModal] = useState<boolean>(false);
 
@@ -1012,7 +1122,7 @@ export default function App() {
     isAuthorized?: boolean;
 
     is_connected?: boolean;
-    
+
     busy_status?: 'idle' | 'join' | 'campaign' | 'scraper' | 'expansion' | 'unavailable';
     active_operation?: string | null;
     active_operation_label?: string | null;
@@ -1226,7 +1336,7 @@ export default function App() {
           state === 'offline';
       })
       .map(acc => acc.id);
-      
+
     if (unavailableIds.length > 0) {
       setSelectedCampaignAccountIds(prev => {
         const next = prev.filter(id => !unavailableIds.includes(id));
@@ -1240,7 +1350,7 @@ export default function App() {
         }
         return prev;
       });
-      
+
       setSelectedJoinAccounts(prev => {
         const next = prev.filter(id => !unavailableIds.includes(id));
         return next;
@@ -2713,7 +2823,7 @@ export default function App() {
 
     if (!targetPid) return;
 
-    
+
 
     // Auto extract UUID if full URL is pasted
 
@@ -2733,7 +2843,7 @@ export default function App() {
 
     setScraperError('');
 
-    
+
 
     try {
 
@@ -2827,7 +2937,7 @@ export default function App() {
 
         setBackendAccounts(mappedData);
 
-        
+
 
         // If forceRefresh is true, update the status of each account sequentially to prevent server overload
 
@@ -3099,9 +3209,9 @@ export default function App() {
 
         const data = await res.json();
 
-        setBackendAccounts(prev => prev.map((acc, idx) => idx === index ? { 
+        setBackendAccounts(prev => prev.map((acc, idx) => idx === index ? {
 
-          ...acc, 
+          ...acc,
 
           statusChecked: true,
 
@@ -3127,9 +3237,9 @@ export default function App() {
 
     } catch (err) {
 
-      setBackendAccounts(prev => prev.map((acc, idx) => idx === index ? { 
+      setBackendAccounts(prev => prev.map((acc, idx) => idx === index ? {
 
-        ...acc, 
+        ...acc,
 
         statusChecked: true,
 
@@ -3629,11 +3739,11 @@ export default function App() {
       return;
     }
 
-    setSelectedAccountIds(prev => 
+    setSelectedAccountIds(prev =>
 
-      prev.includes(accountId) 
+      prev.includes(accountId)
 
-        ? prev.filter(id => id !== accountId) 
+        ? prev.filter(id => id !== accountId)
 
         : [...prev, accountId]
 
@@ -3669,7 +3779,7 @@ export default function App() {
 
     }
 
-    
+
 
     result.sort((a, b) => {
 
@@ -3759,7 +3869,7 @@ export default function App() {
 
     setToastText(`正在批量检测 ${selectedAccountIds.length} 个账号的状态...`);
 
-    
+
 
     await Promise.all(selectedAccountIds.map(async (accountId) => {
 
@@ -3773,7 +3883,7 @@ export default function App() {
 
     }));
 
-    
+
 
     setToastText("所有选中账号状态检测完成！");
 
@@ -3793,7 +3903,7 @@ export default function App() {
 
     }
 
-    
+
 
     setToastText(`正在批量清除 ${selectedAccountIds.length} 个账号的 Session...`);
 
@@ -3801,7 +3911,7 @@ export default function App() {
 
     let successCount = 0;
 
-    
+
 
     for (const accountId of selectedAccountIds) {
 
@@ -3827,7 +3937,7 @@ export default function App() {
 
     }
 
-    
+
 
     setToastText(`成功清除 ${successCount} 个账号的 Session`);
 
@@ -3851,7 +3961,7 @@ export default function App() {
 
     }
 
-    
+
 
     setToastText(`正在批量删除 ${selectedAccountIds.length} 个账号...`);
 
@@ -3859,7 +3969,7 @@ export default function App() {
 
     let successCount = 0;
 
-    
+
 
     for (const accountId of selectedAccountIds) {
 
@@ -3885,7 +3995,7 @@ export default function App() {
 
     }
 
-    
+
 
     setToastText(`成功彻底删除 ${successCount} 个账号`);
 
@@ -3948,11 +4058,11 @@ export default function App() {
 
     }
 
-    
+
 
     setUpdatingBatchProfiles(true);
 
-    setToastText(onlyAbout 
+    setToastText(onlyAbout
 
       ? `正在批量修改 ${batchEditTargetIds.length} 个账号的个人简介...`
 
@@ -3990,7 +4100,7 @@ export default function App() {
 
       });
 
-      
+
 
       const data = await res.json();
 
@@ -4006,7 +4116,7 @@ export default function App() {
 
         if (data.failed_count > 0) {
 
-          alert(`修改完成。成功: ${data.success_count}，失败: ${data.failed_count}。失败详情:\n` + 
+          alert(`修改完成。成功: ${data.success_count}，失败: ${data.failed_count}。失败详情:\n` +
 
             data.failed_details.map((f: any) => `${f.account_id}: ${f.error}`).join('\n')
 
@@ -4163,7 +4273,7 @@ export default function App() {
 
       formData.append('account_ids', JSON.stringify(batchEditTargetIds));
 
-      
+
 
       if (batchAvatarSource === 'library') {
 
@@ -4209,7 +4319,7 @@ export default function App() {
 
       });
 
-      
+
 
       const data = await res.json();
 
@@ -4219,7 +4329,7 @@ export default function App() {
 
         if (data.failed_count > 0) {
 
-          alert(`修改完成。成功: ${data.success_count}，失败: ${data.failed_count}。失败详情:\n` + 
+          alert(`修改完成。成功: ${data.success_count}，失败: ${data.failed_count}。失败详情:\n` +
 
             data.failed_details.map((f: any) => `${f.account_id}: ${f.error}`).join('\n')
 
@@ -4576,6 +4686,18 @@ export default function App() {
 
     }
 
+    const scheduledDate = campaignScheduleEnabled ? parseBeijingDateTimeLocal(campaignScheduledAt) : null;
+    if (campaignScheduleEnabled) {
+      if (!scheduledDate) {
+        alert("请选择正确的北京时间定时启动时间！");
+        return;
+      }
+      if (scheduledDate.getTime() <= Date.now()) {
+        alert("定时启动时间必须晚于当前北京时间！");
+        return;
+      }
+    }
+
     const handwrittenAds = campaignMessage
       .split('====')
       .map((x: string) => x.trim())
@@ -4747,7 +4869,9 @@ export default function App() {
 
           message: payloadMessage,
 
-          target_groups: resolvedGroups
+          target_groups: resolvedGroups,
+
+          scheduled_start_at: campaignScheduleEnabled ? campaignScheduledAt : null
 
         })
 
@@ -4755,7 +4879,13 @@ export default function App() {
 
       if (res.ok) {
 
-        setToastText(`已成功启动 ${selectedCampaignAccountIds.length} 个账号的随机调度群发任务`);
+        const data = await res.json();
+
+        if (data.status === 'scheduled') {
+          setToastText(`已预约定时轰炸：北京时间 ${data.scheduled_start_at_beijing || formatCampaignScheduleLabel(campaignScheduledAt)} 执行，剩余 ${data.remaining_text || formatCampaignCountdown(scheduledDate)}`);
+        } else {
+          setToastText(`已成功启动 ${selectedCampaignAccountIds.length} 个账号的随机调度群发任务`);
+        }
 
         setTimeout(() => setToastText(''), 2500);
 
@@ -4967,7 +5097,7 @@ export default function App() {
 
               setCampaignMessage(data.message);
 
-              
+
 
               if (data.target_groups && data.target_groups.length > 0) {
 
@@ -5057,7 +5187,7 @@ export default function App() {
 
       }
 
-      
+
 
       const res = await fetch(`${backendUrl}/api/avatar-library`, {
 
@@ -5101,7 +5231,7 @@ export default function App() {
 
     if (!confirm(`确定要从头像库中彻底删除头像 "${filename}" 吗？`)) return;
 
-    
+
 
     const backendUrl = BASE_URL;
 
@@ -5151,7 +5281,7 @@ export default function App() {
 
     if (!newName.trim() || oldName === newName.trim()) return;
 
-    
+
 
     const backendUrl = BASE_URL;
 
@@ -5685,7 +5815,7 @@ export default function App() {
 
         alert(msg);
 
-        
+
 
         // Reset states
 
@@ -5824,7 +5954,7 @@ export default function App() {
 
       };
 
-      
+
 
       fetchCapturedCodes(loginInfoAccount.id);
 
@@ -5834,7 +5964,7 @@ export default function App() {
 
       }, 3000);
 
-      
+
 
       return () => {
 
@@ -6312,7 +6442,7 @@ export default function App() {
 
   };
 
-  
+
 
   const handleStartJoinTask = async () => {
 
@@ -6979,7 +7109,7 @@ export default function App() {
 
       setToastText(`正在校验第 ${i + 1}/${links.length} 个链接: ${link}...`);
 
-      
+
 
       const controller = new AbortController();
 
@@ -7005,7 +7135,7 @@ export default function App() {
 
         });
 
-        
+
 
         clearTimeout(timeoutId);
 
@@ -7061,7 +7191,7 @@ export default function App() {
 
         clearTimeout(timeoutId);
 
-        
+
 
         if (err.name === 'AbortError') {
 
@@ -7141,7 +7271,7 @@ export default function App() {
 
   const handleToggleSelectGroup = (groupId: string) => {
 
-    setSelectedGroupIds(prev => 
+    setSelectedGroupIds(prev =>
 
       prev.includes(groupId) ? prev.filter(id => id !== groupId) : [...prev, groupId]
 
@@ -7340,7 +7470,7 @@ export default function App() {
   const [scrapedMaxPages, setScrapedMaxPages] = useState<number>(5);
   const [scrapedContinuous, setScrapedContinuous] = useState<boolean>(false);
   const [scrapedIntervalMinutes, setScrapedIntervalMinutes] = useState<number>(30);
-  
+
   const [scrapedAutoJoin, setScrapedAutoJoin] = useState<boolean>(() => {
     return localStorage.getItem('rosepay_scraped_auto_join') === 'true';
   });
@@ -7383,7 +7513,7 @@ export default function App() {
   const [categoryToAssignScraped, setCategoryToAssignScraped] = useState<string>('中文广告');
   const [scrapedFilterCategory, setScrapedFilterCategory] = useState<string>('all');
   const [scrapedMinScoreFilter, setScrapedMinScoreFilter] = useState<number>(0);
-  
+
   const [scrapedTaskStatus, setScrapedTaskStatus] = useState<string>('idle');
   const [scrapedTaskProgress, setScrapedTaskProgress] = useState<{current: number, total: number}>({current: 0, total: 0});
   const [scrapedTaskLogs, setScrapedTaskLogs] = useState<string[]>([]);
@@ -7838,7 +7968,7 @@ export default function App() {
   useEffect(() => {
     if (!isLoggedIn) return;
     let timer: any = null;
-    
+
     const checkStatus = async () => {
       const backendUrl = BASE_URL;
       try {
@@ -7849,7 +7979,7 @@ export default function App() {
           setScrapedTaskProgress(data.progress || {current: 0, total: 0});
           setScrapedTaskLogs(data.logs || []);
           setScrapedTaskError(data.error);
-          
+
           if (data.status === 'completed' || data.status === 'failed' || data.status === 'stopped') {
             setIsSearchingScraped(false);
             fetchScrapedGroups(); // Refresh list on complete
@@ -7866,7 +7996,7 @@ export default function App() {
       checkStatus();
       timer = setInterval(checkStatus, 3000);
     }
-    
+
     return () => {
       if (timer) clearInterval(timer);
     };
@@ -7890,7 +8020,7 @@ export default function App() {
   useEffect(() => {
     if (!isLoggedIn) return;
     let timer: any = null;
-    
+
     const checkStatus = async () => {
       await fetchExpansionStatus();
       if (activeTab === 'expansion') {
@@ -7902,7 +8032,7 @@ export default function App() {
       checkStatus();
       timer = setInterval(checkStatus, 3000);
     }
-    
+
     return () => {
       if (timer) clearInterval(timer);
     };
@@ -7920,7 +8050,7 @@ export default function App() {
   useEffect(() => {
     if (!isLoggedIn) return;
     let timer: any = null;
-    
+
     const checkStatus = async () => {
       await fetchExpansionStatus();
       if (activeTab === 'expansion') {
@@ -7932,7 +8062,7 @@ export default function App() {
       checkStatus();
       timer = setInterval(checkStatus, 3000);
     }
-    
+
     return () => {
       if (timer) clearInterval(timer);
     };
@@ -8156,7 +8286,7 @@ export default function App() {
 
           setJoinLogs(data.logs || []);
 
-          
+
 
           if (data.status === 'completed' || data.status === 'stopped') {
 
@@ -8168,7 +8298,7 @@ export default function App() {
 
             setTimeout(() => setToastText(''), 3000);
 
-            
+
 
             // Check for invalid groups to prompt deletion
 
@@ -8258,7 +8388,7 @@ export default function App() {
 
       .filter(acc => acc.status === 'idle' || acc.status === 'failed' || acc.status === 'waiting_code' || acc.status === '2fa_required');
 
-      
+
 
     if (accountsToLogin.length === 0) {
 
@@ -8268,13 +8398,13 @@ export default function App() {
 
     }
 
-    
+
 
     setToastText(`开始批量登录 ${accountsToLogin.length} 个账号...`);
 
     setTimeout(() => setToastText(''), 3000);
 
-    
+
 
     for (const acc of accountsToLogin) {
 
@@ -8302,7 +8432,7 @@ export default function App() {
     for (const line of lines) {
       let phone = '';
       let url = '';
-      
+
       // 智能兼容切分：优先使用 ----，若无则支持空格、Tab、逗号等
       if (line.includes('----')) {
         const parts = line.split('----');
@@ -8319,7 +8449,7 @@ export default function App() {
           url = urlMatch[1].trim();
         }
       }
-      
+
       let pageId = '';
       if (url) {
         // 兼容新旧平台的 token 提取
@@ -8334,7 +8464,7 @@ export default function App() {
         alert(`无效的手机号码格式: "${phone}"`);
         return;
       }
-      
+
       newAccounts.push({
 
         phone,
@@ -8389,7 +8519,7 @@ export default function App() {
 
         const acc = newAccounts[i];
 
-        
+
 
         // Proactively check session first
 
@@ -8433,7 +8563,7 @@ export default function App() {
 
         }
 
-        
+
 
         // If not already logged in, start the login flow automatically
 
@@ -8534,7 +8664,7 @@ export default function App() {
 
     if (!account) return 'failed';
 
-    
+
 
     setAccountsPool(prev => prev.map(acc => acc.accountId === accountId ? {
 
@@ -8572,7 +8702,7 @@ export default function App() {
 
       });
 
-      
+
 
       const sendCodeData = await sendCodeRes.json();
 
@@ -8596,7 +8726,7 @@ export default function App() {
 
         } : acc));
 
-        
+
 
         setLogs(prev => [{
 
@@ -8778,7 +8908,7 @@ export default function App() {
 
         } : acc));
 
-        
+
 
         setLogs(prev => [{
 
@@ -8818,7 +8948,7 @@ export default function App() {
 
       } : acc));
 
-      
+
 
       setLogs(prev => [{
 
@@ -8862,7 +8992,7 @@ export default function App() {
 
     }
 
-    
+
 
     setAccountsPool(prev => prev.map(acc => acc.accountId === accountId ? {
 
@@ -8938,7 +9068,7 @@ export default function App() {
 
         } : acc));
 
-        
+
 
         setLogs(prev => [{
 
@@ -8972,7 +9102,7 @@ export default function App() {
 
       } : acc));
 
-      
+
 
       setLogs(prev => [{
 
@@ -9006,7 +9136,7 @@ export default function App() {
 
     if (!account) return;
 
-    
+
 
     setAccountsPool(prev => prev.map(acc => acc.accountId === accountId ? {
 
@@ -9082,7 +9212,7 @@ export default function App() {
 
         } : acc));
 
-        
+
 
         setLogs(prev => [{
 
@@ -9219,7 +9349,7 @@ export default function App() {
 
         {/* Auth Card Box */}
         <div className="w-full max-w-md bg-white/80 backdrop-blur-md border border-slate-200/50 shadow-2xl rounded-3xl p-8 z-10 mx-4 flex flex-col gap-6 relative">
-          
+
           {/* Logo Brand */}
           <div className="flex flex-col items-center gap-3">
             <div className="text-center">
@@ -9242,8 +9372,8 @@ export default function App() {
 
               <div className="flex flex-col gap-1.5">
                 <label className="text-xs font-bold text-slate-600">管理员用户名</label>
-                <input 
-                  type="text" 
+                <input
+                  type="text"
                   value={setupUsername}
                   onChange={(e) => setSetupUsername(e.target.value)}
                   placeholder="请输入主管理员用户名"
@@ -9253,8 +9383,8 @@ export default function App() {
 
               <div className="flex flex-col gap-1.5">
                 <label className="text-xs font-bold text-slate-600">管理员密码</label>
-                <input 
-                  type="password" 
+                <input
+                  type="password"
                   value={setupPassword}
                   onChange={(e) => setSetupPassword(e.target.value)}
                   placeholder="请输入主管理员密码（不小于6位）"
@@ -9264,8 +9394,8 @@ export default function App() {
 
               <div className="flex flex-col gap-1.5">
                 <label className="text-xs font-bold text-slate-600">确认管理员密码</label>
-                <input 
-                  type="password" 
+                <input
+                  type="password"
                   value={setupConfirmPassword}
                   onChange={(e) => setSetupConfirmPassword(e.target.value)}
                   placeholder="请再次确认密码"
@@ -9322,8 +9452,8 @@ export default function App() {
             <div className="flex flex-col gap-4">
               <div className="flex flex-col gap-1.5">
                 <label className="text-xs font-bold text-slate-600">用户名 (Username)</label>
-                <input 
-                  type="text" 
+                <input
+                  type="text"
                   value={loginUsername}
                   onChange={(e) => setLoginUsername(e.target.value)}
                   placeholder="请输入您的用户名"
@@ -9334,8 +9464,8 @@ export default function App() {
 
               <div className="flex flex-col gap-1.5">
                 <label className="text-xs font-bold text-slate-600">登录密码 (Password)</label>
-                <input 
-                  type="password" 
+                <input
+                  type="password"
                   value={loginPassword}
                   onChange={(e) => setLoginPassword(e.target.value)}
                   placeholder="请输入您的登录密码"
@@ -9356,7 +9486,7 @@ export default function App() {
         {showDeepSeekConfigModal && (
           <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs z-50 flex items-center justify-center p-4">
             <div className="bg-white rounded-2xl border border-slate-100 shadow-xl w-full max-w-md flex flex-col overflow-hidden animate-in fade-in zoom-in-95 duration-150">
-              
+
               {/* Header */}
               <div className="p-5 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
                 <div>
@@ -9421,27 +9551,27 @@ export default function App() {
 
     <div className="flex h-screen bg-slate-50 text-slate-800 font-sans overflow-hidden">
 
-      
+
 
       {/* 1. LEFT SIDEBAR PANEL */}
 
       {/* Mobile Sidebar Overlay */}
       {sidebarOpen && (
-        <div 
+        <div
           className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-20 lg:hidden"
           onClick={() => setSidebarOpen(false)}
         />
       )}
 
       <aside className={`fixed lg:static inset-y-0 left-0 w-64 bg-white border-r border-slate-100 flex flex-col justify-between h-full z-30 shrink-0 transition-transform duration-300 transform lg:transform-none ${sidebarOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'}`}>
-        
+
         {/* Brand Logo Header */}
         <div className="p-6 border-b border-slate-50 flex items-center justify-between gap-3">
           <div>
             <h1 className="font-bold text-slate-900 tracking-wide text-base leading-none">RosePay telegram tools</h1>
           </div>
           {/* Close button on mobile */}
-          <button 
+          <button
             onClick={() => setSidebarOpen(false)}
             className="lg:hidden p-1.5 hover:bg-slate-50 text-slate-400 hover:text-slate-600 rounded-lg transition-colors"
           >
@@ -9457,15 +9587,15 @@ export default function App() {
 
           {allowedTabs.includes('login') && (
 
-            <button 
+            <button
 
               onClick={() => setActiveTab('login')}
 
               className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition-all duration-200 border-l-4 ${
 
-                activeTab === 'login' 
+                activeTab === 'login'
 
-                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold' 
+                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold'
 
                   : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900 border-transparent'
 
@@ -9485,15 +9615,15 @@ export default function App() {
 
           {allowedTabs.includes('accounts') && (
 
-            <button 
+            <button
 
               onClick={() => setActiveTab('accounts')}
 
               className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition-all duration-200 border-l-4 ${
 
-                activeTab === 'accounts' 
+                activeTab === 'accounts'
 
-                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold' 
+                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold'
 
                   : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900 border-transparent'
 
@@ -9513,15 +9643,15 @@ export default function App() {
 
           {allowedTabs.includes('groups') && (
 
-            <button 
+            <button
 
               onClick={() => setActiveTab('groups')}
 
               className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition-all duration-200 border-l-4 ${
 
-                activeTab === 'groups' 
+                activeTab === 'groups'
 
-                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold' 
+                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold'
 
                   : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900 border-transparent'
 
@@ -9541,15 +9671,15 @@ export default function App() {
 
           {allowedTabs.includes('join') && (
 
-            <button 
+            <button
 
               onClick={() => setActiveTab('join')}
 
               className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition-all duration-200 border-l-4 ${
 
-                activeTab === 'join' 
+                activeTab === 'join'
 
-                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold' 
+                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold'
 
                   : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900 border-transparent'
 
@@ -9569,15 +9699,15 @@ export default function App() {
 
           {allowedTabs.includes('campaign') && (
 
-            <button 
+            <button
 
               onClick={() => setActiveTab('campaign')}
 
               className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition-all duration-200 border-l-4 ${
 
-                activeTab === 'campaign' 
+                activeTab === 'campaign'
 
-                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold' 
+                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold'
 
                   : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900 border-transparent'
 
@@ -9597,15 +9727,15 @@ export default function App() {
 
           {allowedTabs.includes('templates') && (
 
-            <button 
+            <button
 
               onClick={() => setActiveTab('templates')}
 
               className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition-all duration-200 border-l-4 ${
 
-                activeTab === 'templates' 
+                activeTab === 'templates'
 
-                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold' 
+                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold'
 
                   : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900 border-transparent'
 
@@ -9625,15 +9755,15 @@ export default function App() {
 
           {allowedTabs.includes('logs') && (
 
-            <button 
+            <button
 
               onClick={() => setActiveTab('logs')}
 
               className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition-all duration-200 border-l-4 ${
 
-                activeTab === 'logs' 
+                activeTab === 'logs'
 
-                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold' 
+                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold'
 
                   : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900 border-transparent'
 
@@ -9653,15 +9783,15 @@ export default function App() {
 
           {allowedTabs.includes('finder') && (
 
-            <button 
+            <button
 
               onClick={() => setActiveTab('finder')}
 
               className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition-all duration-200 border-l-4 ${
 
-                activeTab === 'finder' 
+                activeTab === 'finder'
 
-                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold' 
+                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold'
 
                   : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900 border-transparent'
 
@@ -9681,15 +9811,15 @@ export default function App() {
 
           {allowedTabs.includes('expansion') && (
 
-            <button 
+            <button
 
               onClick={() => setActiveTab('expansion')}
 
               className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition-all duration-200 border-l-4 ${
 
-                activeTab === 'expansion' 
+                activeTab === 'expansion'
 
-                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold' 
+                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold'
 
                   : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900 border-transparent'
 
@@ -9708,15 +9838,15 @@ export default function App() {
 
           {allowedTabs.includes('settings') && (
 
-            <button 
+            <button
 
               onClick={() => setActiveTab('settings')}
 
               className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition-all duration-200 border-l-4 ${
 
-                activeTab === 'settings' 
+                activeTab === 'settings'
 
-                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold' 
+                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold'
 
                   : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900 border-transparent'
 
@@ -9736,15 +9866,15 @@ export default function App() {
 
           {allowedTabs.includes('users') && (
 
-            <button 
+            <button
 
               onClick={() => setActiveTab('users')}
 
               className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition-all duration-200 border-l-4 ${
 
-                activeTab === 'users' 
+                activeTab === 'users'
 
-                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold' 
+                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold'
 
                   : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900 border-transparent'
 
@@ -9765,15 +9895,15 @@ export default function App() {
 
           {(allowedTabs.includes('bot_auth') || allowedTabs.includes('bots') || userRole === 'admin') && (
 
-            <button 
+            <button
 
               onClick={() => setActiveTab('bot_auth')}
 
               className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition-all duration-200 border-l-4 ${
 
-                activeTab === 'bot_auth' 
+                activeTab === 'bot_auth'
 
-                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold' 
+                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold'
 
                   : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900 border-transparent'
 
@@ -9793,15 +9923,15 @@ export default function App() {
 
           {allowedTabs.includes('permissions') && (
 
-            <button 
+            <button
 
               onClick={() => setActiveTab('permissions')}
 
               className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition-all duration-200 border-l-4 ${
 
-                activeTab === 'permissions' 
+                activeTab === 'permissions'
 
-                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold' 
+                  ? 'bg-blue-50/50 text-blue-600 border-blue-500 font-semibold'
 
                   : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900 border-transparent'
 
@@ -9831,7 +9961,7 @@ export default function App() {
 
       <main className="flex-grow flex flex-col h-full overflow-hidden relative">
 
-        
+
 
         {/* RIGHT TOP HEADER BAR */}
 
@@ -9839,7 +9969,7 @@ export default function App() {
 
           <div className="flex items-center gap-3">
             {/* Hamburger button on mobile */}
-            <button 
+            <button
               onClick={() => setSidebarOpen(true)}
               className="lg:hidden p-2 hover:bg-slate-50 text-slate-500 hover:text-slate-800 rounded-xl transition-all border border-slate-100 flex items-center justify-center"
             >
@@ -9925,7 +10055,7 @@ export default function App() {
 
                 </span>
 
-                <button 
+                <button
 
                   onClick={() => {
                     localStorage.removeItem('rosepay_auth_token');
@@ -9954,7 +10084,7 @@ export default function App() {
 
 
 
-            <button 
+            <button
 
               onClick={() => {
 
@@ -9984,7 +10114,7 @@ export default function App() {
 
         <div className="flex-grow p-4 lg:p-8 overflow-y-auto flex flex-col gap-6">
 
-          
+
 
           {/* A. Tab-Specific Metrics Dashboard Panel */}
 
@@ -10048,9 +10178,17 @@ export default function App() {
 
                   <div className="text-3xl font-bold text-slate-900 mt-2 font-mono flex items-center gap-2">
 
-                    <span className={`w-3.5 h-3.5 rounded-full ${campaignTasks.some(t => t.status === 'running') ? 'bg-emerald-500 animate-pulse' : 'bg-amber-400'}`}></span>
+                    <span className={`w-3.5 h-3.5 rounded-full ${
+                      campaignTasks.some(t => t.status === 'running')
+                        ? 'bg-emerald-500 animate-pulse'
+                        : campaignTasks.some(t => t.status === 'scheduled')
+                        ? 'bg-amber-400'
+                        : 'bg-slate-300'
+                    }`}></span>
 
-                    <span className="text-lg font-semibold">{campaignTasks.some(t => t.status === 'running') ? '运行中' : '暂停'}</span>
+                    <span className="text-lg font-semibold">
+                      {campaignTasks.some(t => t.status === 'running') ? '运行中' : campaignTasks.some(t => t.status === 'scheduled') ? '有定时任务' : '空闲'}
+                    </span>
 
                   </div>
 
@@ -10067,7 +10205,7 @@ export default function App() {
                   <h3 className="font-bold text-slate-900 text-base">系统及群发日志明细</h3>
                   <p className="text-xs text-slate-400 mt-0.5">查看各个群发轰炸任务的执行细节</p>
                 </div>
-                
+
                 <div className="flex flex-wrap gap-2.5 items-center">
                   <span className="text-xs font-bold text-slate-600">选择群发任务：</span>
                   <select
@@ -10109,8 +10247,8 @@ export default function App() {
                       </div>
                       <div>
                         <span className={`px-2.5 py-0.5 rounded text-[10px] font-semibold ${
-                          log.status === 'success' 
-                            ? 'bg-emerald-50 text-emerald-700 border border-emerald-100' 
+                          log.status === 'success'
+                            ? 'bg-emerald-50 text-emerald-700 border border-emerald-100'
                             : 'bg-rose-50 text-rose-700 border border-rose-100'
                         }`}>
                           {log.status === 'success' ? '成功' : '失败'}
@@ -10131,7 +10269,7 @@ export default function App() {
 
           {/* B. Dynamic Tab Content View */}
 
-          
+
 
           {/* TAB 1: ACCOUNT LOGIN CONSOLE */}
 
@@ -10155,7 +10293,7 @@ export default function App() {
 
               <div className="p-6 grid grid-cols-1 lg:grid-cols-2 gap-8">
 
-                
+
 
                 {/* Left Column: Input Textarea */}
 
@@ -10165,7 +10303,7 @@ export default function App() {
 
                     <label className="text-sm font-semibold text-slate-700">账号列表</label>
 
-                    <textarea 
+                    <textarea
 
                       value={textareaValue}
 
@@ -10179,9 +10317,9 @@ export default function App() {
 
                   </div>
 
-                  
 
-                  <button 
+
+                  <button
 
                     onClick={handleImportAccounts}
 
@@ -10207,7 +10345,7 @@ export default function App() {
 
                     {accountsPool.length > 0 && (
 
-                      <button 
+                      <button
 
                         onClick={handleBatchLoginAll}
 
@@ -10223,7 +10361,7 @@ export default function App() {
 
                   </div>
 
-                  
+
 
                   <div className="flex-grow h-48 overflow-y-auto border border-slate-100 rounded-xl p-4 flex flex-col gap-4 bg-slate-50/20">
 
@@ -10247,7 +10385,7 @@ export default function App() {
 
                           <div key={account.accountId} className="bg-white border border-slate-100 rounded-xl p-4 shadow-sm flex flex-col gap-3.5 relative hover:shadow-md transition-all">
 
-                            
+
 
                             {/* Card Header: Phone number and Delete button */}
 
@@ -10259,7 +10397,7 @@ export default function App() {
 
                               </div>
 
-                              
+
 
                               <div className="flex items-center gap-2">
 
@@ -10267,7 +10405,7 @@ export default function App() {
 
                                 <span className={`px-2 py-0.5 rounded text-[10px] font-semibold tracking-wide border ${
 
-                                  account.status === 'failed' 
+                                  account.status === 'failed'
 
                                     ? 'bg-rose-50 text-rose-700 border-rose-100'
 
@@ -10295,9 +10433,9 @@ export default function App() {
 
                                 </span>
 
-                                
 
-                                <button 
+
+                                <button
 
                                   onClick={() => handleDeleteAccount(account.accountId)}
 
@@ -10327,7 +10465,7 @@ export default function App() {
 
                               </div>
 
-                              
+
 
                               {/* Scraped Code & Default 2FA display */}
 
@@ -10359,13 +10497,13 @@ export default function App() {
 
                                 </div>
 
-                                
+
 
                                 <div className="flex gap-2">
 
-                                  <input 
+                                  <input
 
-                                    type="password" 
+                                    type="password"
 
                                     value={account.pass2fa}
 
@@ -10407,9 +10545,9 @@ export default function App() {
 
                                 <div className="flex-grow flex gap-1.5 items-center">
 
-                                  <input 
+                                  <input
 
-                                    type="text" 
+                                    type="text"
 
                                     value={account.code}
 
@@ -10441,17 +10579,17 @@ export default function App() {
 
                               )}
 
-                              
 
-                              <button 
+
+                              <button
 
                                 onClick={() => startLoginFlow(account.accountId)}
 
                                 disabled={
 
-                                  account.status === 'sending_code' || 
+                                  account.status === 'sending_code' ||
 
-                                  account.status === 'fetching_code' || 
+                                  account.status === 'fetching_code' ||
 
                                   account.status === 'submitting_code'
 
@@ -10539,7 +10677,7 @@ export default function App() {
 
                     <>
 
-                      <button 
+                      <button
 
                         onClick={() => {
 
@@ -10559,7 +10697,7 @@ export default function App() {
 
                       </button>
 
-                      <button 
+                      <button
 
                         onClick={() => {
 
@@ -10583,7 +10721,7 @@ export default function App() {
 
                     <>
 
-                      <button 
+                      <button
 
                         onClick={() => {
 
@@ -10601,7 +10739,7 @@ export default function App() {
 
                       </button>
 
-                      <button 
+                      <button
 
                         onClick={() => {
 
@@ -10621,7 +10759,7 @@ export default function App() {
 
                       </button>
 
-                      <button 
+                      <button
 
                         onClick={() => {
 
@@ -10641,7 +10779,7 @@ export default function App() {
 
                       </button>
 
-                      <button 
+                      <button
 
                         onClick={() => fetchBackendAccounts(true)}
 
@@ -10657,7 +10795,7 @@ export default function App() {
 
                       </button>
 
-                      <button 
+                      <button
 
                         onClick={togglePrivateRelayListeners}
 
@@ -10845,8 +10983,8 @@ export default function App() {
                             <tr className="border-b border-slate-100 bg-slate-50/50 text-[11px] font-semibold uppercase text-slate-400 tracking-wider">
                               {isBatchManagingAccounts && (
                                 <th className="py-4 px-3 w-12 text-center">
-                                  <input 
-                                    type="checkbox" 
+                                  <input
+                                    type="checkbox"
                                     checked={filtered.some(acc => !isAccountLockedForManualOperation(acc)) && selectedAccountIds.length === filtered.filter(acc => !isAccountLockedForManualOperation(acc)).length}
                                     onChange={() => handleToggleSelectAllAccounts(filtered.map(acc => acc.id))}
                                     className="rounded text-blue-600 focus:ring-blue-500/20 border-slate-300 cursor-pointer"
@@ -10856,7 +10994,7 @@ export default function App() {
                               <th className="py-2.5 px-2 text-xs w-[15%]">账号</th>
                               <th className="py-2.5 px-2 text-xs w-[14%]">归属 / 创建者</th>
                               <th className="py-2.5 px-2 text-xs w-[9%]">连接 & 登录</th>
-                              <th 
+                              <th
                                 className="py-2.5 px-2 text-xs cursor-pointer hover:bg-slate-100/60 select-none transition-colors w-[8%]"
                                 onClick={() => {
                                   if (accountSortField === 'available') {
@@ -10871,7 +11009,7 @@ export default function App() {
                               </th>
                               <th className="py-2.5 px-2 text-xs w-[11%]">网络代理</th>
                               <th className="py-2.5 px-2 text-xs w-[8%]">资料</th>
-                              <th 
+                              <th
                                 className="py-2.5 px-2 text-xs cursor-pointer hover:bg-slate-100/60 select-none transition-colors w-[10%]"
                                 onClick={() => {
                                   if (accountSortField === 'health') {
@@ -10889,8 +11027,8 @@ export default function App() {
                           </thead>
                           <tbody>
                             {filtered.map((acc) => (
-                              <tr 
-                                key={acc.id} 
+                              <tr
+                                key={acc.id}
                                 onClick={() => {
                                   if (isBatchManagingAccounts) {
                                     handleToggleSelectAccount(acc.id);
@@ -10904,8 +11042,8 @@ export default function App() {
                               >
                                 {isBatchManagingAccounts && (
                                   <td className="py-4 px-3 w-12 text-center" onClick={(e) => e.stopPropagation()}>
-                                    <input 
-                                      type="checkbox" 
+                                    <input
+                                      type="checkbox"
                                       checked={selectedAccountIds.includes(acc.id)}
                                       disabled={isAccountLockedForManualOperation(acc)}
                                       onChange={() => handleToggleSelectAccount(acc.id)}
@@ -11056,8 +11194,8 @@ export default function App() {
                                       ...assignedHosts,
                                     ])).filter(h => h !== '127.0.0.1');
 
-                                    const currentHost = acc.config?.proxy?.enabled && acc.config?.proxy?.host 
-                                      ? acc.config.proxy.host 
+                                    const currentHost = acc.config?.proxy?.enabled && acc.config?.proxy?.host
+                                      ? acc.config.proxy.host
                                       : 'none';
 
                                     return (
@@ -11074,8 +11212,8 @@ export default function App() {
                                         {availableHosts.map((host) => {
                                           const isCurrentAccountHost = host === currentHost;
                                           const isUsedByOthers = backendAccounts.some(
-                                            (other) => other.id !== acc.id && 
-                                                       other.config?.proxy?.enabled && 
+                                            (other) => other.id !== acc.id &&
+                                                       other.config?.proxy?.enabled &&
                                                        other.config?.proxy?.host === host
                                           );
                                           return (
@@ -11262,7 +11400,7 @@ export default function App() {
 
                   <div className="flex gap-2">
 
-                    <button 
+                    <button
 
                       onClick={(e) => {
 
@@ -11282,7 +11420,7 @@ export default function App() {
 
                     </button>
 
-                    <button 
+                    <button
 
                       onClick={(e) => {
 
@@ -11302,7 +11440,7 @@ export default function App() {
 
                     </button>
 
-                    <button 
+                    <button
 
                       onClick={(e) => {
 
@@ -11322,7 +11460,7 @@ export default function App() {
 
                     </button>
 
-                    <button 
+                    <button
 
                       onClick={async (e) => {
 
@@ -11340,7 +11478,7 @@ export default function App() {
 
                     </button>
 
-                    <button 
+                    <button
 
                       onClick={async (e) => {
 
@@ -11358,7 +11496,7 @@ export default function App() {
 
                     </button>
 
-                    <button 
+                    <button
 
                       onClick={async (e) => {
 
@@ -11380,7 +11518,7 @@ export default function App() {
 
                     {userRole === 'admin' && (
 
-                      <button 
+                      <button
 
                         onClick={async (e) => {
 
@@ -11432,7 +11570,7 @@ export default function App() {
 
                   {isBatchManaging ? (
 
-                    <button 
+                    <button
 
                       onClick={() => {
 
@@ -11454,7 +11592,7 @@ export default function App() {
 
                     <>
 
-                      <button 
+                      <button
 
                         onClick={() => {
 
@@ -11472,7 +11610,7 @@ export default function App() {
 
                       </button>
 
-                      <button 
+                      <button
 
                         onClick={() => setShowAddGroupModal(true)}
 
@@ -11510,7 +11648,7 @@ export default function App() {
 
                   )}
 
-                  <button 
+                  <button
 
                     onClick={handleRunGroupSyncWithLogs}
 
@@ -11602,7 +11740,7 @@ export default function App() {
 
                   <div className="flex flex-wrap justify-end gap-2">
 
-                    <button 
+                    <button
 
                       onClick={async (e) => {
 
@@ -11620,7 +11758,7 @@ export default function App() {
 
                     </button>
 
-                    <button 
+                    <button
 
                       onClick={async (e) => {
 
@@ -11638,7 +11776,7 @@ export default function App() {
 
                     </button>
 
-                    <button 
+                    <button
 
                       onClick={async (e) => {
 
@@ -11676,9 +11814,9 @@ export default function App() {
 
                         <th className="py-3 px-3 w-10 text-center">
 
-                          <input 
+                          <input
 
-                            type="checkbox" 
+                            type="checkbox"
 
                             checked={groups.length > 0 && selectedGroupIds.length === groups.length}
 
@@ -11730,9 +11868,9 @@ export default function App() {
 
                       sortedGroups.map((group) => (
 
-                        <tr 
+                        <tr
 
-                          key={group.id} 
+                          key={group.id}
 
                           onClick={() => {
 
@@ -11760,9 +11898,9 @@ export default function App() {
 
                             <td className="py-3 px-3 w-10 text-center" onClick={(e) => e.stopPropagation()}>
 
-                              <input 
+                              <input
 
-                                type="checkbox" 
+                                type="checkbox"
 
                                 checked={selectedGroupIds.includes(group.id)}
 
@@ -11780,9 +11918,9 @@ export default function App() {
 
                           <td className="py-3 px-3 break-words">
 
-                            <div 
+                            <div
 
-                              className="text-slate-900 font-semibold line-clamp-2 leading-snug text-[13px]" 
+                              className="text-slate-900 font-semibold line-clamp-2 leading-snug text-[13px]"
 
                               style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}
 
@@ -11884,7 +12022,7 @@ export default function App() {
 
                           <td className="py-3 px-3 whitespace-nowrap">
 
-                            <button 
+                            <button
 
                               onClick={(e) => {
 
@@ -11896,9 +12034,9 @@ export default function App() {
 
                               className={`px-3 py-1 rounded-full text-xs font-semibold whitespace-nowrap inline-block ${
 
-                                group.enabled 
+                                group.enabled
 
-                                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-100' 
+                                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-100'
 
                                   : 'bg-slate-100 text-slate-400'
 
@@ -11914,7 +12052,7 @@ export default function App() {
 
                           <td className="py-3 px-3 text-right">
 
-                            <button 
+                            <button
 
                               onClick={(e) => {
 
@@ -11963,7 +12101,7 @@ export default function App() {
 
               <div className="grid grid-cols-1 xl:grid-cols-2 gap-8 items-start">
 
-                
+
 
                 {/* Left Column: Task Configuration */}
 
@@ -12365,9 +12503,9 @@ export default function App() {
 
                                         // Append it
 
-                                        const targetLink = g.username 
+                                        const targetLink = g.username
 
-                                          ? (g.username.startsWith('@') ? g.username : `@${g.username}`) 
+                                          ? (g.username.startsWith('@') ? g.username : `@${g.username}`)
 
                                           : g.id;
 
@@ -12469,7 +12607,7 @@ export default function App() {
 
                     <label className="text-sm font-semibold text-slate-700">4. 加群时间间隔与防封策略</label>
 
-                    
+
 
                     <div className="flex gap-6 mt-1 mb-2">
 
@@ -12585,7 +12723,7 @@ export default function App() {
 
                         <span className="text-xs text-slate-500">个群组</span>
 
-                        
+
 
                         <div className="w-full mt-2 pt-2 border-t border-slate-200/40 text-[10px] text-slate-400 leading-relaxed">
 
@@ -12719,13 +12857,13 @@ export default function App() {
 
                     <p className="text-xs text-slate-400 mt-0.5">
 
-                      {joinRunning 
+                      {joinRunning
 
-                        ? "监控加群实时进度、异常统计及发言权限筛选" 
+                        ? "监控加群实时进度、异常统计及发言权限筛选"
 
-                        : selectedHistoryTask 
+                        : selectedHistoryTask
 
-                          ? "查看该次归档任务的详细参数、日志及加群结果列表" 
+                          ? "查看该次归档任务的详细参数、日志及加群结果列表"
 
                           : "点击任意一条历史记录查看其完整的加群日志与执行详情"}
 
@@ -12739,7 +12877,7 @@ export default function App() {
 
                     <div className="flex flex-col gap-5 flex-grow">
 
-                      
+
 
                       {/* Progress Metrics Bar */}
 
@@ -13521,9 +13659,9 @@ export default function App() {
 
                   </label>
 
-                  
 
-                  {campaignTasks.some(t => t.status === 'running') && (
+
+                  {campaignTasks.some(t => ['running', 'scheduled'].includes(t.status)) && (
 
                     <button
 
@@ -13541,7 +13679,7 @@ export default function App() {
 
                   )}
 
-                  
+
 
                   <button
 
@@ -13587,7 +13725,7 @@ export default function App() {
 
               {/* Task list preview grid */}
 
-              {groupCampaignTasks(campaignTasks).filter(t => showingHistoryCampaignsOnly ? t.status !== 'running' : t.status === 'running').length === 0 ? (
+              {groupCampaignTasks(campaignTasks).filter(t => showingHistoryCampaignsOnly ? !['running', 'scheduled'].includes(t.status) : ['running', 'scheduled'].includes(t.status)).length === 0 ? (
 
                 <div className="bg-white border border-slate-100 rounded-2xl py-20 text-center flex flex-col items-center justify-center gap-3">
 
@@ -13607,7 +13745,7 @@ export default function App() {
 
                   {groupCampaignTasks(campaignTasks)
 
-                    .filter(t => showingHistoryCampaignsOnly ? t.status !== 'running' : t.status === 'running')
+                    .filter(t => showingHistoryCampaignsOnly ? !['running', 'scheduled'].includes(t.status) : ['running', 'scheduled'].includes(t.status))
 
                     .map((task) => {
 
@@ -13623,13 +13761,13 @@ export default function App() {
 
                       } catch (e) {}
 
-                      
+
 
                       return (
 
-                        <div 
+                        <div
 
-                          key={task.id} 
+                          key={task.id}
 
                           onClick={() => {
 
@@ -13641,7 +13779,11 @@ export default function App() {
 
                           }}
 
-                          className="bg-white border border-slate-100 rounded-2xl p-5 shadow-xs flex flex-col gap-4 relative hover:shadow-md transition-all cursor-pointer group hover:border-slate-200"
+                          className={`bg-white rounded-2xl p-5 shadow-xs flex flex-col gap-4 relative hover:shadow-md transition-all cursor-pointer group ${
+                            task.status === 'scheduled'
+                              ? 'border border-amber-200/80 ring-1 ring-amber-50 hover:border-amber-300'
+                              : 'border border-slate-100 hover:border-slate-200'
+                          }`}
 
                         >
 
@@ -13659,9 +13801,13 @@ export default function App() {
 
                             <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
 
-                              task.status === 'running' 
+                              task.status === 'running'
 
                                 ? 'bg-emerald-50 text-emerald-700 border-emerald-100 animate-pulse'
+
+                                : task.status === 'scheduled'
+
+                                ? 'bg-amber-50 text-amber-700 border-amber-200'
 
                                 : task.status === 'completed'
 
@@ -13677,6 +13823,8 @@ export default function App() {
 
                               {task.status === 'running' && '运行中'}
 
+                              {task.status === 'scheduled' && '定时等待'}
+
                               {task.status === 'completed' && '已完成'}
 
                               {task.status === 'stopped' && '已停止'}
@@ -13686,6 +13834,18 @@ export default function App() {
                             </span>
 
                           </div>
+
+                          {task.status === 'scheduled' && (
+                            <div className="rounded-xl border border-amber-100 bg-amber-50/70 p-3 flex items-start gap-2 text-[11px] text-amber-800">
+                              <CalendarClock className="w-4 h-4 shrink-0 mt-0.5" />
+                              <div className="min-w-0 flex flex-col gap-1">
+                                <span className="font-bold">定时任务已创建，启动前不会占用账号</span>
+                                <span className="leading-relaxed">
+                                  北京时间 {getCampaignScheduledLabel(task) || '待确认'} 开始执行，预计剩余 {getCampaignScheduledCountdown(task)}
+                                </span>
+                              </div>
+                            </div>
+                          )}
 
 
 
@@ -13720,9 +13880,13 @@ export default function App() {
 
                               <span>
 
-                                {task.max_cycles === 0 
+                                {task.status === 'scheduled'
 
-                                  ? `当前运行：第 ${task.current_cycle} 轮（无限循环）` 
+                                  ? '等待定时启动'
+
+                                  : task.max_cycles === 0
+
+                                  ? `当前运行：第 ${task.current_cycle} 轮（无限循环）`
 
                                   : `发送进度：第 ${task.current_cycle} / ${task.max_cycles} 轮`
 
@@ -13740,13 +13904,13 @@ export default function App() {
 
                                 className={`h-full transition-all duration-500 rounded-full ${
 
-                                  task.status === 'running' ? 'bg-blue-600' : 'bg-slate-400'
+                                  task.status === 'running' ? 'bg-blue-600' : task.status === 'scheduled' ? 'bg-amber-400' : 'bg-slate-400'
 
                                 }`}
 
-                                style={{ 
+                                style={{
 
-                                  width: `${task.max_cycles > 0 ? (task.current_cycle / task.max_cycles) * 100 : 100}%` 
+                                  width: `${task.status === 'scheduled' ? 8 : task.max_cycles > 0 ? (task.current_cycle / task.max_cycles) * 100 : 100}%`
 
                                 }}
 
@@ -13826,7 +13990,7 @@ export default function App() {
 
                           <div className="flex gap-2 justify-end pt-2 border-t border-slate-50 shrink-0">
 
-                            {task.status === 'running' && (
+                            {['running', 'scheduled'].includes(task.status) && (
 
                               <button
 
@@ -13834,7 +13998,7 @@ export default function App() {
 
                                   e.stopPropagation();
 
-                                  if (confirm("确定要停止这个轰炸任务吗？")) {
+                                  if (confirm(task.status === 'scheduled' ? "确定要取消这个定时轰炸任务吗？" : "确定要停止这个轰炸任务吗？")) {
 
                                     handleStopCampaignTask(task.task_ids);
 
@@ -13846,7 +14010,7 @@ export default function App() {
 
                               >
 
-                                🛑 停止任务
+                                {task.status === 'scheduled' ? '取消定时' : '🛑 停止任务'}
 
                               </button>
 
@@ -13898,7 +14062,7 @@ export default function App() {
 
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
 
-                
+
 
                 {/* Form to Add New Predefined Ad */}
 
@@ -13920,13 +14084,13 @@ export default function App() {
 
                   </h4>
 
-                  
+
 
                   <div className="flex flex-col gap-1">
 
                     <label className="text-xs text-slate-500 font-semibold">广告描述 (简要说明)</label>
 
-                    <input 
+                    <input
 
                       type="text"
 
@@ -14159,7 +14323,7 @@ export default function App() {
 
                 </div>
 
-                <button 
+                <button
 
                   onClick={() => setLogs([])}
 
@@ -14211,13 +14375,13 @@ export default function App() {
 
                         <span className={`px-2.5 py-0.5 rounded text-[10px] font-semibold ${
 
-                          log.status === 'success' 
+                          log.status === 'success'
 
-                            ? 'bg-emerald-50 text-emerald-700 border border-emerald-100' 
+                            ? 'bg-emerald-50 text-emerald-700 border border-emerald-100'
 
-                            : log.status === 'warning' 
+                            : log.status === 'warning'
 
-                            ? 'bg-amber-50 text-amber-700 border border-amber-100' 
+                            ? 'bg-amber-50 text-amber-700 border border-amber-100'
 
                             : 'bg-rose-50 text-rose-700 border border-rose-100'
 
@@ -14247,7 +14411,7 @@ export default function App() {
 
 
 
-          
+
 
 
 
@@ -14269,7 +14433,7 @@ export default function App() {
 
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
 
-                
+
 
                 {/* Proxy Form */}
 
@@ -14287,9 +14451,9 @@ export default function App() {
 
                     <label className="checkbox-container">
 
-                      <input 
+                      <input
 
-                        type="checkbox" 
+                        type="checkbox"
 
                         checked={proxyEnabled}
 
@@ -14327,9 +14491,9 @@ export default function App() {
 
                       <label className="text-xs text-slate-500">主机地址 / IP</label>
 
-                      <input 
+                      <input
 
-                        type="text" 
+                        type="text"
 
                         value={proxyHost}
 
@@ -14351,9 +14515,9 @@ export default function App() {
 
                       <label className="text-xs text-slate-500">代理端口</label>
 
-                      <input 
+                      <input
 
-                        type="number" 
+                        type="number"
 
                         value={proxyPort}
 
@@ -14369,9 +14533,9 @@ export default function App() {
 
                       <label className="text-xs text-slate-500">账号 (可空)</label>
 
-                      <input 
+                      <input
 
-                        type="text" 
+                        type="text"
 
                         value={proxyUser}
 
@@ -14391,9 +14555,9 @@ export default function App() {
 
                     <label className="text-xs text-slate-500">密码 (可空)</label>
 
-                    <input 
+                    <input
 
-                      type="password" 
+                      type="password"
 
                       value={proxyPass}
 
@@ -14407,7 +14571,7 @@ export default function App() {
 
 
 
-                  <button 
+                  <button
 
                     onClick={() => {
 
@@ -14445,7 +14609,7 @@ export default function App() {
 
                     <label className="text-xs text-slate-500">登录认证模式 (auth_mode)</label>
 
-                    <select 
+                    <select
 
                       value={authMode}
 
@@ -14473,9 +14637,9 @@ export default function App() {
 
                         <label className="text-xs text-slate-500">api_id</label>
 
-                        <input 
+                        <input
 
-                          type="text" 
+                          type="text"
 
                           value={apiId}
 
@@ -14493,9 +14657,9 @@ export default function App() {
 
                         <label className="text-xs text-slate-500">api_hash</label>
 
-                        <input 
+                        <input
 
-                          type="text" 
+                          type="text"
 
                           value={apiHash}
 
@@ -14527,7 +14691,7 @@ export default function App() {
 
 
 
-                  <button 
+                  <button
 
                     onClick={() => {
 
@@ -14557,7 +14721,7 @@ export default function App() {
 
 
 
-          
+
 
 
 
@@ -14601,7 +14765,7 @@ export default function App() {
 
                 {systemTabSubView === 'users' ? (
 
-                  <button 
+                  <button
 
                     onClick={() => setShowAddUserModal(true)}
 
@@ -14617,7 +14781,7 @@ export default function App() {
 
                 ) : (
 
-                  <button 
+                  <button
 
                     onClick={() => setShowAddCompanyModal(true)}
 
@@ -14777,7 +14941,7 @@ export default function App() {
 
                               <td className="py-4 px-6 text-right">
 
-                                <button 
+                                <button
 
                                   onClick={() => {
 
@@ -14805,7 +14969,7 @@ export default function App() {
 
                                 </button>
 
-                                <button 
+                                <button
 
                                   onClick={() => handleDeleteUser(user.id, user.username)}
 
@@ -14923,7 +15087,7 @@ export default function App() {
 
                                 </button>
 
-                                <button 
+                                <button
 
                                   onClick={() => handleDeleteCompany(company.id, company.name)}
 
@@ -15069,9 +15233,9 @@ export default function App() {
 
                       <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
 
-                        rp.role === 'admin' 
+                        rp.role === 'admin'
 
-                          ? 'bg-blue-50 text-blue-700 border border-blue-100' 
+                          ? 'bg-blue-50 text-blue-700 border border-blue-100'
 
                           : 'bg-slate-100 text-slate-500 border border-slate-200'
 
@@ -15121,15 +15285,15 @@ export default function App() {
 
                         return (
 
-                          <label 
+                          <label
 
-                            key={tab.id} 
+                            key={tab.id}
 
                             className={`flex items-center justify-between p-2.5 rounded-lg border text-xs cursor-pointer select-none transition-all ${
 
-                              isChecked 
+                              isChecked
 
-                                ? 'border-blue-100 bg-blue-50/20 text-slate-800' 
+                                ? 'border-blue-100 bg-blue-50/20 text-slate-800'
 
                                 : 'border-slate-100 bg-white text-slate-500 hover:bg-slate-50'
 
@@ -15139,9 +15303,9 @@ export default function App() {
 
                             <div className="flex items-center gap-2">
 
-                              <input 
+                              <input
 
-                                type="checkbox" 
+                                type="checkbox"
 
                                 checked={isChecked}
 
@@ -15157,7 +15321,7 @@ export default function App() {
 
                                     if (item.role === rp.role) {
 
-                                      const updatedTabs = checked 
+                                      const updatedTabs = checked
 
                                         ? [...item.allowed_tabs, tab.id]
 
@@ -15291,10 +15455,10 @@ export default function App() {
 
           {activeTab === 'finder' && (
             <div className="flex flex-col gap-6 w-full animate-fade-in">
-              
+
               {/* Row 1: Search Console (Left) and Logs (Right) */}
               <div className="flex flex-col lg:flex-row gap-6 items-stretch w-full">
-                
+
                 {/* Search Console */}
                 <div className="w-full lg:w-[380px] bg-white border border-slate-100 rounded-2xl p-6 shadow-sm flex flex-col gap-4">
                   <div>
@@ -15311,7 +15475,7 @@ export default function App() {
                       <Key className="w-3.5 h-3.5 text-blue-500" />
                       AI 质量评估引擎配置
                     </div>
-                    
+
                     <div className="grid grid-cols-2 gap-2">
                       {/* Gemini Status Card */}
                       <div className="bg-white border border-slate-150 rounded-lg p-2.5 flex flex-col justify-between gap-1 shadow-xs">
@@ -15513,8 +15677,8 @@ export default function App() {
                       scrapedTaskLogs.map((logStr, lIdx) => {
                         let isAiThought = logStr.includes('[AI 思考') || logStr.includes('[AI 思考结论]');
                         return (
-                          <div 
-                            key={lIdx} 
+                          <div
+                            key={lIdx}
                             className={`${isAiThought ? 'text-cyan-300 font-semibold bg-cyan-950/20 py-0.5 px-1.5 rounded border-l-2 border-cyan-400' : 'text-emerald-400'}`}
                           >
                             {logStr}
@@ -15596,7 +15760,7 @@ export default function App() {
                           />
                         </th>
                         <th className="p-4">群组标题</th>
-                        <th 
+                        <th
                           onClick={() => {
                             if (scrapedSortField === 'time') {
                               setScrapedSortOrder(prev => prev === 'asc' ? 'desc' : 'asc');
@@ -15612,7 +15776,7 @@ export default function App() {
                             {scrapedSortField === 'time' && (scrapedSortOrder === 'asc' ? ' ▲' : ' ▼')}
                           </div>
                         </th>
-                        <th 
+                        <th
                           onClick={() => {
                             if (scrapedSortField === 'member_count') {
                               setScrapedSortOrder(prev => prev === 'asc' ? 'desc' : 'asc');
@@ -15629,7 +15793,7 @@ export default function App() {
                           </div>
                         </th>
                         <th className="p-4">AI 属性分类</th>
-                        <th 
+                        <th
                           onClick={() => {
                             if (scrapedSortField === 'quality_score') {
                               setScrapedSortOrder(prev => prev === 'asc' ? 'desc' : 'asc');
@@ -15645,7 +15809,7 @@ export default function App() {
                             {scrapedSortField === 'quality_score' && (scrapedSortOrder === 'asc' ? ' ▲' : ' ▼')}
                           </div>
                         </th>
-                        <th 
+                        <th
                           onClick={() => {
                             if (scrapedSortField === 'status') {
                               setScrapedSortOrder(prev => prev === 'asc' ? 'desc' : 'asc');
@@ -15678,7 +15842,7 @@ export default function App() {
                             const bIgnored = b.status === 'ignored';
                             if (aIgnored && !bIgnored) return 1;
                             if (!aIgnored && bIgnored) return -1;
-                            
+
                             let valA: any;
                             let valB: any;
                             if (scrapedSortField === 'time') {
@@ -15694,7 +15858,7 @@ export default function App() {
                               valA = a.status || '';
                               valB = b.status || '';
                             }
-                            
+
                             if (valA < valB) return scrapedSortOrder === 'asc' ? -1 : 1;
                             if (valA > valB) return scrapedSortOrder === 'asc' ? 1 : -1;
                             return 0;
@@ -15703,8 +15867,8 @@ export default function App() {
                             const isSelected = selectedScrapedGroupIds.includes(g.id);
                             const isIgnored = g.status === 'ignored';
                             return (
-                              <tr 
-                                key={g.id} 
+                              <tr
+                                key={g.id}
                                 className={`hover:bg-slate-50/50 transition-colors cursor-pointer ${isSelected ? 'bg-blue-50/10' : ''} ${isIgnored ? 'opacity-60' : ''}`}
                                 onClick={(e) => {
                                   if ((e.target as HTMLElement).closest('input') || (e.target as HTMLElement).closest('a') || (e.target as HTMLElement).closest('button')) {
@@ -15767,7 +15931,7 @@ export default function App() {
                                 <td className="p-4 whitespace-nowrap">
                                   <div className="flex items-center gap-2">
                                     <div className="w-16 bg-slate-100 rounded-full h-2 overflow-hidden shrink-0">
-                                      <div 
+                                      <div
                                         className={`h-full rounded-full ${g.quality_score >= 70 ? 'bg-emerald-500' : g.quality_score >= 40 ? 'bg-amber-400' : 'bg-rose-500'}`}
                                         style={{ width: `${g.quality_score}%` }}
                                       ></div>
@@ -15843,7 +16007,7 @@ export default function App() {
                           ))}
                         </select>
                       </div>
-                      
+
                       <button
                         onClick={() => handleBatchActionScraped('join')}
                         className="px-4 py-2 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white rounded-xl font-bold text-xs shadow-sm transition-all flex items-center gap-1"
@@ -15883,7 +16047,7 @@ export default function App() {
                         </h3>
                         <p className="text-[10px] text-slate-400 mt-0.5 font-light">由 AI 智能评估分析得出</p>
                       </div>
-                      <button 
+                      <button
                         onClick={() => setSelectedScrapedGroupDetail(null)}
                         className="w-8 h-8 hover:bg-slate-100 rounded-full flex items-center justify-center text-slate-400 hover:text-slate-600 transition-colors"
                       >
@@ -15898,10 +16062,10 @@ export default function App() {
                         <span className="text-[10px] text-slate-400 font-bold uppercase">群组标题</span>
                         <div className="font-bold text-slate-900 text-sm">{selectedScrapedGroupDetail.title || selectedScrapedGroupDetail.id}</div>
                         <div className="flex items-center gap-3 mt-1 text-[11px]">
-                          <a 
-                            href={selectedScrapedGroupDetail.link} 
-                            target="_blank" 
-                            rel="noreferrer" 
+                          <a
+                            href={selectedScrapedGroupDetail.link}
+                            target="_blank"
+                            rel="noreferrer"
                             className="text-blue-500 hover:underline flex items-center gap-0.5"
                           >
                             @{selectedScrapedGroupDetail.id}
@@ -16005,10 +16169,10 @@ export default function App() {
                     <div className="flex justify-between items-center text-xs">
                       <span className="text-slate-500 font-medium">任务状态</span>
                       <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
-                        expansionStatus === 'running' 
-                          ? 'bg-emerald-50 text-emerald-600 animate-pulse' 
-                          : expansionStatus === 'paused' 
-                          ? 'bg-amber-50 text-amber-600' 
+                        expansionStatus === 'running'
+                          ? 'bg-emerald-50 text-emerald-600 animate-pulse'
+                          : expansionStatus === 'paused'
+                          ? 'bg-amber-50 text-amber-600'
                           : 'bg-slate-100 text-slate-500'
                       }`}>
                         {expansionStatus === 'running' ? '运行中' : expansionStatus === 'paused' ? '已暂停' : '已停止'}
@@ -16136,7 +16300,7 @@ export default function App() {
                     <div className="bg-slate-50 border border-slate-100 rounded-xl p-3 text-xs text-slate-600 flex flex-col gap-1.5 animate-fade-in">
                       <div className="flex justify-between items-center">
                         <span className="font-bold text-slate-700">当前拓展目标</span>
-                        <button 
+                        <button
                           onClick={() => pauseExpansion()}
                           className="text-[10px] text-blue-500 hover:underline font-semibold"
                         >
@@ -16189,8 +16353,8 @@ export default function App() {
                       expansionLogs.map((logStr, lIdx) => {
                         let isAiThought = logStr.includes('[AI 思考') || logStr.includes('[AI 思考结论]');
                         return (
-                          <div 
-                            key={lIdx} 
+                          <div
+                            key={lIdx}
                             className={`${isAiThought ? 'text-cyan-300 font-semibold bg-cyan-950/20 py-0.5 px-1.5 rounded border-l-2 border-cyan-400' : 'text-emerald-400'}`}
                           >
                             {logStr}
@@ -16263,7 +16427,7 @@ export default function App() {
                           />
                         </th>
                         <th className="p-4">群组标题</th>
-                        <th 
+                        <th
                           onClick={() => {
                             if (expansionSortField === 'time') {
                               setExpansionSortOrder(prev => prev === 'asc' ? 'desc' : 'asc');
@@ -16279,7 +16443,7 @@ export default function App() {
                             {expansionSortField === 'time' && (expansionSortOrder === 'asc' ? ' ▲' : ' ▼')}
                           </div>
                         </th>
-                        <th 
+                        <th
                           onClick={() => {
                             if (expansionSortField === 'member_count') {
                               setExpansionSortOrder(prev => prev === 'asc' ? 'desc' : 'asc');
@@ -16296,7 +16460,7 @@ export default function App() {
                           </div>
                         </th>
                         <th className="p-4">AI 属性分类</th>
-                        <th 
+                        <th
                           onClick={() => {
                             if (expansionSortField === 'quality_score') {
                               setExpansionSortOrder(prev => prev === 'asc' ? 'desc' : 'asc');
@@ -16330,7 +16494,7 @@ export default function App() {
                             const bIgnored = b.status === 'ignored';
                             if (aIgnored && !bIgnored) return 1;
                             if (!aIgnored && bIgnored) return -1;
-                            
+
                             let valA: any;
                             let valB: any;
                             if (expansionSortField === 'time') {
@@ -16343,7 +16507,7 @@ export default function App() {
                               valA = a.quality_score || 0;
                               valB = b.quality_score || 0;
                             }
-                            
+
                             if (valA < valB) return expansionSortOrder === 'asc' ? -1 : 1;
                             if (valA > valB) return expansionSortOrder === 'asc' ? 1 : -1;
                             return 0;
@@ -16352,8 +16516,8 @@ export default function App() {
                             const isSelected = selectedExpansionGroupIds.includes(g.id);
                             const isIgnored = g.status === 'ignored';
                             return (
-                              <tr 
-                                key={g.id} 
+                              <tr
+                                key={g.id}
                                 className={`hover:bg-slate-50/50 transition-colors cursor-pointer ${isSelected ? 'bg-blue-50/10' : ''} ${isIgnored ? 'opacity-60' : ''}`}
                                 onClick={(e) => {
                                   if ((e.target as HTMLElement).closest('input') || (e.target as HTMLElement).closest('a') || (e.target as HTMLElement).closest('button')) {
@@ -16416,7 +16580,7 @@ export default function App() {
                                 <td className="p-4 whitespace-nowrap">
                                   <div className="flex items-center gap-2">
                                     <div className="w-16 bg-slate-100 rounded-full h-2 overflow-hidden shrink-0">
-                                      <div 
+                                      <div
                                         className={`h-full rounded-full ${g.quality_score >= 70 ? 'bg-emerald-500' : g.quality_score >= 40 ? 'bg-amber-400' : 'bg-rose-500'}`}
                                         style={{ width: `${g.quality_score}%` }}
                                       ></div>
@@ -16487,7 +16651,7 @@ export default function App() {
                         </h3>
                         <p className="text-[10px] text-slate-400 mt-0.5 font-light">由 AI Agent 自主搜寻并多维度分析得出</p>
                       </div>
-                      <button 
+                      <button
                         onClick={() => setSelectedExpansionGroupDetail(null)}
                         className="w-8 h-8 hover:bg-slate-100 rounded-full flex items-center justify-center text-slate-400 hover:text-slate-600 transition-colors"
                       >
@@ -16502,10 +16666,10 @@ export default function App() {
                         <span className="text-[10px] text-slate-400 font-bold uppercase">群组标题</span>
                         <div className="font-bold text-slate-900 text-sm">{selectedExpansionGroupDetail.title || selectedExpansionGroupDetail.id}</div>
                         <div className="flex items-center gap-3 mt-1 text-[11px]">
-                          <a 
-                            href={selectedExpansionGroupDetail.link} 
-                            target="_blank" 
-                            rel="noreferrer" 
+                          <a
+                            href={selectedExpansionGroupDetail.link}
+                            target="_blank"
+                            rel="noreferrer"
                             className="text-blue-500 hover:underline flex items-center gap-0.5"
                           >
                             @{selectedExpansionGroupDetail.id}
@@ -16526,7 +16690,7 @@ export default function App() {
                             {selectedExpansionGroupDetail.quality_score} 分
                           </span>
                           <div className="w-full bg-slate-200 h-1 rounded-full overflow-hidden mt-1">
-                            <div 
+                            <div
                               className={`h-full ${
                                 selectedExpansionGroupDetail.quality_score >= 80 ? 'bg-emerald-500' : selectedExpansionGroupDetail.quality_score >= 50 ? 'bg-amber-400' : 'bg-rose-400'
                               }`}
@@ -16539,10 +16703,10 @@ export default function App() {
                           <span className="text-[10px] text-slate-400 font-bold uppercase">AI 属性分类</span>
                           <div>
                             <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold inline-block ${
-                              selectedExpansionGroupDetail.category === 'life' 
-                                ? 'bg-emerald-50 text-emerald-600 border border-emerald-100' 
-                                : selectedExpansionGroupDetail.category === 'business' 
-                                ? 'bg-purple-50 text-purple-600 border border-purple-100' 
+                              selectedExpansionGroupDetail.category === 'life'
+                                ? 'bg-emerald-50 text-emerald-600 border border-emerald-100'
+                                : selectedExpansionGroupDetail.category === 'business'
+                                ? 'bg-purple-50 text-purple-600 border border-purple-100'
                                 : 'bg-slate-50 text-slate-500 border border-slate-100'
                             }`}>
                               {selectedExpansionGroupDetail.category === 'life' ? '印度生活聊天' : selectedExpansionGroupDetail.category === 'business' ? '同行商业广告' : selectedExpansionGroupDetail.category}
@@ -16623,14 +16787,14 @@ export default function App() {
               {/* Header */}
               <div className="p-5 border-b border-slate-100 bg-slate-50/50 flex justify-between items-center">
                 <h3 className="font-bold text-slate-900 text-sm">选择导入分组</h3>
-                <button 
+                <button
                   onClick={() => setGroupToImportCategory(null)}
                   className="w-8 h-8 hover:bg-slate-100 rounded-full flex items-center justify-center text-slate-400 hover:text-slate-600 transition-colors text-lg"
                 >
                   ✕
                 </button>
               </div>
-              
+
               {/* Body */}
               <div className="p-5 flex flex-col gap-4 text-xs">
                 <div className="flex flex-col gap-1.5">
@@ -16639,7 +16803,7 @@ export default function App() {
                     {groupToImportCategory.title || groupToImportCategory.id} (@{groupToImportCategory.id})
                   </div>
                 </div>
-                
+
                 <div className="flex flex-col gap-1.5">
                   <label className="text-slate-500 font-semibold">导入加群并归类为：</label>
                   <select
@@ -16653,7 +16817,7 @@ export default function App() {
                   </select>
                 </div>
               </div>
-              
+
               {/* Footer */}
               <div className="p-4 border-t border-slate-100 flex justify-end gap-2 bg-slate-50/50">
                 <button
@@ -16808,7 +16972,7 @@ export default function App() {
 
             <div className="bg-white rounded-2xl border border-slate-100 shadow-xl w-full max-w-md flex flex-col max-h-[85vh] overflow-hidden">
 
-              
+
 
               {/* Modal Header */}
 
@@ -16822,7 +16986,7 @@ export default function App() {
 
                 </div>
 
-                <button 
+                <button
 
                   onClick={handleCloseBatchProfileModal}
 
@@ -16844,7 +17008,7 @@ export default function App() {
 
               <div className="p-6 overflow-y-auto flex flex-col gap-5">
 
-                
+
 
                 {/* 1. Last name (固定姓氏) */}
 
@@ -16852,9 +17016,9 @@ export default function App() {
 
                   <label className="text-xs text-slate-600 font-semibold">固定姓氏 (Last Name)</label>
 
-                  <input 
+                  <input
 
-                    type="text" 
+                    type="text"
 
                     value={batchProfileLastName}
 
@@ -16882,9 +17046,9 @@ export default function App() {
 
                 <div className="flex items-center gap-2 bg-slate-50 p-3 rounded-lg border border-slate-100">
 
-                  <input 
+                  <input
 
-                    type="checkbox" 
+                    type="checkbox"
 
                     id="batchProfileVirtualModify"
 
@@ -16938,9 +17102,9 @@ export default function App() {
 
                       <label className="text-xs text-slate-600 font-semibold">固定名字 (First Name)</label>
 
-                      <input 
+                      <input
 
-                        type="text" 
+                        type="text"
 
                         value={batchProfileFirstName}
 
@@ -16960,9 +17124,9 @@ export default function App() {
 
                       <label className="text-xs text-slate-600 font-semibold">Username 前缀 (用户名)</label>
 
-                      <input 
+                      <input
 
-                        type="text" 
+                        type="text"
 
                         value={batchProfileUsernamePrefix}
 
@@ -17006,9 +17170,9 @@ export default function App() {
 
                   </div>
 
-                  <input 
+                  <input
 
-                    type="text" 
+                    type="text"
 
                     value={batchProfileAbout}
 
@@ -17140,7 +17304,7 @@ export default function App() {
 
             <div className="bg-white rounded-2xl border border-slate-100 shadow-xl w-full max-w-md flex flex-col max-h-[85vh] overflow-hidden">
 
-              
+
 
               {/* Modal Header */}
 
@@ -17154,7 +17318,7 @@ export default function App() {
 
                 </div>
 
-                <button 
+                <button
 
                   onClick={handleCloseBatch2faModal}
 
@@ -17176,7 +17340,7 @@ export default function App() {
 
               <div className="p-6 overflow-y-auto flex flex-col gap-5">
 
-                
+
 
                 {/* 1. Current 2FA Password (current default/likely same) */}
 
@@ -17184,9 +17348,9 @@ export default function App() {
 
                   <label className="text-xs text-slate-600 font-semibold">原两步验证密码 (若当前未设置请留空)</label>
 
-                  <input 
+                  <input
 
-                    type="password" 
+                    type="password"
 
                     value={batch2faCurrentPassword}
 
@@ -17212,7 +17376,7 @@ export default function App() {
 
                   <div className="flex gap-2">
 
-                    <button 
+                    <button
 
                       type="button"
 
@@ -17220,9 +17384,9 @@ export default function App() {
 
                       className={`flex-grow py-2 border rounded-lg text-xs font-semibold transition-all ${
 
-                        batch2faNewPasswordMode === 'same' 
+                        batch2faNewPasswordMode === 'same'
 
-                          ? 'border-blue-500 bg-blue-50/50 text-blue-600' 
+                          ? 'border-blue-500 bg-blue-50/50 text-blue-600'
 
                           : 'border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100'
 
@@ -17236,7 +17400,7 @@ export default function App() {
 
                     </button>
 
-                    <button 
+                    <button
 
                       type="button"
 
@@ -17244,9 +17408,9 @@ export default function App() {
 
                       className={`flex-grow py-2 border rounded-lg text-xs font-semibold transition-all ${
 
-                        batch2faNewPasswordMode === 'auto' 
+                        batch2faNewPasswordMode === 'auto'
 
-                          ? 'border-blue-500 bg-blue-50/50 text-blue-600' 
+                          ? 'border-blue-500 bg-blue-50/50 text-blue-600'
 
                           : 'border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100'
 
@@ -17274,9 +17438,9 @@ export default function App() {
 
                     <label className="text-xs text-slate-600 font-semibold">统一新两步验证密码</label>
 
-                    <input 
+                    <input
 
-                      type="text" 
+                      type="text"
 
                       value={batch2faCustomNewPassword}
 
@@ -17322,9 +17486,9 @@ export default function App() {
 
                   <label className="text-xs text-slate-600 font-semibold">密码提示信息 (Hint, 可选)</label>
 
-                  <input 
+                  <input
 
-                    type="text" 
+                    type="text"
 
                     value={batch2faHint}
 
@@ -17426,7 +17590,7 @@ export default function App() {
 
                 </div>
 
-                <button 
+                <button
 
                   onClick={() => {
 
@@ -17458,9 +17622,9 @@ export default function App() {
 
                   <label className="text-xs font-semibold text-slate-700">用户名</label>
 
-                  <input 
+                  <input
 
-                    type="text" 
+                    type="text"
 
                     value={newUserUsername}
 
@@ -17480,9 +17644,9 @@ export default function App() {
 
                   <label className="text-xs font-semibold text-slate-700">登录密码</label>
 
-                  <input 
+                  <input
 
-                    type="password" 
+                    type="password"
 
                     value={newUserPassword}
 
@@ -17502,7 +17666,7 @@ export default function App() {
 
                   <label className="text-xs font-semibold text-slate-700">所属公司</label>
 
-                  <select 
+                  <select
 
                     value={newUserCompany}
 
@@ -17556,11 +17720,11 @@ export default function App() {
 
                     <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer select-none font-medium">
 
-                      <input 
+                      <input
 
-                        type="radio" 
+                        type="radio"
 
-                        name="newUserRole" 
+                        name="newUserRole"
 
                         value="user"
 
@@ -17578,11 +17742,11 @@ export default function App() {
 
                     <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer select-none font-medium">
 
-                      <input 
+                      <input
 
-                        type="radio" 
+                        type="radio"
 
-                        name="newUserRole" 
+                        name="newUserRole"
 
                         value="admin"
 
@@ -17608,7 +17772,7 @@ export default function App() {
 
               <div className="p-5 border-t border-slate-100 flex justify-end gap-2.5 bg-slate-50/35">
 
-                <button 
+                <button
 
                   onClick={() => {
 
@@ -17630,7 +17794,7 @@ export default function App() {
 
                 </button>
 
-                <button 
+                <button
 
                   onClick={handleCreateUser}
 
@@ -17670,7 +17834,7 @@ export default function App() {
 
                 </div>
 
-                <button 
+                <button
 
                   onClick={() => {
 
@@ -17702,9 +17866,9 @@ export default function App() {
 
                   <label className="text-xs font-semibold text-slate-700">用户名 (不可修改)</label>
 
-                  <input 
+                  <input
 
-                    type="text" 
+                    type="text"
 
                     value={editUserTarget.username}
 
@@ -17722,9 +17886,9 @@ export default function App() {
 
                   <label className="text-xs font-semibold text-slate-700">新密码 (留空则不修改)</label>
 
-                  <input 
+                  <input
 
-                    type="password" 
+                    type="password"
 
                     value={editUserPassword}
 
@@ -17744,7 +17908,7 @@ export default function App() {
 
                   <label className="text-xs font-semibold text-slate-700">所属公司</label>
 
-                  <select 
+                  <select
 
                     value={editUserCompany}
 
@@ -17798,11 +17962,11 @@ export default function App() {
 
                     <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer select-none font-medium">
 
-                      <input 
+                      <input
 
-                        type="radio" 
+                        type="radio"
 
-                        name="editUserRole" 
+                        name="editUserRole"
 
                         value="user"
 
@@ -17820,11 +17984,11 @@ export default function App() {
 
                     <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer select-none font-medium">
 
-                      <input 
+                      <input
 
-                        type="radio" 
+                        type="radio"
 
-                        name="editUserRole" 
+                        name="editUserRole"
 
                         value="admin"
 
@@ -17850,7 +18014,7 @@ export default function App() {
 
               <div className="p-5 border-t border-slate-100 flex justify-end gap-2.5 bg-slate-50/35">
 
-                <button 
+                <button
 
                   onClick={() => {
 
@@ -17872,7 +18036,7 @@ export default function App() {
 
                 </button>
 
-                <button 
+                <button
 
                   onClick={handleUpdateUser}
 
@@ -17912,7 +18076,7 @@ export default function App() {
 
                 </div>
 
-                <button 
+                <button
 
                   onClick={() => {
 
@@ -17940,9 +18104,9 @@ export default function App() {
 
                   <label className="text-xs font-semibold text-slate-700">公司名称</label>
 
-                  <input 
+                  <input
 
-                    type="text" 
+                    type="text"
 
                     value={newCompanyName}
 
@@ -17962,7 +18126,7 @@ export default function App() {
 
               <div className="p-5 border-t border-slate-100 flex justify-end gap-2.5 bg-slate-50/35">
 
-                <button 
+                <button
 
                   onClick={() => {
 
@@ -17980,7 +18144,7 @@ export default function App() {
 
                 </button>
 
-                <button 
+                <button
 
                   onClick={handleCreateCompany}
 
@@ -18020,7 +18184,7 @@ export default function App() {
 
                 </div>
 
-                <button 
+                <button
 
                   onClick={() => {
 
@@ -18050,9 +18214,9 @@ export default function App() {
 
                   <label className="text-xs font-semibold text-slate-700">公司名称</label>
 
-                  <input 
+                  <input
 
-                    type="text" 
+                    type="text"
 
                     value={editCompanyNameValue}
 
@@ -18072,7 +18236,7 @@ export default function App() {
 
               <div className="p-5 border-t border-slate-100 flex justify-end gap-2.5 bg-slate-50/35">
 
-                <button 
+                <button
 
                   onClick={() => {
 
@@ -18092,7 +18256,7 @@ export default function App() {
 
                 </button>
 
-                <button 
+                <button
 
                   onClick={handleUpdateCompany}
 
@@ -18114,7 +18278,7 @@ export default function App() {
 
 
 
-        
+
         {/* LOGIN INFO MODAL */}
         {showLoginInfoModal && loginInfoAccount && (
           <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs z-50 flex items-center justify-center p-4">
@@ -18125,7 +18289,7 @@ export default function App() {
                   <h3 className="font-bold text-slate-900 text-base">🔑 登录凭证与验证码</h3>
                   <p className="text-xs text-slate-400 mt-0.5 font-mono">{loginInfoAccount.name} (手机号: +{loginInfoAccount.id})</p>
                 </div>
-                <button 
+                <button
                   onClick={() => {
                     setShowLoginInfoModal(false);
                     setLoginInfoAccount(null);
@@ -18138,7 +18302,7 @@ export default function App() {
 
               {/* Modal Body */}
               <div className="p-6 overflow-y-auto flex flex-col gap-6">
-                
+
                 {/* 1. Captured Login Codes */}
                 <div className="flex flex-col gap-3">
                   <h4 className="font-bold text-slate-800 text-xs flex items-center gap-1.5">
@@ -18175,10 +18339,10 @@ export default function App() {
                             // Use word boundary regex to match 5-6 digit code cleanly, ignoring 777000
                             const matches = item.text.match(/\b\d{5,6}\b/g);
                             const parsedCode = matches ? matches.find((m: string) => m !== '777000') || '' : '';
-                            
+
                             // If no code could be parsed, show a snippet or ignore
                             const displayCode = parsedCode ? parsedCode : '解析失败 (请查看控制台日志)';
-                            
+
                             return (
                               <div key={idx} className="flex justify-between items-center bg-white p-3.5 border border-slate-200/60 rounded-xl shadow-2xs">
                                 <div className="flex flex-col gap-1">
@@ -18231,12 +18395,12 @@ export default function App() {
                     <span className="w-1.5 h-3 bg-blue-500 rounded-full"></span>
                     ⚙️ 配置云端凭证
                   </h4>
-                  
+
                   <div className="flex flex-col gap-3">
                     <div className="flex flex-col gap-1">
                       <label className="text-[10px] text-slate-400 font-semibold">页码ID (Page ID, 用于接码绑定)</label>
-                      <input 
-                        type="text" 
+                      <input
+                        type="text"
                         value={localPageId}
                         onChange={(e) => setLocalPageId(e.target.value)}
                         placeholder="请输入页码ID"
@@ -18247,8 +18411,8 @@ export default function App() {
                     <div className="flex flex-col gap-1">
                       <label className="text-[10px] text-slate-400 font-semibold">两步验证密码 (2FA Password)</label>
                       <div className="flex gap-2">
-                        <input 
-                          type={showLoginInfo2faText ? "text" : "password"} 
+                        <input
+                          type={showLoginInfo2faText ? "text" : "password"}
                           value={local2fa}
                           onChange={(e) => setLocal2fa(e.target.value)}
                           placeholder="请输入两步验证密码"
@@ -18479,7 +18643,7 @@ export default function App() {
 
             <div className="bg-white rounded-2xl border border-slate-100 shadow-xl w-full max-w-lg flex flex-col max-h-[85vh] overflow-hidden">
 
-              
+
 
               {/* Modal Header */}
 
@@ -18521,7 +18685,7 @@ export default function App() {
 
                   </button>
 
-                  <button 
+                  <button
 
                     onClick={() => {
 
@@ -18553,7 +18717,7 @@ export default function App() {
 
               <div className="p-6 overflow-y-auto flex flex-col gap-6">
 
-                
+
 
                 {/* Account Profile Status */}
 
@@ -18595,9 +18759,9 @@ export default function App() {
 
                       <label className="text-[10px] text-slate-400 font-semibold">名字 (First Name)</label>
 
-                      <input 
+                      <input
 
-                        type="text" 
+                        type="text"
 
                         value={editFirstName}
 
@@ -18617,9 +18781,9 @@ export default function App() {
 
                       <label className="text-[10px] text-slate-400 font-semibold">姓氏 (Last Name, 可空)</label>
 
-                      <input 
+                      <input
 
-                        type="text" 
+                        type="text"
 
                         value={editLastName}
 
@@ -18747,9 +18911,9 @@ export default function App() {
 
                       <label className="text-[10px] text-slate-400 font-semibold">原两步验证密码 (若当前未设置请留空)</label>
 
-                      <input 
+                      <input
 
-                        type="password" 
+                        type="password"
 
                         value={edit2faCurrentPassword}
 
@@ -18769,9 +18933,9 @@ export default function App() {
 
                       <label className="text-[10px] text-slate-400 font-semibold">新两步验证密码</label>
 
-                      <input 
+                      <input
 
-                        type="text" 
+                        type="text"
 
                         value={edit2faNewPassword}
 
@@ -18791,9 +18955,9 @@ export default function App() {
 
                       <label className="text-[10px] text-slate-400 font-semibold">密码提示信息 (Hint, 可空)</label>
 
-                      <input 
+                      <input
 
-                        type="text" 
+                        type="text"
 
                         value={edit2faHint}
 
@@ -18853,7 +19017,7 @@ export default function App() {
 
                       <div className="flex gap-2">
 
-                        <button 
+                        <button
 
                           onClick={() => {
 
@@ -18865,9 +19029,9 @@ export default function App() {
 
                           className={`flex-grow py-2 border rounded-lg text-xs font-semibold transition-all ${
 
-                            newFolderTitle === '内部' 
+                            newFolderTitle === '内部'
 
-                              ? 'border-blue-500 bg-blue-50/50 text-blue-600' 
+                              ? 'border-blue-500 bg-blue-50/50 text-blue-600'
 
                               : 'border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100'
 
@@ -18879,7 +19043,7 @@ export default function App() {
 
                         </button>
 
-                        <button 
+                        <button
 
                           onClick={() => {
 
@@ -18891,9 +19055,9 @@ export default function App() {
 
                           className={`flex-grow py-2 border rounded-lg text-xs font-semibold transition-all ${
 
-                            newFolderTitle === '广告' 
+                            newFolderTitle === '广告'
 
-                              ? 'border-blue-500 bg-blue-50/50 text-blue-600' 
+                              ? 'border-blue-500 bg-blue-50/50 text-blue-600'
 
                               : 'border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100'
 
@@ -18915,9 +19079,9 @@ export default function App() {
 
                       <label className="text-[10px] text-slate-400 font-semibold">自定义文件夹名称</label>
 
-                      <input 
+                      <input
 
-                        type="text" 
+                        type="text"
 
                         value={newFolderTitle}
 
@@ -18931,7 +19095,7 @@ export default function App() {
 
                     </div>
 
-                    
+
 
                     <div className="flex flex-col gap-1.5">
 
@@ -18955,9 +19119,9 @@ export default function App() {
 
                           <label key={cat.key} className="flex items-center gap-1.5 text-xs cursor-pointer select-none text-slate-600 font-medium">
 
-                            <input 
+                            <input
 
-                              type="checkbox" 
+                              type="checkbox"
 
                               checked={folderCategories.includes(cat.key)}
 
@@ -19027,7 +19191,7 @@ export default function App() {
 
                   </h4>
 
-                  
+
 
                   {/* Select source: local or library */}
 
@@ -19041,9 +19205,9 @@ export default function App() {
 
                       className={`flex-1 py-1 text-center text-[10px] font-semibold rounded-md transition-all ${
 
-                        singleAvatarSource === 'local' 
+                        singleAvatarSource === 'local'
 
-                          ? 'bg-white text-slate-800 shadow-xs' 
+                          ? 'bg-white text-slate-800 shadow-xs'
 
                           : 'text-slate-500 hover:text-slate-800'
 
@@ -19069,9 +19233,9 @@ export default function App() {
 
                       className={`flex-1 py-1 text-center text-[10px] font-semibold rounded-md transition-all ${
 
-                        singleAvatarSource === 'library' 
+                        singleAvatarSource === 'library'
 
-                          ? 'bg-white text-slate-800 shadow-xs' 
+                          ? 'bg-white text-slate-800 shadow-xs'
 
                           : 'text-slate-500 hover:text-slate-800'
 
@@ -19091,9 +19255,9 @@ export default function App() {
 
                     <div className="flex flex-col gap-2">
 
-                      <input 
+                      <input
 
-                        type="file" 
+                        type="file"
 
                         accept="image/*"
 
@@ -19153,7 +19317,7 @@ export default function App() {
 
                             return (
 
-                              <div 
+                              <div
 
                                 key={item.name}
 
@@ -19285,7 +19449,7 @@ export default function App() {
 
                       <span>加载设备失败：{devicesError}</span>
 
-                      <button 
+                      <button
 
                         onClick={() => fetchAccountDevices(modalAccount.id)}
 
@@ -19313,15 +19477,15 @@ export default function App() {
 
                       {accountDevices.map((dev) => (
 
-                        <div 
+                        <div
 
-                          key={dev.hash} 
+                          key={dev.hash}
 
                           className={`flex items-center justify-between p-3 border rounded-xl transition-all ${
 
-                            dev.current 
+                            dev.current
 
-                              ? 'border-emerald-100 bg-emerald-50/15' 
+                              ? 'border-emerald-100 bg-emerald-50/15'
 
                               : 'border-slate-100 bg-slate-50/25 hover:bg-slate-50/50'
 
@@ -19417,7 +19581,7 @@ export default function App() {
 
               <div className="p-5 border-t border-slate-100 flex justify-end bg-slate-50/35">
 
-                <button 
+                <button
 
                   onClick={() => {
 
@@ -19453,7 +19617,7 @@ export default function App() {
 
             <div className="bg-white rounded-2xl border border-slate-100 shadow-xl w-full max-w-md flex flex-col max-h-[85vh] overflow-hidden animate-fade-in">
 
-              
+
 
               {/* Modal Header */}
 
@@ -19477,7 +19641,7 @@ export default function App() {
 
                 </div>
 
-                <button 
+                <button
 
                   onClick={() => {
 
@@ -19503,7 +19667,7 @@ export default function App() {
 
               <div className="p-6 overflow-y-auto flex flex-col gap-5">
 
-                
+
 
                 {/* 1. Account Profile Status & Health Score */}
 
@@ -19521,7 +19685,7 @@ export default function App() {
 
                   </div>
 
-                  
+
 
                   <div className="flex justify-between items-center border-t border-slate-200/60 pt-2.5">
 
@@ -19593,9 +19757,9 @@ export default function App() {
 
                         <span className="text-[9px] text-slate-400 font-light mt-0.5">
 
-                          {healthDetailsAccount.spambot_time 
+                          {healthDetailsAccount.spambot_time
 
-                            ? `上次检测：${new Date(healthDetailsAccount.spambot_time * 1000).toLocaleString('zh-CN', { hour12: false })}` 
+                            ? `上次检测：${new Date(healthDetailsAccount.spambot_time * 1000).toLocaleString('zh-CN', { hour12: false })}`
 
                             : '上次检测：暂无记录'}
 
@@ -19625,9 +19789,9 @@ export default function App() {
 
                 <pre className="text-[10px] text-slate-600 bg-slate-100/60 p-2.5 rounded-lg font-sans whitespace-pre-wrap leading-relaxed max-h-[140px] overflow-y-auto mt-1 border border-slate-200/40 select-text">
 
-                  {checkingHealth 
+                  {checkingHealth
 
-                    ? '正在向 @SpamBot 发送指令进行实时风控检测，这需要数秒时间，请稍候...' 
+                    ? '正在向 @SpamBot 发送指令进行实时风控检测，这需要数秒时间，请稍候...'
 
                     : (healthDetailsAccount.spambot_details || '尚未拉取状态，请点击上方按钮进行实时风控检测。')}
 
@@ -19735,7 +19899,7 @@ export default function App() {
 
             <div className="bg-white rounded-2xl border border-slate-100 shadow-xl w-full max-w-4xl flex flex-col max-h-[90vh] overflow-hidden">
 
-              
+
 
               {/* Modal Header */}
 
@@ -19749,7 +19913,7 @@ export default function App() {
 
                 </div>
 
-                <button 
+                <button
 
                   onClick={() => setShowCreateCampaignModal(false)}
 
@@ -19769,7 +19933,7 @@ export default function App() {
 
               <div className="p-6 overflow-y-auto flex-grow bg-slate-50/20 grid grid-cols-1 lg:grid-cols-3 gap-6">
 
-                
+
 
                 {/* Left Column: Account & Group Select */}
 
@@ -19873,7 +20037,7 @@ export default function App() {
 
                                 setSelectedCampaignAccountIds(nextIds);
 
-                                
+
 
                                 if (nextIds.length === 1) {
 
@@ -20206,7 +20370,7 @@ export default function App() {
 
                   <span className="text-xs font-bold text-slate-700 border-b border-slate-100 pb-2">轰炸执行参数</span>
 
-                  
+
 
                   <div className="grid grid-cols-2 gap-3.5">
 
@@ -20469,12 +20633,12 @@ export default function App() {
 
                     {adTemplates.length > 0 && (
                       <div className="mb-3 bg-slate-50 border border-slate-150 rounded-xl p-3 flex flex-col gap-3">
-                        
+
                         {/* 1. 分类 Tab 过滤栏 (精致药丸分段设计) */}
                         <div className="grid grid-cols-2 min-[420px]:grid-cols-3 gap-1.5 bg-slate-100 p-1 rounded-lg">
                           {(["全部", "中文长", "中文短", "英文长", "英文短"] as const).map(tab => {
-                            const count = tab === '全部' 
-                              ? adTemplates.length 
+                            const count = tab === '全部'
+                              ? adTemplates.length
                               : adTemplates.filter(ad => ad.group_type === tab).length;
                             const isSelected = selectedAdFilter === tab;
                             return (
@@ -20540,8 +20704,8 @@ export default function App() {
                             .map(ad => {
                               const isChecked = selectedAdTemplateIds.includes(ad.id);
                               return (
-                                <label 
-                                  key={ad.id} 
+                                <label
+                                  key={ad.id}
                                   className={`flex items-center gap-3 p-2 rounded-lg border cursor-pointer transition-all ${
                                     isChecked
                                       ? 'bg-blue-50/40 border-blue-200 text-blue-900 shadow-2xs'
@@ -20612,6 +20776,55 @@ export default function App() {
                   </div>
                   )}
 
+                  <div className={`rounded-xl border p-3.5 flex flex-col gap-3 transition-all ${
+                    campaignScheduleEnabled
+                      ? 'border-amber-200 bg-amber-50/50'
+                      : 'border-slate-200 bg-slate-50/60'
+                  }`}>
+                    <label className="flex items-start gap-2 text-xs text-slate-700 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={campaignScheduleEnabled}
+                        onChange={(e) => {
+                          const enabled = e.target.checked;
+                          setCampaignScheduleEnabled(enabled);
+                          if (enabled) {
+                            setCampaignScheduledAt(prev => prev || getDefaultCampaignScheduleAt());
+                          }
+                        }}
+                        className="mt-0.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500/20 w-3.5 h-3.5"
+                      />
+                      <span className="flex flex-col gap-1 min-w-0">
+                        <span className="font-bold text-slate-700 flex items-center gap-1">
+                          <CalendarClock className="w-3.5 h-3.5 text-amber-500" />
+                          制定定时任务
+                        </span>
+                        <span className="text-[10px] text-slate-400 leading-relaxed">
+                          按北京时间预约启动。任务开始前不占用账号；到点启动后，AI Bot 会通知启动者任务参数和参与账号。
+                        </span>
+                      </span>
+                    </label>
+
+                    {campaignScheduleEnabled && (
+                      <div className="rounded-lg border border-amber-100 bg-white/80 p-3 flex flex-col gap-2">
+                        <label className="text-[10px] font-bold text-amber-800 flex items-center gap-1">
+                          <Timer className="w-3.5 h-3.5" />
+                          北京时间启动
+                        </label>
+                        <input
+                          type="datetime-local"
+                          value={campaignScheduledAt}
+                          onChange={(e) => setCampaignScheduledAt(e.target.value)}
+                          min={formatDateTimeLocalInZone(new Date(Date.now() + 60 * 1000))}
+                          className="w-full bg-slate-50 border border-amber-200 rounded-lg px-2.5 py-2 text-xs focus:outline-none focus:bg-white focus:ring-2 focus:ring-amber-500/20 focus:border-amber-400 font-mono"
+                        />
+                        <div className="text-[10px] text-amber-700 leading-relaxed bg-amber-50 rounded-lg px-2.5 py-2 border border-amber-100">
+                          将在北京时间 <b>{formatCampaignScheduleLabel(campaignScheduledAt)}</b> 执行，预计剩余 <b>{formatCampaignCountdown(parseBeijingDateTimeLocal(campaignScheduledAt))}</b>。
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
                 </div>
 
 
@@ -20660,7 +20873,7 @@ export default function App() {
 
                   <Play className="w-3.5 h-3.5" />
 
-                  <span>启动群发广告</span>
+                  <span>{campaignScheduleEnabled ? '预约群发广告' : '启动群发广告'}</span>
 
                 </button>
 
@@ -20684,7 +20897,7 @@ export default function App() {
 
             <div className="bg-white rounded-2xl border border-slate-100 shadow-xl w-full max-w-4xl flex flex-col max-h-[85vh] overflow-hidden">
 
-              
+
 
               {/* Modal Header */}
 
@@ -20708,7 +20921,7 @@ export default function App() {
 
                 } catch (e) {}
 
-                
+
 
                 return (
 
@@ -20724,9 +20937,13 @@ export default function App() {
 
                           <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
 
-                            task.status === 'running' 
+                            task.status === 'running'
 
                               ? 'bg-emerald-50 text-emerald-700 border-emerald-100'
+
+                              : task.status === 'scheduled'
+
+                              ? 'bg-amber-50 text-amber-700 border-amber-200'
 
                               : task.status === 'completed'
 
@@ -20741,6 +20958,8 @@ export default function App() {
                           }`}>
 
                             {task.status === 'running' && '运行中'}
+
+                            {task.status === 'scheduled' && '定时等待'}
 
                             {task.status === 'completed' && '已完成'}
 
@@ -20776,7 +20995,7 @@ export default function App() {
 
                         </button>
 
-                        <button 
+                        <button
 
                           onClick={() => {
 
@@ -20900,7 +21119,7 @@ export default function App() {
 
                         </span>
 
-                        
+
 
                         <div className="border border-slate-150 rounded-xl overflow-hidden bg-white shadow-sm flex-grow overflow-y-auto max-h-[300px]">
 
@@ -21048,7 +21267,7 @@ export default function App() {
                                       <td className="py-2.5 px-4 text-center font-bold text-slate-600 text-[11px]">
                                         {log.cycle}
                                       </td>
-                                      <td 
+                                      <td
                                         className="py-2.5 px-4 text-slate-800 font-semibold text-[11px]"
                                         title={username ? `${log.group_title}\n点击复制群组 username: ${username}` : `${log.group_title}\n未找到 username，点击复制群ID: ${log.group_id}`}
                                         onClick={handleCopy}
@@ -21113,7 +21332,7 @@ export default function App() {
 
               <div className="p-5 border-t border-slate-100 flex justify-end bg-slate-50/35">
 
-                <button 
+                <button
 
                   onClick={() => {
 
@@ -21149,7 +21368,7 @@ export default function App() {
         {showInvalidGroupsModal && (
           <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs z-50 flex items-center justify-center p-4">
             <div className="bg-white rounded-2xl border border-slate-100 shadow-xl w-full max-w-md flex flex-col max-h-[85vh] overflow-hidden">
-              
+
               {/* Modal Header */}
               <div className="p-5 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
                 <div>
@@ -21158,7 +21377,7 @@ export default function App() {
                     本次加群任务中，有 {invalidGroupsToDelete.length} 个群组已被屏蔽或失效
                   </p>
                 </div>
-                <button 
+                <button
                   onClick={() => {
                     setShowInvalidGroupsModal(false);
                     setInvalidGroupsToDelete([]);
@@ -21174,7 +21393,7 @@ export default function App() {
                 <p className="text-xs text-slate-600 leading-relaxed">
                   以下群组在加群时返回了“版权受限/无效/已屏蔽”的状态。你是否需要将它们从<strong>群组列表</strong>中批量删除？
                 </p>
-                
+
                 <div className="border border-slate-100 rounded-xl overflow-hidden max-h-40 overflow-y-auto bg-slate-50/50 p-2 flex flex-col gap-2">
                   {invalidGroupsToDelete.map((g, idx) => (
                     <div key={idx} className="flex justify-between items-center text-xs p-2 bg-white rounded-lg border border-slate-100 shadow-xs">
@@ -21461,7 +21680,7 @@ export default function App() {
         {showGeminiConfigModal && (
           <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs z-50 flex items-center justify-center p-4">
             <div className="bg-white rounded-2xl border border-slate-100 shadow-xl w-full max-w-md flex flex-col overflow-hidden animate-in fade-in zoom-in-95 duration-150">
-              
+
               {/* Header */}
               <div className="p-5 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
                 <div>
@@ -21526,7 +21745,7 @@ export default function App() {
 
             <div className="bg-white rounded-2xl border border-slate-100 shadow-xl w-full max-w-4xl flex flex-col max-h-[85vh] overflow-hidden">
 
-              
+
 
               {/* Modal Header */}
 
@@ -21584,7 +21803,7 @@ export default function App() {
 
                   </button>
 
-                  <button 
+                  <button
 
                     onClick={() => {
 
@@ -21666,7 +21885,7 @@ export default function App() {
 
                           }
 
-                          
+
 
                           return (
 
@@ -21688,9 +21907,9 @@ export default function App() {
 
                                 <span className={`px-2 py-0.5 rounded text-[10px] font-medium border ${
 
-                                  log.login_type === 'import' 
+                                  log.login_type === 'import'
 
-                                    ? 'bg-purple-50 text-purple-600 border-purple-100' 
+                                    ? 'bg-purple-50 text-purple-600 border-purple-100'
 
                                     : 'bg-blue-50 text-blue-600 border-blue-100'
 
@@ -21708,7 +21927,7 @@ export default function App() {
 
                                   <div className="flex items-center gap-1.5 justify-between max-w-full">
 
-                                    <span 
+                                    <span
 
                                       className="font-mono text-slate-500 select-all truncate text-[10px]"
 
@@ -21776,7 +21995,7 @@ export default function App() {
 
                                 ) : (
 
-                                  <span 
+                                  <span
 
                                     className="px-2 py-0.5 bg-rose-50 text-rose-600 border border-rose-100 rounded text-[10px] font-bold cursor-help"
 
@@ -21814,7 +22033,7 @@ export default function App() {
 
               <div className="p-5 border-t border-slate-100 flex justify-end bg-slate-50/35">
 
-                <button 
+                <button
 
                   onClick={() => {
 
@@ -21962,7 +22181,7 @@ export default function App() {
 
             <div className="bg-white rounded-2xl border border-slate-100 shadow-xl w-full max-w-md flex flex-col overflow-hidden">
 
-              
+
 
               {/* Modal Header */}
 
@@ -21976,7 +22195,7 @@ export default function App() {
 
                 </div>
 
-                <button 
+                <button
 
                   onClick={() => {
 
@@ -22008,7 +22227,7 @@ export default function App() {
 
                   <label className="text-xs font-semibold text-slate-700">群组/频道链接或标识符列表 (每行一个)</label>
 
-                  <textarea 
+                  <textarea
 
                     value={newGroupLinks}
 
@@ -22059,7 +22278,7 @@ export default function App() {
 
               <div className="p-5 border-t border-slate-100 flex justify-end gap-2.5 bg-slate-50/35">
 
-                <button 
+                <button
 
                   onClick={() => {
 
@@ -22081,7 +22300,7 @@ export default function App() {
 
                 </button>
 
-                <button 
+                <button
 
                   onClick={handleResolveGroup}
 
@@ -22693,7 +22912,7 @@ export default function App() {
 
             <div className="bg-white rounded-2xl border border-slate-100 shadow-xl w-full max-w-lg flex flex-col max-h-[80vh] overflow-hidden">
 
-              
+
 
               {/* Modal Header */}
 
@@ -22707,7 +22926,7 @@ export default function App() {
 
                 </div>
 
-                <button 
+                <button
 
                   onClick={() => {
 
@@ -22791,7 +23010,7 @@ export default function App() {
 
               <div className="p-5 border-t border-slate-100 flex justify-end bg-slate-50/35">
 
-                <button 
+                <button
 
                   onClick={() => {
 
@@ -22829,7 +23048,7 @@ export default function App() {
 
             <div className="bg-white rounded-2xl border border-slate-100 shadow-xl w-full max-w-lg flex flex-col max-h-[85vh] overflow-hidden">
 
-              
+
 
               {/* Modal Header */}
 
@@ -22843,7 +23062,7 @@ export default function App() {
 
                 </div>
 
-                <button 
+                <button
 
                   onClick={handleCloseBatchAvatarModal}
 
@@ -22865,7 +23084,7 @@ export default function App() {
 
               <div className="p-6 overflow-y-auto flex flex-col gap-5">
 
-                
+
 
                 {/* Source Toggle */}
 
@@ -22879,9 +23098,9 @@ export default function App() {
 
                     className={`flex-1 py-1.5 text-center text-xs font-semibold rounded-md transition-all ${
 
-                      batchAvatarSource === 'local' 
+                      batchAvatarSource === 'local'
 
-                        ? 'bg-white text-slate-800 shadow-xs' 
+                        ? 'bg-white text-slate-800 shadow-xs'
 
                         : 'text-slate-500 hover:text-slate-800'
 
@@ -22907,9 +23126,9 @@ export default function App() {
 
                     className={`flex-1 py-1.5 text-center text-xs font-semibold rounded-md transition-all ${
 
-                      batchAvatarSource === 'library' 
+                      batchAvatarSource === 'library'
 
-                        ? 'bg-white text-slate-800 shadow-xs' 
+                        ? 'bg-white text-slate-800 shadow-xs'
 
                         : 'text-slate-500 hover:text-slate-800'
 
@@ -22935,9 +23154,9 @@ export default function App() {
 
                       <label className="text-xs text-slate-600 font-semibold">选择图片文件 (可多选，支持 JPG/PNG)</label>
 
-                      <input 
+                      <input
 
-                        type="file" 
+                        type="file"
 
                         accept="image/*"
 
@@ -23027,7 +23246,7 @@ export default function App() {
 
                           return (
 
-                            <div 
+                            <div
 
                               key={item.name}
 
@@ -23095,7 +23314,7 @@ export default function App() {
 
               <div className="p-5 border-t border-slate-100 flex justify-end bg-slate-50/35 gap-2">
 
-                <button 
+                <button
 
                   onClick={handleCloseBatchAvatarModal}
 
@@ -23157,7 +23376,7 @@ export default function App() {
 
             <div className="bg-white rounded-2xl border border-slate-100 shadow-xl w-full max-w-2xl flex flex-col max-h-[85vh] overflow-hidden">
 
-              
+
 
               {/* Modal Header */}
 
@@ -23171,7 +23390,7 @@ export default function App() {
 
                 </div>
 
-                <button 
+                <button
 
                   onClick={() => {
 
@@ -23197,15 +23416,15 @@ export default function App() {
 
               <div className="p-6 overflow-y-auto flex flex-col gap-6">
 
-                
+
 
                 {/* Upload Section */}
 
                 <div className="border border-dashed border-slate-200 hover:border-blue-400 rounded-xl p-6 bg-slate-50/50 transition-colors flex flex-col items-center justify-center gap-2 group relative">
 
-                  <input 
+                  <input
 
-                    type="file" 
+                    type="file"
 
                     accept="image/*"
 
@@ -23289,9 +23508,9 @@ export default function App() {
 
                         return (
 
-                          <div 
+                          <div
 
-                            key={item.name} 
+                            key={item.name}
 
                             className="bg-white border border-slate-100 rounded-xl overflow-hidden shadow-sm flex flex-col group/card hover:shadow-md transition-shadow"
 
@@ -23303,7 +23522,7 @@ export default function App() {
 
                               <img src={imgUrl} alt={item.name} className="w-full h-full object-cover group-hover/card:scale-105 transition-transform duration-300" />
 
-                              
+
 
                               {/* Hover Action Overlays */}
 
@@ -23361,9 +23580,9 @@ export default function App() {
 
                                 <div className="flex gap-1 items-center">
 
-                                  <input 
+                                  <input
 
-                                    type="text" 
+                                    type="text"
 
                                     value={renameAvatarInput}
 
@@ -23459,7 +23678,7 @@ export default function App() {
 
               <div className="p-5 border-t border-slate-100 flex justify-end bg-slate-50/35">
 
-                <button 
+                <button
 
                   type="button"
 

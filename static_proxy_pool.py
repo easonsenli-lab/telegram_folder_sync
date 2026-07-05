@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
+import hashlib
 from collections import Counter
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 
 ROOT = Path(__file__).resolve().parent
@@ -27,6 +30,8 @@ STATIC_PROXY_TYPE = os.environ.get("ROSEPAY_STATIC_PROXY_TYPE", "socks5").strip(
 STATIC_PROXY_PORT = int(os.environ.get("ROSEPAY_STATIC_PROXY_PORT", "50101") or "50101")
 STATIC_PROXY_USERNAME = os.environ.get("ROSEPAY_STATIC_PROXY_USERNAME", "easonsenli").strip()
 STATIC_PROXY_PASSWORD = os.environ.get("ROSEPAY_STATIC_PROXY_PASSWORD", "Mz8biy6nTn")
+_PROXY_ROTATION_LOCK = threading.Lock()
+_PROXY_ROTATION_FILE = ROOT / "data" / "static_proxy_rotation.json"
 
 
 def is_static_proxy_host(host: str | None) -> bool:
@@ -115,6 +120,52 @@ def choose_runtime_proxy_host(current_account_id: str = "") -> tuple[str, str]:
     return host, "borrowed"
 
 
+def choose_balanced_proxy_host(service_key: str = "telegram_bot_api") -> tuple[str, str]:
+    """Pick a proxy for shared service traffic without binding it to one account.
+
+    Preference order:
+    1. Hosts that are not assigned to any account.
+    2. If none are idle, hosts with the lowest account-assignment count.
+    3. Rotate within that candidate set so background services do not all reuse
+       the same IP.
+    """
+    counts = static_proxy_usage_counts()
+    idle_hosts = [host for host in STATIC_PROXY_HOSTS if counts.get(host, 0) <= 0]
+    source = "idle" if idle_hosts else "borrowed"
+    if idle_hosts:
+        candidates = idle_hosts
+    else:
+        min_count = min((counts.get(host, 0) for host in STATIC_PROXY_HOSTS), default=0)
+        candidates = [host for host in STATIC_PROXY_HOSTS if counts.get(host, 0) == min_count]
+    if not candidates:
+        return STATIC_PROXY_HOSTS[0], "borrowed"
+
+    with _PROXY_ROTATION_LOCK:
+        state: dict[str, Any] = {}
+        try:
+            if _PROXY_ROTATION_FILE.exists():
+                import json
+                state = json.loads(_PROXY_ROTATION_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            state = {}
+
+        key = str(service_key or "telegram_bot_api")
+        rotation_key = f"{key}:rotation"
+        stable_offset = int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:8], 16)
+        index = int(state.get(rotation_key, -1) or -1) + 1
+        index += stable_offset
+        host = candidates[index % len(candidates)]
+        state[rotation_key] = index - stable_offset
+        state[key] = {"last_host": host, "last_source": source}
+        try:
+            import json
+            _PROXY_ROTATION_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _PROXY_ROTATION_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+    return host, source
+
+
 def runtime_proxy_candidates(preferred_host: str | None = None, current_account_id: str = "") -> list[dict[str, Any]]:
     counts = static_proxy_usage_counts(current_account_id)
     ordered_hosts: list[str] = []
@@ -134,6 +185,45 @@ def runtime_proxy_candidates(preferred_host: str | None = None, current_account_
     remaining.sort(key=lambda item: (counts.get(item, 0), STATIC_PROXY_HOSTS.index(item)))
     ordered_hosts.extend(remaining)
     return [normalize_static_proxy(host) for host in ordered_hosts]
+
+
+def static_proxy_url(host: str, scheme: str = "socks5h") -> str:
+    auth = ""
+    if STATIC_PROXY_USERNAME or STATIC_PROXY_PASSWORD:
+        auth = f"{quote(STATIC_PROXY_USERNAME)}:{quote(STATIC_PROXY_PASSWORD)}@"
+    return f"{scheme}://{auth}{host}:{STATIC_PROXY_PORT}"
+
+
+def balanced_proxy_url(service_key: str = "telegram_bot_api", scheme: str = "socks5h") -> tuple[str, str, str]:
+    host, source = choose_balanced_proxy_host(service_key)
+    return static_proxy_url(host, scheme), host, source
+
+
+def telegram_requests_proxy_kwargs(service_key: str = "telegram_bot_api") -> dict[str, Any]:
+    proxy_url, _, _ = balanced_proxy_url(service_key)
+    return {
+        "proxies": {
+            "http": proxy_url,
+            "https": proxy_url,
+        }
+    }
+
+
+def telegram_urllib_opener(service_key: str = "telegram_bot_api"):
+    import urllib.request
+
+    proxy_url, _, _ = balanced_proxy_url(service_key)
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({
+            "http": proxy_url,
+            "https": proxy_url,
+        })
+    )
+
+
+def telegram_httpx_proxy_url(service_key: str = "telegram_bot_api") -> str:
+    proxy_url, _, _ = balanced_proxy_url(service_key)
+    return proxy_url
 
 
 def ensure_safe_telegram_proxy_config(

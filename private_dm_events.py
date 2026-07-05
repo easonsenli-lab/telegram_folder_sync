@@ -40,10 +40,10 @@ def save_topic_thread_id(account_id: str, sender_id: int, chat_id: int, thread_i
             pass
     key = f"{account_id}:{sender_id}"
     data[key] = [chat_id, thread_id]
-    
+
     rev_key = f"rev:{chat_id}:{thread_id}"
     data[rev_key] = [account_id, sender_id]
-    
+
     try:
         TOPICS_MAP_FILE.parent.mkdir(parents=True, exist_ok=True)
         with TOPICS_MAP_FILE.open("w", encoding="utf-8") as f:
@@ -58,13 +58,13 @@ def get_info_by_thread_id(thread_id: int, chat_id: Optional[int] = None) -> Opti
     try:
         with TOPICS_MAP_FILE.open("r", encoding="utf-8") as f:
             data = json.load(f)
-            
+
             if chat_id is not None:
                 rev_key = f"rev:{chat_id}:{thread_id}"
                 val = data.get(rev_key)
                 if val:
                     return val[0], int(val[1])
-                    
+
             for k, v in data.items():
                 if k.startswith("rev:"):
                     continue
@@ -79,22 +79,26 @@ def get_info_by_thread_id(thread_id: int, chat_id: Optional[int] = None) -> Opti
 
 
 def _send_urllib_request_sync(url: str, data_bytes: bytes, headers: dict, timeout: int = 10) -> dict:
-    import urllib.request
-    import urllib.error
     import json
+    import requests
+
     try:
-        req = urllib.request.Request(url, data=data_bytes, headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
+        from static_proxy_pool import telegram_requests_proxy_kwargs
+
+        response = requests.post(
+            url,
+            data=data_bytes,
+            headers=headers,
+            timeout=timeout,
+            **telegram_requests_proxy_kwargs("private_dm_bot_api"),
+        )
         try:
-            body = exc.read().decode("utf-8", "replace")
-            parsed = json.loads(body) if body else {}
-            if isinstance(parsed, dict):
-                return parsed
+            parsed = response.json()
         except Exception:
-            body = ""
-        return {"ok": False, "error_code": exc.code, "description": body or str(exc)}
+            parsed = {}
+        if isinstance(parsed, dict):
+            return parsed
+        return {"ok": response.ok, "error_code": response.status_code, "description": response.text}
     except Exception as exc:
         return {"ok": False, "description": str(exc)}
 
@@ -134,13 +138,13 @@ async def async_notify_admin_of_dm(account_id: str, account_label: str, sender_i
     from pathlib import Path
     import os
     import asyncio
-    
+
     # 1. Query rosepay.db to find the admin details
     db_path = Path(__file__).resolve().parent / "data" / "rosepay.db"
     if not db_path.exists():
         print(f"[NotifyAdmin] DB path not found: {db_path}")
         return
-    
+
     telegram_chat_id = None
     owner_username = None
     admin_contact = None
@@ -166,9 +170,9 @@ async def async_notify_admin_of_dm(account_id: str, account_label: str, sender_i
     except Exception as exc:
         print(f"[NotifyAdmin] Failed to query database: {exc}")
         return
-        
+
     display_account_name = db_account_name if db_account_name else account_label
-    
+
     # 2. Retrieve Bot Token
     bot_token = None
     try:
@@ -184,14 +188,14 @@ async def async_notify_admin_of_dm(account_id: str, account_label: str, sender_i
                         break
     except Exception as exc:
         print(f"[NotifyAdmin] Failed to read Bot Token from env: {exc}")
-        
+
     if not bot_token:
         bot_token = os.getenv("BOT_TOKEN", "").strip()
-        
+
     if not bot_token:
         print("[NotifyAdmin] Bot token not found, cannot send notification")
         return
- 
+
     # 3. Read notify_config.json or use user's forum_chat_id
     notify_chat_id = forum_chat_id if forum_chat_id else None
     if not notify_chat_id:
@@ -206,19 +210,19 @@ async def async_notify_admin_of_dm(account_id: str, account_label: str, sender_i
                     notify_chat_id = config_data.get("notify_chat_id")
         except Exception as exc:
             print(f"[NotifyAdmin] Failed to read notify_config.json: {exc}")
- 
+
     sender_display = sender_username if sender_username else sender_name
     sender_username_clean = sender_username.strip().lstrip("@") if sender_username else ""
     if sender_username_clean:
         sender_display_html = f"<b>{sender_name}</b> (@{sender_username_clean})"
     else:
         sender_display_html = f"<b>{sender_name}</b>"
- 
+
     # CASE A: Supergroup Forum Topic Mode is configured (Recommended)
     if notify_chat_id:
         thread_id = get_topic_thread_id(account_id, sender_id)
         is_new_topic = False
-        
+
         # If no thread_id exists, create a new Forum Topic dynamically
         if not thread_id:
             create_url = f"https://api.telegram.org/bot{bot_token}/createForumTopic"
@@ -244,7 +248,7 @@ async def async_notify_admin_of_dm(account_id: str, account_label: str, sender_i
                     print(f"[NotifyAdmin] Failed to create Forum Topic: {c_res}")
             except Exception as c_exc:
                 print(f"[NotifyAdmin] Error creating Forum Topic: {c_exc}")
- 
+
         if thread_id:
             # If it's a newly created topic, send a beautiful setup card first
             if is_new_topic:
@@ -273,15 +277,15 @@ async def async_notify_admin_of_dm(account_id: str, account_label: str, sender_i
                     )
                 except Exception as intro_exc:
                     print(f"[NotifyAdmin] Error sending intro card: {intro_exc}")
- 
+
             # Send the actual customer message content to the Topic with a beautiful name and username prefix
             sender_display_name = sender_name.strip()
             sender_display_username = f" (@{sender_username.strip().lstrip('@')})" if sender_username else ""
-            
+
             # Format: 👤 Name (@username)
             header_prefix = f"👤 <b>{sender_display_name}</b>{sender_display_username}\n"
             formatted_text = f"{header_prefix}{message_text}"
- 
+
             msg_payload = {
                 "chat_id": int(notify_chat_id),
                 "message_thread_id": int(thread_id),
@@ -340,7 +344,7 @@ async def async_notify_admin_of_dm(account_id: str, account_label: str, sender_i
     if not telegram_chat_id:
         print(f"[NotifyAdmin] No private telegram_chat_id bound and no Forum Group configured for owner of account {account_id}")
         return
- 
+
     # Call official Telegram Bot API sendMessage to private admin chat
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     html_text = (
@@ -351,7 +355,7 @@ async def async_notify_admin_of_dm(account_id: str, account_label: str, sender_i
         f"<blockquote>{message_text}</blockquote>\n\n"
         f"⚙️ <code>ref:{account_id}:{sender_id}:{message_id}</code>"
     )
-    
+
     reply_callback = f"reply_dm:{account_id}:{sender_id}:{message_id}:{sender_display}"
     reply_markup = {
         "inline_keyboard": [
@@ -364,14 +368,14 @@ async def async_notify_admin_of_dm(account_id: str, account_label: str, sender_i
             ]
         ]
     }
-    
+
     payload = {
         "chat_id": telegram_chat_id,
         "text": html_text,
         "parse_mode": "HTML",
         "reply_markup": reply_markup
     }
-    
+
     try:
         data = json.dumps(payload).encode("utf-8")
         resp_data = await asyncio.to_thread(
@@ -393,11 +397,11 @@ def append_private_dm_event(event_data: dict) -> None:
     DM_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     with DM_EVENTS_FILE.open("a", encoding="utf-8") as f:
         f.write(json.dumps(event_data, ensure_ascii=False) + "\n")
-    
+
     # 如果是发送出去的消息，或者 notify 标记为 False，则只写入本地 jsonl 缓存，不发送 Bot 通知
     if event_data.get("out") or not event_data.get("notify", True):
         return
-    
+
     # Trigger real-time Bot notification!
     try:
         import asyncio
@@ -494,11 +498,11 @@ def register_private_dm_event_listener(client: Any, account_id: str, account_lab
                     # 如果云端获取到的消息数小于或等于1（即只有当前刚收到的这一条），说明此前在电报云端没有任何聊天记录，是绝对的新客！
                     if cloud_count <= 1:
                         is_first_chat = True
-                
+
                 if is_first_chat:
                     print(f"[Welcome Check] Sender {sender_id} is verified as FIRST-TIME chat. Preparing to send welcome text.")
                     first_chat_notified_set.add(cache_key)
-                    
+
                     # 从数据库中拉取所有启用中的自动回复模板列表，并进行随机选择发送
                     welcome_text = ""
                     try:
@@ -531,7 +535,7 @@ def register_private_dm_event_listener(client: Any, account_id: str, account_lab
                             conn.close()
                     except Exception as db_err:
                         print(f"[Welcome] Failed to query welcome templates from database: {db_err}")
-                        
+
                     if not welcome_text:
                         welcome_text = (
                             "🌹 <b>您好，欢迎咨询 RosePay！</b>\n\n"
