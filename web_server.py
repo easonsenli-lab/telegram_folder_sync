@@ -14,6 +14,9 @@ import threading
 import subprocess
 import datetime
 from zoneinfo import ZoneInfo
+
+def get_beijing_time_str() -> str:
+    return datetime.datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
 from collections import deque
 from contextlib import asynccontextmanager
 from functools import wraps
@@ -1076,7 +1079,7 @@ def get_account_notify_label(account_id: str) -> str:
 
 
 def ops_event_time() -> str:
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return get_beijing_time_str()
 
 
 def should_send_ops_event(key: str, cooldown_seconds: int = 300) -> bool:
@@ -5629,7 +5632,7 @@ def create_login_log(req: LoginLogCreate, user: dict = Depends(get_current_user)
     with Session(engine) as session:
         new_log = LoginLogDb(
             company=user["company"],
-            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            timestamp=get_beijing_time_str(),
             phone=req.phone,
             api_link=req.api_link,
             original_password=req.original_password,
@@ -5661,7 +5664,7 @@ def get_login_logs(limit: int = 100, user: dict = Depends(get_current_user)):
             accounts = session.exec(stmt_accounts).all()
             if accounts:
                 for idx, acc in enumerate(accounts):
-                    t = datetime.fromtimestamp(time.time() - (len(accounts) - idx) * 60).strftime("%Y-%m-%d %H:%M:%S")
+                    t = datetime.fromtimestamp(time.time() - (len(accounts) - idx) * 60, tz=ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
                     new_log = LoginLogDb(
                         company=acc.company,
                         timestamp=t,
@@ -8435,12 +8438,12 @@ async def launch_campaign_task(task_id: str, scheduled: bool = False):
             if is_account_busy_with_task(acc_id):
                 task.status = "failed"
                 task.error_detail = f"定时任务启动时账号 {acc_id} 正在执行其他任务，已取消启动"
-                task.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                task.updated_at = get_beijing_time_str()
                 session.add(task)
                 session.commit()
                 return
         task.status = "running"
-        task.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        task.updated_at = get_beijing_time_str()
         session.add(task)
         session.commit()
         register_account_task_usage(
@@ -8464,7 +8467,7 @@ async def scheduled_campaign_runner(task_id: str):
             if not scheduled_utc:
                 task.status = "failed"
                 task.error_detail = "定时启动时间缺失或格式错误"
-                task.updated_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                task.updated_at = get_beijing_time_str()
                 session.add(task)
                 session.commit()
                 return
@@ -8726,7 +8729,7 @@ async def campaign_worker_task(task_id: str):
                 new_log = CampaignLogDb(
                     company=task_company,
                     task_id=task_id,
-                    timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    timestamp=get_beijing_time_str(),
                     cycle=log_cycle,
                     group_title=log_group_title,
                     group_id=str(log_group_id),
@@ -9192,7 +9195,7 @@ async def campaign_worker_task(task_id: str):
                         new_log = CampaignLogDb(
                             company=task_company,
                             task_id=task_id,
-                            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            timestamp=get_beijing_time_str(),
                             cycle=cycle,
                             group_title=title,
                             group_id=str(chat_id),
@@ -9234,7 +9237,7 @@ async def campaign_worker_task(task_id: str):
                     new_log = CampaignLogDb(
                         company=task_company,
                         task_id=task_id,
-                        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        timestamp=get_beijing_time_str(),
                         cycle=cycle,
                         group_title=title,
                         group_id=str(chat_id),
@@ -9262,7 +9265,7 @@ async def campaign_worker_task(task_id: str):
                     task = session.get(CampaignTaskDb, task_id)
                     if task and task.status == "running":
                         task.status = "completed"
-                        task.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        task.updated_at = get_beijing_time_str()
                         session.add(task)
                         session.commit()
                 break
@@ -9278,7 +9281,7 @@ async def campaign_worker_task(task_id: str):
             if task and task.status == "running":
                 task.status = "stopped"
                 task.error_detail = "任务协程被取消，但未收到停止接口请求；请检查同时间 Telethon/代理 429、服务关闭或事件循环取消日志。"
-                task.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                task.updated_at = get_beijing_time_str()
                 session.add(task)
                 session.commit()
                 print(f"[Campaign] Worker task {task_id} was cancelled unexpectedly while running.")
@@ -9291,7 +9294,7 @@ async def campaign_worker_task(task_id: str):
             if task and task.status == "running":
                 task.status = "failed"
                 task.error_detail = str(e)
-                task.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                task.updated_at = get_beijing_time_str()
                 session.add(task)
                 session.commit()
     finally:
@@ -9562,7 +9565,7 @@ async def create_campaign_task(req: MessageCampaignTaskRequest, user: dict = Dep
         print(f"Failed to save last campaign params: {e}")
 
     task_id = str(uuid.uuid4())
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_str = get_beijing_time_str()
     task_config = {
         "multi_account_safety_enabled": req.multi_account_safety_enabled,
         "strategy_enabled": req.strategy_enabled,
@@ -9632,6 +9635,37 @@ def list_campaign_tasks(user: dict = Depends(get_current_user)):
                 task for task in session.exec(stmt).all()
                 if any(acc_id in allowed_ids for acc_id in parse_campaign_account_ids(task))
             ]
+        
+        # Auto-Recovery & State Sync for Zombie Tasks
+        needs_commit = False
+        for task in results:
+            if task.status == "running":
+                acc_ids = parse_campaign_account_ids(task)
+                has_active = False
+                for acc_id in acc_ids:
+                    is_running = acc_id in active_processes and active_processes[acc_id].poll() is None
+                    if not is_running:
+                        is_running = find_campaign_process(acc_id) is not None
+                    if is_running:
+                        has_active = True
+                        break
+                if not has_active:
+                    task.status = "stopped"
+                    task.error_detail = "检测到发送进程已异常退出，已自动同步状态为停止。"
+                    task.updated_at = get_beijing_time_str()
+                    session.add(task)
+                    needs_commit = True
+        if needs_commit:
+            session.commit()
+            # Refresh the list to reflect database changes
+            if user["role"] == "admin":
+                results = session.exec(stmt).all()
+            else:
+                results = [
+                    task for task in session.exec(stmt).all()
+                    if any(acc_id in allowed_ids for acc_id in parse_campaign_account_ids(task))
+                ]
+        
         return [task.model_dump() for task in results]
 
 @app.post("/api/campaign/tasks/{task_id}/stop")
@@ -9659,7 +9693,7 @@ async def stop_campaign_task(task_id: str, user: dict = Depends(get_current_user
 
         if task.status in {"running", "scheduled"}:
             task.status = "stopped"
-            task.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            task.updated_at = get_beijing_time_str()
             task.updated_by = user["username"]
             session.add(task)
             session.commit()
@@ -9701,7 +9735,7 @@ async def stop_all_campaigns(user: dict = Depends(get_current_user)):
                 except KeyError:
                     pass
             task.status = "stopped"
-            task.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            task.updated_at = get_beijing_time_str()
             task.updated_by = user["username"]
             stopped_task_accounts.append((task.id, parse_campaign_account_ids(task)))
             session.add(task)
