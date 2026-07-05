@@ -1856,11 +1856,13 @@ async def get_client(account_id: str, ignore_proxy: bool = False) -> TelegramCli
             detail=f"该账号正在执行操作: {active_operation.get('label') or active_operation.get('operation') or 'active'}，请稍后再试。"
         )
 
-    is_campaign_running = is_campaign_running_for_account(account_id)
-    if is_campaign_running:
+    is_subprocess_campaign_running = account_id in active_processes and active_processes[account_id].poll() is None
+    if not is_subprocess_campaign_running:
+        is_subprocess_campaign_running = find_campaign_process(account_id) is not None
+    if is_subprocess_campaign_running:
         raise HTTPException(
             status_code=400,
-            detail="该账号正在后台运行群发广告任务。为了防止电报 Session 数据库冲突锁死，请先暂停广告任务后再进行此操作。"
+            detail="该账号正在后台运行独立广告子进程。为了防止电报 Session 数据库冲突锁死，请先暂停广告进程后再进行此操作。"
         )
 
     if account_id not in client_locks:
