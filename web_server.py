@@ -17,6 +17,80 @@ from zoneinfo import ZoneInfo
 
 def get_beijing_time_str() -> str:
     return datetime.datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
+
+def is_banned_or_deactivated_error(exc: Exception) -> bool:
+    from telethon.errors import UserDeactivatedError, AuthKeyUnregisteredError
+    if isinstance(exc, (UserDeactivatedError, AuthKeyUnregisteredError)):
+        return True
+    err_str = str(exc).lower()
+    return any(
+        marker in err_str
+        for marker in [
+            "user_deactivated",
+            "auth_key_unregistered",
+            "authkeyunregistered",
+            "user deactivated",
+            "auth key unregistered",
+            "session revoked",
+            "user_deactivated_ban"
+        ]
+    )
+
+async def handle_deactivated_or_banned_account(account_id: str, exc: Exception):
+    from db import engine, AccountDb, Session
+    try:
+        with Session(engine) as session:
+            db_account = session.get(AccountDb, account_id)
+            if db_account and db_account.is_available:
+                db_account.is_available = False
+                session.add(db_account)
+                session.commit()
+                session.refresh(db_account)
+                
+                # Sync changes to JSON configs
+                try:
+                    from account_manager import account_config_path, save_json
+                    path = account_config_path(db_account.id)
+                    save_json(path, db_account.to_dict())
+                except Exception as e:
+                    print(f"[BanDetector] Failed to sync toggled account to json config: {e}")
+                
+                # Update memory store status
+                set_account_status(
+                    account_id,
+                    {
+                        "is_available": False,
+                        "availability_status": "occupied",
+                        "is_authorized": False,
+                        "auth_status": "unauthorized",
+                        "error": f"电报官方账号封禁/注销: {exc}"
+                    },
+                    source="ban-detector"
+                )
+                
+                # Send HTML notification card via AI Bot
+                phone = db_account.id
+                account_name = db_account.account_name or "未知账号"
+                owner = db_account.owner_username or db_account.created_by or "admin"
+                err_type = type(exc).__name__
+                err_detail = str(exc)
+                bj_time = get_beijing_time_str()
+                
+                alert_text = (
+                    f"⚠️ <b>【防封系统预警】托管账号已被电报官方封禁/拉黑/注销</b>\n\n"
+                    f"● <b>账号姓名</b>: <code>{account_name}</code>\n"
+                    f"● <b>注册手机</b>: <code>+{phone}</code>\n"
+                    f"● <b>账号ID</b>: <code>{account_id}</code>\n"
+                    f"● <b>归属管理员</b>: <code>{owner}</code>\n"
+                    f"● <b>限制类型</b>: <code>{err_type}</code>\n"
+                    f"● <b>详细报错</b>: <code>{err_detail}</code>\n"
+                    f"● <b>当前状态</b>: 🚫 <b>已自动将该账号评分状态修改为不可用（is_available=False），并下线 Session</b>\n"
+                    f"● <b>发生时间</b>: <code>{bj_time}</code>"
+                )
+                send_ops_bot_notification(alert_text)
+    except Exception as db_err:
+        print(f"[BanDetector] Error updating DB/sending notification: {db_err}")
+
 from collections import deque
 from contextlib import asynccontextmanager
 from functools import wraps
@@ -7402,6 +7476,10 @@ async def get_login_status(account_id: str, force: bool = False, user: dict = De
                 source="login-status-error",
                 is_connected=bool(active_clients.get(account_id) and active_clients[account_id].is_connected()),
             )
+
+        # Handle deactivated or banned account by updating DB/config, memory store, and notifying via Bot
+        await handle_deactivated_or_banned_account(account_id, e)
+
         status_res = {
             "is_connected": False,
             "is_authorized": False,
@@ -7411,17 +7489,6 @@ async def get_login_status(account_id: str, force: bool = False, user: dict = De
             "status_check_failed": True,
         }
         status_res = set_account_status(account_id, status_res, source="login-status-error")
-        if is_deactivated:
-            send_ops_bot_notification(
-                "\n".join([
-                    "⛔ <b>账号疑似被封禁/注销</b>",
-                    html_line("账号", get_account_notify_label(account_id)),
-                    html_line("错误", str(e)[:800]),
-                    html_line("时间", ops_event_time()),
-                ]),
-                dedup_key=f"deactivated:{account_id}",
-                cooldown_seconds=1800,
-            )
         return status_res
 
 @app.post("/api/login/send-code")
@@ -7946,9 +8013,14 @@ def account_has_session_file(account_id: str, acc=None) -> bool:
 async def ensure_private_listener_for_account(account_id: str, account_label: str = "") -> bool:
     if get_private_poll_skip_reason(account_id):
         return False
-    client = await get_client(account_id)
-    if not await client.is_user_authorized():
-        return False
+    try:
+        client = await get_client(account_id)
+        if not await client.is_user_authorized():
+            return False
+    except Exception as exc:
+        if is_banned_or_deactivated_error(exc):
+            await handle_deactivated_or_banned_account(account_id, exc)
+        raise exc
     auto_private_listener_accounts.add(account_id)
     active_clients_last_accessed[account_id] = time.time()
     set_account_status(
@@ -8894,19 +8966,51 @@ async def campaign_worker_task(task_id: str):
                     for candidate_account_id in candidate_ids:
                         selected_account_id = candidate_account_id
                         selected_phone = phones_by_id.get(selected_account_id, selected_account_id)
-                        client = await get_campaign_client(selected_account_id)
+                        try:
+                            client = await get_campaign_client(selected_account_id)
+                            if not client.is_connected():
+                                try:
+                                    await client.connect()
+                                except Exception as conn_err:
+                                    if is_banned_or_deactivated_error(conn_err):
+                                        await handle_deactivated_or_banned_account(selected_account_id, conn_err)
+                                        if selected_account_id in account_ids:
+                                            account_ids.remove(selected_account_id)
+                                        continue
+                                    raise Exception(f"客户端连接已断开，尝试自动重连失败: {conn_err}")
+                        except Exception as client_exc:
+                            if is_banned_or_deactivated_error(client_exc):
+                                await handle_deactivated_or_banned_account(selected_account_id, client_exc)
+                                if selected_account_id in account_ids:
+                                    account_ids.remove(selected_account_id)
+                                continue
 
-                        if not client.is_connected():
-                            try:
-                                await client.connect()
-                            except Exception as conn_err:
-                                raise Exception(f"客户端连接已断开，尝试自动重连失败: {conn_err}")
+                            last_candidate_error = f"{selected_phone} 初始化客户端失败：{client_exc}"
+                            if len(candidate_ids) > 1:
+                                await write_campaign_log(
+                                    cycle,
+                                    title,
+                                    str(chat_id),
+                                    username,
+                                    selected_account_id,
+                                    selected_phone,
+                                    "skipped",
+                                    last_candidate_error,
+                                    selected_ad_ref,
+                                )
+                                continue
+                            raise Exception(last_candidate_error)
 
                         try:
                             target_entity, resolved_chat_id, resolved_title, joined_now = await resolve_campaign_target_for_account(client, group)
                             chat_id = resolved_chat_id or chat_id
                             title = resolved_title or title
                         except Exception as account_exc:
+                            if is_banned_or_deactivated_error(account_exc):
+                                await handle_deactivated_or_banned_account(selected_account_id, account_exc)
+                                if selected_account_id in account_ids:
+                                    account_ids.remove(selected_account_id)
+                                continue
                             last_candidate_error = f"{selected_phone} 检查群组失败：{account_exc}"
                             if is_campaign_permission_or_invalid_error(account_exc):
                                 invalid_or_warning_details.append(last_candidate_error)
@@ -8962,6 +9066,11 @@ async def campaign_worker_task(task_id: str):
                                     )
                                     continue
                         except Exception as speak_check_exc:
+                            if is_banned_or_deactivated_error(speak_check_exc):
+                                await handle_deactivated_or_banned_account(selected_account_id, speak_check_exc)
+                                if selected_account_id in account_ids:
+                                    account_ids.remove(selected_account_id)
+                                continue
                             last_candidate_error = f"{selected_phone} 发言权限检测失败：{speak_check_exc}"
                             if is_campaign_permission_or_invalid_error(speak_check_exc):
                                 invalid_or_warning_details.append(last_candidate_error)
@@ -9088,7 +9197,16 @@ async def campaign_worker_task(task_id: str):
                             continue
 
                         target_for_send = target_entity or chat_id
-                        can_speak = await check_can_speak(client, target_for_send)
+                        try:
+                            can_speak = await check_can_speak(client, target_for_send)
+                        except Exception as speak_check_exc2:
+                            if is_banned_or_deactivated_error(speak_check_exc2):
+                                await handle_deactivated_or_banned_account(selected_account_id, speak_check_exc2)
+                                if selected_account_id in account_ids:
+                                    account_ids.remove(selected_account_id)
+                                continue
+                            can_speak = False
+
                         if not can_speak:
                             no_speak_detail = f"{selected_phone} 无该群发言权限，已跳过未发送"
                             cannot_speak_details.append(no_speak_detail)
@@ -9123,6 +9241,11 @@ async def campaign_worker_task(task_id: str):
                             )
                             continue
                         except Exception as send_exc:
+                            if is_banned_or_deactivated_error(send_exc):
+                                await handle_deactivated_or_banned_account(selected_account_id, send_exc)
+                                if selected_account_id in account_ids:
+                                    account_ids.remove(selected_account_id)
+                                continue
                             if is_campaign_permission_or_invalid_error(send_exc):
                                 warn_detail = f"{selected_phone} 发送失败：群组不可发言/已删除/触发限制警告 ({send_exc})"
                                 invalid_or_warning_details.append(warn_detail)
@@ -9154,7 +9277,12 @@ async def campaign_worker_task(task_id: str):
                         try:
                             await drain_pending_private_sends(selected_account_id, client, max_items=3)
                         except Exception as drain_exc:
-                            print(f"[PrivateSendQueue] Drain after campaign send failed for {selected_account_id}: {drain_exc}")
+                            if is_banned_or_deactivated_error(drain_exc):
+                                await handle_deactivated_or_banned_account(selected_account_id, drain_exc)
+                                if selected_account_id in account_ids:
+                                    account_ids.remove(selected_account_id)
+                            else:
+                                print(f"[PrivateSendQueue] Drain after campaign send failed for {selected_account_id}: {drain_exc}")
 
                         with Session(engine) as session:
                             task = session.get(CampaignTaskDb, task_id)
@@ -10879,8 +11007,10 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                     task["logs"].append(f"账号 {phone} 检测到已加入其中 {skipped_count} 个群组，已自动跳过，不占任务数。")
                 return acc_id, todo_links, skipped_count
             except Exception as ex:
+                if is_banned_or_deactivated_error(ex):
+                    await handle_deactivated_or_banned_account(acc_id, ex)
                 task["logs"].append(f"账号 {phone} 检查已加入群组失败: {ex}")
-                return acc_id, links, 0
+                return acc_id, [], 0
 
         results_precheck = await asyncio.gather(*(check_account_todo(acc_id, phone) for acc_id, phone in accounts_info))
         precheck_skipped_total = 0
@@ -10913,6 +11043,8 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                             for folder_name_clean in target_folders:
                                 await try_create_folder_early(client, folder_name_clean)
                     except Exception as ex:
+                        if is_banned_or_deactivated_error(ex):
+                            await handle_deactivated_or_banned_account(acc_id, ex)
                         print(f"Failed early folder check/creation for {phone}: {ex}")
 
         # Keep track of links index per account
@@ -10948,6 +11080,11 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
             idx = start_idx
 
             while idx < len(todo_links) and added_this_round < groups_per_round:
+                status = account_status_store.get(account_id, {})
+                if status.get("auth_status") == "unauthorized" or not status.get("is_authorized", True):
+                    task["logs"].append(f"⚠️ 账号 {phone} 检测到已处于未登录/封禁状态，终止该账号入群任务。")
+                    break
+
                 if task["status"] == "stopped":
                     task["logs"].append(f"账号 {phone} 的入群任务已被手动停止。")
                     break
@@ -11160,6 +11297,8 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                                         except Exception as fe:
                                             task["logs"].append(f"移动群组到文件夹 '{folder_name_clean}' 失败: {str(fe)}")
                         except Exception as ex:
+                            if is_banned_or_deactivated_error(ex):
+                                await handle_deactivated_or_banned_account(account_id, ex)
                             err_msg = str(ex)
                             err_msg_lower = err_msg.lower()
                             is_invalid = False
@@ -11189,6 +11328,8 @@ async def join_worker_task(task_id: str, req: JoinTaskRequest):
                             "error": f"触发电报 FloodWait 限制，需等待 {fwe.seconds} 秒"
                         })
                     except Exception as e:
+                        if is_banned_or_deactivated_error(e):
+                            await handle_deactivated_or_banned_account(account_id, e)
                         err_msg = str(e)
                         err_msg_lower = err_msg.lower()
                         is_invalid = False
