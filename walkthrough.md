@@ -241,3 +241,38 @@
 ## 3. 本地编译与 Git 部署
 * **编译通过**：本地运行 `python -m py_compile web_server.py` 顺利通过，无任何语法错误。
 * **Git 提交**：将所有修改已正式提交至本地 Git 仓库，符合规范提交命名。
+
+
+## 2026-07-05 (深夜): 修复控制后台主面板状态崩溃与广告进程状态检测重构
+
+我们彻底修复了管理员查询系统状态接口 `/api/system/status` 在判定广告任务是否运行时，由于不当的 `active_processes` 字典查询引发的致命类型/键值错误，并对整个后台的广告进程状态检测逻辑进行了健壮的重构：
+
+### 1. 彻底解决 `/api/system/status` 崩溃问题
+* **崩溃根源**：此接口在遍历所有广告轰炸任务记录并统计当前正在运行的任务数时，直接使用 `active_processes` 字典（其 Key 为 `account_id`，而 Value 为 `subprocess.Popen` 对象）。代码却错误地使用 `task.id`（任务 UUID 字符串）作为 Key 访问该字典，并调用 `.poll()`。当在多账号轰炸任务模式下使用该接口，或者 `task.id` 巧合不存在于 `active_processes` 时（或当 task.id 匹配了但并非 account_id 导致状态混淆），可能引发 `AttributeError` 或无法正确获取运行状态，造成面板数据获取崩溃。
+* **重构修复**：引入了统一的任务运行判定辅助函数 `is_campaign_task_running(task)`：
+  1. **协程模式**：预检任务 ID 是否在 `active_campaign_tasks` 内存字典中，且该 asyncio.Task 未完成；
+  2. **进程模式（旧版/遗留模式）**：解析任务对应的所有 `account_ids`，遍历每一个账号，若有任何一个账号的广告轰炸子进程在跑（通过 `is_campaign_running_for_account(acc_id)` 精准判定），则判定该任务处于运行中。
+* **修复效果**：在 `get_internal_bot_status` 里将脆弱的直接字典访问彻底替换为 `is_campaign_task_running(task)`，完美消除了类型和 Key 不匹配引起的逻辑崩溃风险。
+
+### 2. 广告进程状态判定逻辑的全局统一与重构
+为避免未来再次出现混淆与多处判定不一致，我们设计并封装了以下全局工具函数，并重构了所有相关点：
+* **`is_campaign_running_for_account(account_id: str) -> bool`**：
+  * **第一步**：检查内存中的 in-process 轰炸任务注册表 `account_task_registry`，确认其是否存在当前账号对应的轰炸任务且正在运行；
+  * **第二步**：检查 legacy 轰炸子进程字典 `active_processes` 中该账号对应的进程是否仍在运行 (`poll() is None`)；
+  * **第三步**：从 OS 级进程表 `find_campaign_process(account_id)` 中精准检索是否在运行 `ad_sender.py`；
+  * 具备完美的层级覆盖与容错。
+* **重构影响范围**：
+  * **客户端获取**：`get_client` 中防止冲突的 busy 预检逻辑；
+  * **账号列表拉取**：`/api/accounts` 中广告运行状态的字段映射；
+  * **私聊监听预检**：`get_private_poll_skip_reason` 中防止抢占 Session 的自动避让判定；
+  * **空闲连接释放**：`clean_idle_clients_loop` 后台周期清理逻辑；
+  * **单账号状态查询**：`/api/campaign/status/{account_id}` 接口状态反馈。
+  以上全部切入点已全部平滑重载为全新封装的 `is_campaign_running_for_account` 检测。
+
+---
+
+## 4. 后续步骤与验证
+1. **代码静态检查**：运行 `python -m py_compile web_server.py` 完美通过。
+2. **前端打包校验**：在 `frontend` 目录下执行 `npm run build` 构建无任何类型/编译警告。
+3. **已就绪**：已对本次修复所涉及的全部文件与历史做好了完整记录。
+

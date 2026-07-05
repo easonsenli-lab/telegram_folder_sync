@@ -975,6 +975,24 @@ def find_campaign_process(account_id: str) -> Optional[int]:
     return scan_campaign_processes_cached().get(str(account_id))
 
 
+def is_campaign_running_for_account(account_id: str) -> bool:
+    # 1. Check in-process campaign tasks
+    try:
+        registry = account_task_registry.get(str(account_id)) or {}
+        for task_id, task_info in registry.items():
+            if task_info.get("kind") == "campaign" and task_id in active_campaign_tasks:
+                return True
+    except Exception:
+        pass
+    # 2. Check active subprocesses
+    if account_id in active_processes and active_processes[account_id].poll() is None:
+        return True
+    # 3. Check OS level processes running ad_sender.py
+    if find_campaign_process(account_id) is not None:
+        return True
+    return False
+
+
 OPS_NOTIFY_DEDUP_FILE = Path("data/ops_notify_dedup.json")
 
 
@@ -1838,9 +1856,7 @@ async def get_client(account_id: str, ignore_proxy: bool = False) -> TelegramCli
             detail=f"该账号正在执行操作: {active_operation.get('label') or active_operation.get('operation') or 'active'}，请稍后再试。"
         )
 
-    is_campaign_running = account_id in active_processes and active_processes[account_id].poll() is None
-    if not is_campaign_running:
-        is_campaign_running = find_campaign_process(account_id) is not None
+    is_campaign_running = is_campaign_running_for_account(account_id)
     if is_campaign_running:
         raise HTTPException(
             status_code=400,
@@ -2865,9 +2881,7 @@ def get_accounts(scope: str = "mine", user: dict = Depends(get_current_user)):
         result = []
         for acc in db_accounts:
             campaign_started = time.time()
-            is_campaign_running = acc.id in active_processes and active_processes[acc.id].poll() is None
-            if not is_campaign_running:
-                is_campaign_running = find_campaign_process(acc.id) is not None
+            is_campaign_running = is_campaign_running_for_account(acc.id)
             campaign_scan_ms += int((time.time() - campaign_started) * 1000)
 
             # Fetch status from account_status_store
@@ -3298,14 +3312,8 @@ def get_private_poll_skip_reason(account_id: str) -> Optional[str]:
     if busy_status and busy_status != "idle":
         return f"账号正在执行任务: {busy_status}"
 
-    try:
-        process = active_processes.get(account_id)
-        if process and process.poll() is None:
-            return "账号正在执行广告任务"
-        if find_campaign_process(account_id) is not None:
-            return "账号正在执行广告进程"
-    except Exception:
-        pass
+    if is_campaign_running_for_account(account_id):
+        return "账号正在执行广告任务"
     return None
 
 
@@ -7980,9 +7988,7 @@ async def clean_idle_clients_loop():
                     active_clients_last_accessed[account_id] = now
                     continue
 
-                is_campaign_running = account_id in active_processes and active_processes[account_id].poll() is None
-                if not is_campaign_running:
-                    is_campaign_running = find_campaign_process(account_id) is not None
+                is_campaign_running = is_campaign_running_for_account(account_id)
 
                 if not is_campaign_running and not is_account_busy_with_task(account_id):
                     try:
@@ -8336,6 +8342,21 @@ async def get_account_folders(account_id: str, user: dict = Depends(get_current_
 
 active_campaign_tasks: Dict[str, asyncio.Task] = {}
 active_campaign_schedules: Dict[str, asyncio.Task] = {}
+
+def is_campaign_task_running(task) -> bool:
+    # 1. Task Mode (asyncio Task in main process)
+    if task.id in active_campaign_tasks and not active_campaign_tasks[task.id].done():
+        return True
+    # 2. Subprocess Mode (Classic Mode)
+    try:
+        acc_ids = parse_campaign_account_ids(task)
+        for acc_id in acc_ids:
+            if is_campaign_running_for_account(acc_id):
+                return True
+    except Exception:
+        pass
+    return False
+
 
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 UTC_TZ = ZoneInfo("UTC")
@@ -9768,15 +9789,7 @@ def list_campaign_tasks(user: dict = Depends(get_current_user)):
         needs_commit = False
         for task in results:
             if task.status == "running":
-                acc_ids = parse_campaign_account_ids(task)
-                has_active = False
-                for acc_id in acc_ids:
-                    is_running = acc_id in active_processes and active_processes[acc_id].poll() is None
-                    if not is_running:
-                        is_running = find_campaign_process(acc_id) is not None
-                    if is_running:
-                        has_active = True
-                        break
+                has_active = is_campaign_task_running(task)
                 if not has_active:
                     task.status = "stopped"
                     task.error_detail = "检测到发送进程已异常退出，已自动同步状态为停止。"
@@ -10338,9 +10351,7 @@ def stop_campaign(account_id: str = Body(..., embed=True), user: dict = Depends(
 def get_campaign_status(account_id: str, user: dict = Depends(get_current_user)):
     """Checks whether a campaign is currently running for an account."""
     check_account_company(account_id, user)
-    is_running = account_id in active_processes and active_processes[account_id].poll() is None
-    if not is_running:
-        is_running = find_campaign_process(account_id) is not None
+    is_running = is_campaign_running_for_account(account_id)
     return {"is_running": is_running}
 
 @app.get("/api/campaign/logs")
@@ -13126,10 +13137,7 @@ def get_internal_bot_status():
         db_tasks = session.exec(select(CampaignTaskDb)).all()
         tasks_result = []
         for task in db_tasks:
-            # Check if running in memory process
-            is_running = task.id in active_processes and active_processes[task.id].poll() is None
-            if not is_running:
-                is_running = find_campaign_process(task.id) is not None
+            is_running = is_campaign_task_running(task)
 
             tasks_result.append({
                 "id": task.id,
