@@ -260,27 +260,16 @@ class CampaignTaskDb(SQLModel, table=True):
 
 
 class CampaignLogDb(SQLModel, table=True):
-
     __tablename__ = "campaign_logs"
 
-
-
     id: Optional[int] = Field(default=None, primary_key=True)
-
-    company: str = Field(default="admin")
-
-    task_id: str
-
+    company: str = Field(default="admin", index=True)
+    task_id: str = Field(index=True)
     timestamp: str
-
     cycle: int
-
     group_title: str
-
     group_id: str
-
     group_username: Optional[str] = None
-
     ad_ref: Optional[str] = None
 
     account_id: Optional[str] = None

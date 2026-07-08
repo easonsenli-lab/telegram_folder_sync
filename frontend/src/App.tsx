@@ -905,7 +905,7 @@ export default function App() {
     subtasks: CampaignTask[];
   }
 
-  const groupCampaignTasks = (tasks: CampaignTask[]): GroupedCampaignTask[] => {
+  const groupCampaignTasks = (tasks: CampaignTask[], sortByTimeOnly: boolean = false): GroupedCampaignTask[] => {
     const groups: Record<string, GroupedCampaignTask> = {};
     tasks.forEach(task => {
       const key = `${task.created_at}_${task.round_interval_minutes}_${task.message.substring(0, 50)}`;
@@ -973,10 +973,15 @@ export default function App() {
       stopped: 3,
       completed: 4
     };
-    return Object.values(groups).sort((a, b) => (
-      (statusPriority[a.status] ?? 9) - (statusPriority[b.status] ?? 9)
-      || b.created_at.localeCompare(a.created_at)
-    ));
+    return Object.values(groups).sort((a, b) => {
+      if (sortByTimeOnly) {
+        return b.created_at.localeCompare(a.created_at);
+      }
+      return (
+        (statusPriority[a.status] ?? 9) - (statusPriority[b.status] ?? 9)
+        || b.created_at.localeCompare(a.created_at)
+      );
+    });
   };
 
   const [campaignTasks, setCampaignTasks] = useState<CampaignTask[]>([]);
@@ -10216,7 +10221,7 @@ export default function App() {
                     {campaignTasks.length === 0 && (
                       <option value="">暂无轰炸任务记录</option>
                     )}
-                    {groupCampaignTasks(campaignTasks).map((task) => (
+                    {groupCampaignTasks(campaignTasks, true).map((task) => (
                       <option key={task.id} value={task.id}>
                         任务 #{task.id.substring(0, 8)} ({task.created_at}) - 账号: {task.phones.join(', ')} (成功: {task.success_count})
                       </option>
@@ -13725,7 +13730,7 @@ export default function App() {
 
               {/* Task list preview grid */}
 
-              {groupCampaignTasks(campaignTasks).filter(t => showingHistoryCampaignsOnly ? !['running', 'scheduled'].includes(t.status) : ['running', 'scheduled'].includes(t.status)).length === 0 ? (
+              {groupCampaignTasks(campaignTasks, showingHistoryCampaignsOnly).filter(t => showingHistoryCampaignsOnly ? !['running', 'scheduled'].includes(t.status) : ['running', 'scheduled'].includes(t.status)).length === 0 ? (
 
                 <div className="bg-white border border-slate-100 rounded-2xl py-20 text-center flex flex-col items-center justify-center gap-3">
 
@@ -13743,7 +13748,7 @@ export default function App() {
 
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
 
-                  {groupCampaignTasks(campaignTasks)
+                  {groupCampaignTasks(campaignTasks, showingHistoryCampaignsOnly)
 
                     .filter(t => showingHistoryCampaignsOnly ? !['running', 'scheduled'].includes(t.status) : ['running', 'scheduled'].includes(t.status))
 

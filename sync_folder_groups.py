@@ -567,6 +567,56 @@ def export_csv(db_path: Path, csv_path: Path) -> None:
             writer.writerow(data)
 
 
+def get_deterministic_device_profile(seed: str) -> dict[str, Any]:
+    import hashlib
+    # 利用 seed 的 MD5 确定性散列值
+    val = int(hashlib.md5(str(seed).encode("utf-8")).hexdigest(), 16)
+    
+    device_types = ["android", "ios", "desktop"]
+    device_type = device_types[val % len(device_types)]
+    
+    if device_type == "android":
+        android_models = [
+            ("Samsung Galaxy S23 Ultra", "Android 13"),
+            ("Samsung Galaxy S22", "Android 12"),
+            ("Xiaomi 13 Pro", "Android 13"),
+            ("Xiaomi Redmi Note 12", "Android 12"),
+            ("Google Pixel 7 Pro", "Android 13"),
+            ("OnePlus 11", "Android 13"),
+        ]
+        model, os_ver = android_models[val % len(android_models)]
+        app_versions = ["10.0.1", "10.1.2", "10.2.0"]
+        app_ver = f"Telegram Android {app_versions[val % len(app_versions)]}"
+    elif device_type == "ios":
+        ios_models = [
+            ("iPhone 14 Pro Max", "iOS 16.5"),
+            ("iPhone 14", "iOS 16.0"),
+            ("iPhone 13 Pro", "iOS 15.4"),
+            ("iPhone 12", "iOS 15.0"),
+        ]
+        model, os_ver = ios_models[val % len(ios_models)]
+        app_versions = ["10.0.0", "10.1.0", "10.2.1"]
+        app_ver = f"Telegram iOS {app_versions[val % len(app_versions)]}"
+    else:
+        desktop_models = [
+            ("Desktop", "Windows 10 x64"),
+            ("Desktop", "Windows 11 x64"),
+            ("Desktop", "macOS 13.4.1"),
+            ("Desktop", "Linux x86_64"),
+        ]
+        model, os_ver = desktop_models[val % len(desktop_models)]
+        app_versions = ["4.8.3", "4.9.1", "4.10.0"]
+        app_ver = f"Telegram Desktop {app_versions[val % len(app_versions)]}"
+
+    return {
+        "device_model": model,
+        "system_version": os_ver,
+        "app_version": app_ver,
+        "lang_code": "en",
+        "system_lang_code": "en-US"
+    }
+
+
 async def build_client(config: dict[str, Any], base_dir: Path) -> TelegramClient:
     config = ensure_safe_telegram_proxy_config(config)
     safe_print(f"Telegram 连接代理：{safe_proxy_summary(config)}")
@@ -576,6 +626,9 @@ async def build_client(config: dict[str, Any], base_dir: Path) -> TelegramClient
 
     if auth_mode == "api_id_hash":
         options = await choose_telegram_client_options(config, int(config["api_id"]), config["api_hash"])
+        seed = config.get("account_name", "") or config.get("session_name", "") or str(session_path)
+        profile = get_deterministic_device_profile(seed)
+        options.update(profile)
         return TelegramClient(str(session_path), int(config["api_id"]), config["api_hash"], **options)
 
     if auth_mode == "builtin_telegram_desktop":
