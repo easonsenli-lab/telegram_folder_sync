@@ -6391,18 +6391,25 @@ async def get_login_status(account_id: str, force: bool = False, user: dict = De
             client = await asyncio.wait_for(get_client(account_id), timeout=15)
             is_connected = client.is_connected()
             is_authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=8) if is_connected else False
-    except HTTPException as http_exc:
-        # 3. 如果捕获到 409 或 400（证明大号正被独立子进程或忙碌任务独占），我们启动自适应平滑降级：
-        # 此时账号必定是在线连接着的，我们判定 is_connected = True, is_authorized = True 并在后文使用历史缓存返回健康度，防止假死报错！
-        if http_exc.status_code in (400, 409):
+    except Exception as err:
+        # 3. 捕获 400/409 (忙碌锁) 或 TimeoutError (等待锁超时卡死)
+        # 证明大号正在运行任务且 Session 被独占，我们启动自适应降级，直接提取最新缓存数据，确保前台流畅秒回！
+        import asyncio
+        err_name = type(err).__name__
+        is_error_to_fallback = False
+        
+        if err_name == "HTTPException" and getattr(err, "status_code", 0) in (400, 409):
+            is_error_to_fallback = True
+        elif err_name in ("TimeoutError", "asyncio.TimeoutError") or isinstance(err, (TimeoutError, asyncio.TimeoutError)):
+            is_error_to_fallback = True
+            
+        if is_error_to_fallback:
             is_connected = True
             is_authorized = True
             is_occupied_fallback = True
-            print(f"[LoginStatus] Account {account_id} is busy with campaign/task. Triggering occupied cache fallback.")
+            print(f"[LoginStatus] Account {account_id} is locked/busy ({err_name}). Triggering occupied cache fallback.")
         else:
-            raise
-    except Exception as conn_err:
-        raise conn_err
+            raise err
         me_info = None
         spambot_status = "unknown"
         spambot_details = ""
