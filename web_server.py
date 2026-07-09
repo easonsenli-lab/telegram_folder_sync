@@ -158,6 +158,7 @@ from services.scraping_service import (
 )
 # --- MODULAR SERVICES IMPORTS ---
 from services.shared_state import (
+    account_operation_locks,
     active_clients,
     active_clients_last_accessed,
     client_locks,

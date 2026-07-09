@@ -45,7 +45,8 @@ background_tasks = set()  # Set[asyncio.Task]
 registered_listeners = set()  # Set[WebSocket]
 
 # Operations registries and process tables
-active_account_operations = {}  # Dict[str, dict]
+active_account_operations = {}
+account_operation_locks = {}  # Dict[str, asyncio.Lock]  # Dict[str, dict]
 active_processes = {}  # Dict[str, subprocess.Popen]
 campaign_process_cache: Dict[str, Any] = {"expires_at": 0.0, "by_account": {}}
 
