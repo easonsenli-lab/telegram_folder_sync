@@ -746,6 +746,25 @@ async def campaign_worker_task(task_id: str):
                 remaining -= step
             await campaign_drain_private_queues(max_items_per_account=max_items_per_account)
 
+        def handle_empty_account_pool():
+            if not account_ids:
+                with Session(engine) as session:
+                    task = session.get(CampaignTaskDb, task_id)
+                    if task and task.status != "stopped":
+                        task.status = "stopped"
+                        session.add(task)
+                        session.commit()
+                alert_text = (
+                    f"❌ <b>【任务异常终止预警】当前群发广告任务已被系统强制停止！</b>\n\n"
+                    f"● <b>任务ID</b>: <code>#{task_id}</code>\n"
+                    f"● <b>任务公司</b>: <code>{task_company}</code>\n"
+                    f"● <b>原因</b>: 🚫 <b>参与本任务的所有大号均已失效或被封号！已无任何可用健康账号。</b>\n"
+                    f"● <b>发生时间</b>: <code>{get_beijing_time_str()}</code>"
+                )
+                send_ops_bot_notification(alert_text)
+                return True
+            return False
+
         cycle = max(1, int(task_record.current_cycle or 1))
         while True:
             # 1. Update status
@@ -851,6 +870,8 @@ async def campaign_worker_task(task_id: str):
                                         await handle_deactivated_or_banned_account(selected_account_id, conn_err)
                                         if selected_account_id in account_ids:
                                             account_ids.remove(selected_account_id)
+                                        if handle_empty_account_pool():
+                                            break
                                         continue
                                     raise Exception(f"客户端连接已断开，尝试自动重连失败: {conn_err}")
                         except Exception as client_exc:
@@ -858,6 +879,10 @@ async def campaign_worker_task(task_id: str):
                                 await handle_deactivated_or_banned_account(selected_account_id, client_exc)
                                 if selected_account_id in account_ids:
                                     account_ids.remove(selected_account_id)
+                                if handle_empty_account_pool():
+                                    break
+                                if handle_empty_account_pool():
+                                    break
                                 continue
 
                             last_candidate_error = f"{selected_phone} 初始化客户端失败：{client_exc}"
@@ -885,6 +910,10 @@ async def campaign_worker_task(task_id: str):
                                 await handle_deactivated_or_banned_account(selected_account_id, account_exc)
                                 if selected_account_id in account_ids:
                                     account_ids.remove(selected_account_id)
+                                if handle_empty_account_pool():
+                                    break
+                                if handle_empty_account_pool():
+                                    break
                                 continue
                             last_candidate_error = f"{selected_phone} 检查群组失败：{account_exc}"
                             if is_campaign_permission_or_invalid_error(account_exc):
@@ -1069,6 +1098,10 @@ async def campaign_worker_task(task_id: str):
                                 await handle_deactivated_or_banned_account(selected_account_id, send_exc)
                                 if selected_account_id in account_ids:
                                     account_ids.remove(selected_account_id)
+                                if handle_empty_account_pool():
+                                    break
+                                if handle_empty_account_pool():
+                                    break
                                 continue
                             if is_campaign_permission_or_invalid_error(send_exc):
                                 warn_detail = f"{selected_phone} 发送失败：群组不可发言/已删除/触发限制警告 ({send_exc})"
@@ -1111,6 +1144,8 @@ async def campaign_worker_task(task_id: str):
                                 await handle_deactivated_or_banned_account(selected_account_id, drain_exc)
                                 if selected_account_id in account_ids:
                                     account_ids.remove(selected_account_id)
+                                if handle_empty_account_pool():
+                                    break
                             else:
                                 print(f"[PrivateSendQueue] Drain after campaign send failed for {selected_account_id}: {drain_exc}")
 
