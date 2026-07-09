@@ -82,21 +82,52 @@ async def audit_group_bot_rules(client, chat_id: int, group_title: str, username
     }
     
     try:
-        # 1. 预先拉取所有的群管理员 ID，剔除管理员的大段文案字数污染
+        # 1. 预先定义内部抓取函数，实现大号轮询降级
         admin_ids = set()
-        try:
-            from telethon.tl.types import ChannelParticipantsAdmins
-            participants = await client.get_participants(chat_id, filter=ChannelParticipantsAdmins())
-            for p in participants:
-                admin_ids.add(p.id)
-        except Exception as admin_err:
-            print(f"[Bot审计] 获取群组管理员列表失败(可能非群组或无权): {admin_err}")
-
-        # 获取 90 条历史消息，获取足够背景
-        messages = await client.get_messages(chat_id, limit=90)
-        bot_warnings = []
+        messages = []
         pin_text = ""
+        bot_warnings = []
         human_message_bytes = []
+
+        async def try_fetch_messages(target_client):
+            t_admin_ids = set()
+            try:
+                from telethon.tl.types import ChannelParticipantsAdmins
+                participants = await target_client.get_participants(chat_id, filter=ChannelParticipantsAdmins())
+                for p in participants:
+                    t_admin_ids.add(p.id)
+            except Exception:
+                pass
+            
+            t_messages = await target_client.get_messages(chat_id, limit=90)
+            t_pin = ""
+            for m in t_messages:
+                if m and getattr(m, "pinned", False) and m.text:
+                    t_pin = m.text
+                    break
+            return t_admin_ids, t_messages, t_pin
+
+        # 第一步：尝试首选 client (探测号)
+        try:
+            admin_ids, messages, pin_text = await try_fetch_messages(client)
+            print(f"[Bot审计] 首选探测大号成功拉取群组 '{group_title}' 的消息。")
+        except Exception as client_err:
+            print(f"[Bot审计] 探测号拉取群组 '{group_title}' 消息失败 (可能不在群内): {client_err}，尝试降级轮询其他在线大号...")
+            # 第二步：轮询其它在线的客户端
+            from services.shared_state import active_clients
+            fetched_ok = False
+            for alt_id, alt_client in list(active_clients.items()):
+                if alt_client != client:
+                    try:
+                        if alt_client.is_connected() and await alt_client.is_user_authorized():
+                            admin_ids, messages, pin_text = await try_fetch_messages(alt_client)
+                            print(f"[Bot审计] 降级大号成功！已使用在线大号 {alt_id} 拉取到群组消息。")
+                            fetched_ok = True
+                            break
+                    except Exception:
+                        continue
+            if not fetched_ok:
+                raise Exception(f"所有在线账号均不在此群组内，无法拉取消息：{client_err}")
         
         for msg in messages:
             if not msg:
