@@ -957,6 +957,7 @@ async def resolve_group(req, user):
     res_data = None
     last_exception = None
     resolved_ok = False
+    active_query_client = None
 
     # 2. 依次轮询大号进行 8 秒的超时容灾解析
     for account_id, client in available_clients:
@@ -1040,6 +1041,7 @@ async def resolve_group(req, user):
                 }
             
             resolved_ok = True
+            active_query_client = client
             print(f"[解析群组] 使用账号 {account_id} 成功定位并解析群组。")
             break
         except Exception as e:
@@ -1082,6 +1084,24 @@ async def resolve_group(req, user):
             created_by=user["username"],
             updated_by=user["username"]
         )
+        # 4. 立即对该群组执行同步规则审计与评分计算，使其导入后立即可用
+        if active_query_client:
+            try:
+                from bot_rules_auditor import audit_group_bot_rules
+                rules_summary_json, rules_raw_logs = await audit_group_bot_rules(
+                    active_query_client, 
+                    str(res_data["id"]), 
+                    res_data.get("title", ""), 
+                    res_data.get("username", "")
+                )
+                new_db_group.bot_rules_summary = rules_summary_json
+                new_db_group.bot_rules_raw_logs = rules_raw_logs
+                
+                # 并立即应用群规则计算并更新其质量与活跃评分
+                apply_group_library_scores(new_db_group, is_valid=True)
+            except Exception as audit_err:
+                print(f"[导入自动审计] 自动审计新导入群组失败: {audit_err}")
+
         session.add(new_db_group)
         session.commit()
     return res_data
