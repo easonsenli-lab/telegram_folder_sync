@@ -6379,11 +6379,18 @@ async def get_login_status(account_id: str, force: bool = False, user: dict = De
     is_occupied_fallback = False
     
     # 0. 【核心前置过滤器】先判定大号是否正被子进程或忙碌任务独占，100% 避免去强行获取 get_client 导致 Session 锁竞争挂起超时
+    from db import engine, AccountDb, Session
     from services.client_manager import active_processes, find_campaign_process
-    from services.shared_state import get_account_status
     
-    acc_status = get_account_status(account_id) or {}
-    is_occupied_db = acc_status.get("availability_status") == "occupied"
+    is_occupied_db = False
+    try:
+        with Session(engine) as session:
+            db_acc = session.get(AccountDb, account_id)
+            if db_acc and not db_acc.is_available:
+                is_occupied_db = True
+    except Exception as db_err:
+        print(f"[LoginStatus] Failed to query account availability: {db_err}")
+        
     is_subprocess_campaign_running = account_id in active_processes and active_processes[account_id].poll() is None
     if not is_subprocess_campaign_running:
         is_subprocess_campaign_running = find_campaign_process(account_id) is not None
