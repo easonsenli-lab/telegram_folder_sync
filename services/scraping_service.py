@@ -28,6 +28,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config.json"
 
 
+def format_sse(event: str, data: dict) -> str:
+    import json
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
 def query_allowed_accounts(session, user):
     from db import AccountDb, AdminDb, select
     from sqlmodel import or_
