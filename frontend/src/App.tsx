@@ -213,7 +213,8 @@ interface Group {
   activity_score?: number;
 
   engagement_score?: number;
-
+  bot_rules_summary?: string;
+  bot_rules_raw_logs?: string;
 }
 
 
@@ -1089,6 +1090,45 @@ export default function App() {
   // Toast / Status notification count
 
   const [toastText, setToastText] = useState<string>('');
+  const [auditingGroupId, setAuditingGroupId] = useState<string | null>(null);
+
+  const handleReAuditGroup = async (groupId: string) => {
+    if (auditingGroupId) return;
+    setAuditingGroupId(groupId);
+    setToastText("正在拉取探测号重新审计该群规则...");
+    try {
+      const res = await fetch(`${BASE_URL}/api/groups/${groupId}/re-audit`, {
+        method: 'POST'
+      });
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.detail || '重新拉取群限制失败，请确保受限探测号已在线登录。');
+      }
+      const data = await res.json();
+      if (data && data.status === 'success') {
+        setGroups(prevGroups => prevGroups.map(g => {
+          if (g.id === groupId) {
+            return {
+              ...g,
+              bot_rules_summary: typeof data.bot_rules_summary === 'object' 
+                ? JSON.stringify(data.bot_rules_summary) 
+                : data.bot_rules_summary,
+              bot_rules_raw_logs: data.bot_rules_raw_logs
+            };
+          }
+          return g;
+        }));
+        setToastText("群限制规则同步成功！");
+        setTimeout(() => setToastText(''), 2000);
+      }
+    } catch (err: any) {
+      console.error('Re-audit failed:', err);
+      alert(err.message || '重新拉取群限制失败');
+      setToastText('');
+    } finally {
+      setAuditingGroupId(null);
+    }
+  };
 
 
 
@@ -11919,21 +11959,117 @@ export default function App() {
 
                           )}
 
-                          <td className="py-3 px-3 font-mono text-xs text-slate-500 whitespace-nowrap">{group.id}</td>
+                          <td className="py-3 px-3 font-mono text-xs whitespace-nowrap">
+                            <span 
+                              onClick={() => handleReAuditGroup(group.id)}
+                              className={`cursor-pointer underline decoration-dotted transition-colors hover:text-blue-600 ${
+                                auditingGroupId === group.id ? 'text-blue-500 animate-pulse font-semibold' : 'text-slate-500'
+                              }`}
+                              title="点击使用受限探测号重新同步群组限制规则"
+                            >
+                              {auditingGroupId === group.id ? '⏳ 同步中...' : group.id}
+                            </span>
+                          </td>
 
                           <td className="py-3 px-3 break-words">
 
-                            <div
+                            <div className="flex flex-col gap-1 min-w-0">
 
-                              className="text-slate-900 font-semibold line-clamp-2 leading-snug text-[13px]"
+                              <div
 
-                              style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}
+                                className="text-slate-900 font-semibold line-clamp-2 leading-snug text-[13px]"
 
-                              title={group.title}
+                                style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}
 
-                            >
+                                title={group.title}
 
-                              {group.title}
+                              >
+
+                                {group.title}
+
+                              </div>
+
+                              {(() => {
+
+                                const summary = group.bot_rules_summary;
+
+                                if (!summary) return null;
+
+                                try {
+
+                                  const rules = typeof summary === 'object' ? summary : JSON.parse(summary);
+
+                                  if (!rules) return null;
+
+                                  const maxLen = Number(rules.max_length || 0);
+
+                                  const bannedLinks = !!rules.banned_links;
+
+                                  const bannedMedia = !!rules.banned_media;
+
+                                  const hasSens = !!rules.has_sensitive_words;
+
+                                  
+
+                                  if (maxLen === 0 && !bannedLinks && !bannedMedia && !hasSens) return null;
+
+                                  
+
+                                  return (
+
+                                    <div className="flex items-center gap-1 flex-wrap mt-0.5" title={group.bot_rules_raw_logs || ''}>
+
+                                      {maxLen > 0 && (
+
+                                        <span className="px-1 py-0.5 bg-blue-50 text-[9px] text-blue-600 border border-blue-100/50 rounded font-semibold">
+
+                                          {maxLen}字限制
+
+                                        </span>
+
+                                      )}
+
+                                      {bannedLinks && (
+
+                                        <span className="px-1 py-0.5 bg-rose-50 text-[9px] text-rose-500 border border-rose-100/50 rounded font-semibold">
+
+                                          禁链接
+
+                                        </span>
+
+                                      )}
+
+                                      {bannedMedia && (
+
+                                        <span className="px-1 py-0.5 bg-orange-50 text-[9px] text-orange-500 border border-orange-100/50 rounded font-semibold">
+
+                                          禁媒体
+
+                                        </span>
+
+                                      )}
+
+                                      {hasSens && (
+
+                                        <span className="px-1 py-0.5 bg-amber-50 text-[9px] text-amber-600 border border-amber-100/50 rounded font-semibold">
+
+                                          敏感警告
+
+                                        </span>
+
+                                      )}
+
+                                    </div>
+
+                                  );
+
+                                } catch (e) {
+
+                                  return null;
+
+                                }
+
+                              })()}
 
                             </div>
 
@@ -12008,6 +12144,8 @@ export default function App() {
                           </td>
 
                           <td className="py-3 px-3 font-mono text-xs whitespace-nowrap">{(group.memberCount || 0).toLocaleString()}</td>
+
+
 
                           <td className="py-3 px-3 whitespace-nowrap">
 

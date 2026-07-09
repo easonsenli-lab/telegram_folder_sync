@@ -1,0 +1,92 @@
+401:         )
+402:     except Exception:
+403:         pass
+404: 
+405:     try:
+406:         yield
+407:     finally:
+408:         active_account_operations.pop(account_id, None)
+409:         try:
+410:             set_account_status(
+411:                 account_id,
+412:                 {
+413:                     "active_operation": None,
+414:                     "active_operation_label": None,
+415:                 },
+416:                 source="account-operation-finish",
+417:             )
+418:         except Exception:
+419:             pass
+420:         lock.release()
+421: 
+422: 
+423: def account_api_operation(operation: str, *, label: str = "", block_task_busy: bool = True):
+424:     def decorator(func):
+425:         @wraps(func)
+426:         async def wrapper(*args, **kwargs):
+427:             account_id = kwargs.get("account_id")
+428:             if not account_id:
+429:                 return await func(*args, **kwargs)
+430:             user = kwargs.get("user") or kwargs.get("admin_user")
+431:             if user:
+432:                 check_account_company_scope(str(account_id), user)
+433:             async with account_operation_guard(str(account_id), operation, label=label or operation, block_task_busy=block_task_busy):
+434:                 return await func(*args, **kwargs)
+435:         return wrapper
+436:     return decorator
+437: 
+438: SPAMBOT_CACHE_FILE = Path("data/spambot_cache.json")
+439: 
+440: def load_spambot_cache() -> Dict[str, dict]:
+441:     if SPAMBOT_CACHE_FILE.exists():
+442:         try:
+443:             return load_json(SPAMBOT_CACHE_FILE)
+444:         except Exception:
+445:             pass
+446:     return {}
+447: 
+448: def save_spambot_cache(cache: Dict[str, dict]):
+449:     try:
+450:         SPAMBOT_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+451:         save_json(SPAMBOT_CACHE_FILE, cache)
+452:     except Exception as e:
+453:         print(f"Failed to save spambot cache: {e}")
+454: 
+455: spambot_cache: Dict[str, dict] = load_spambot_cache()
+456: account_status_store: Dict[str, dict] = {}
+457: account_status_subscribers: set[asyncio.Queue] = set()
+458: private_dm_subscribers: set[asyncio.Queue] = set()
+459: account_task_registry: Dict[str, Dict[str, dict]] = {}
+460: TASK_BUSY_PRIORITY = {"join": 10, "campaign": 20, "scraper": 30, "expansion": 40}
+461: private_unread_cache: Dict[str, dict] = {}
+462: private_unread_refreshing: set[str] = set()
+463: PRIVATE_UNREAD_CACHE_TTL_SECONDS = 8
+464: PRIVATE_DM_ACK_FILE = Path("data/private_dm_event_ack.json")
+465: PRIVATE_SENDER_CACHE_FILE = Path("data/private_sender_cache.json")
+466: PRIVATE_WELCOME_SENT_FILE = Path("data/private_welcome_sent.json")
+467: pending_private_sends: Dict[str, deque] = {}
+468: private_send_queue_locks: Dict[str, asyncio.Lock] = {}
+469: auto_private_listener_accounts: set[str] = set()
+470: auto_private_listener_cooldowns: Dict[str, float] = {}
+471: AUTO_PRIVATE_LISTENER_STARTUP_DELAY_SECONDS = 8
+472: AUTO_PRIVATE_LISTENER_INTERVAL_SECONDS = 60
+473: AUTO_PRIVATE_LISTENER_CONNECT_GAP_SECONDS = 4
+474: AUTO_PRIVATE_LISTENER_FAILURE_COOLDOWN_SECONDS = 300
+475: PRIVATE_LISTENER_TRANSPORT_429_COOLDOWN_SECONDS = 900
+476: 
+477: 
+478: def is_telegram_transport_rate_error(exc: Exception) -> bool:
+479:     err = str(exc)
+480:     return (
+481:         "HTTP code 429" in err
+482:         or "Invalid response buffer" in err
+483:         or "FloodWait" in err
+484:         or "A wait of" in err
+485:     )
+486: 
+487: 
+488: def mark_private_listener_cooldown(account_id: str, exc: Exception, context: str = "private-listener") -> None:
+489:     wait_time = getattr(exc, "seconds", None)
+490:     if not wait_time:
+491:         wait_time = PRIVATE_LISTENER_TRANSPORT_429_COOLDOWN_SECONDS if is_telegram_transport_rate_error(exc) else AUTO_PRIVATE_LISTENER_FAILURE_COOLDOWN_SECONDS
+492:     wait_time = max(60, int(wait_time))

@@ -1,0 +1,30 @@
+7331:                     spambot_details = res["details"]
+7332:                     spambot_time = time.time()
+7333:                     spambot_cache[account_id] = {
+7334:                         "status": spambot_status,
+7335:                         "details": spambot_details,
+7336:                         "timestamp": spambot_time
+7337:                     }
+7338:                     save_spambot_cache(spambot_cache)
+7339:                 except Exception as e:
+7340:                     warning = f"SpamBot 检测失败，登录状态已确认: {e}"
+7341:                     check_warnings.append(warning)
+7342:                     if cached:
+7343:                         spambot_status = cached.get("status", "unknown")
+7344:                         spambot_details = cached.get("details", "")
+7345:                         spambot_time = cached.get("timestamp")
+7346:                     print(f"[LoginStatus] spambot check failed for {account_id}: {e}")
+7347: 
+7348:         status_res = {
+7349:             "is_connected": is_connected,
+7350:             "is_authorized": is_authorized,
+7351:             "me": me_info,
+7352:             "spambot_status": spambot_status,
+7353:             "spambot_details": spambot_details,
+7354:             "spambot_time": spambot_time,
+7355:             "bot_setup_status": db_acc.bot_setup_status if db_acc and is_authorized else "not_started",
+7356:             "error": "; ".join(check_warnings) if check_warnings else None,
+7357:             "last_error": "; ".join(check_warnings) if check_warnings else None,
+7358:             "status_check_failed": bool(check_warnings),
+7359:             "status_check_warnings": check_warnings,
+7360:         }

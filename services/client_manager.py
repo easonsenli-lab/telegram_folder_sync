@@ -29,6 +29,11 @@ account_operation_locks: Dict[str, asyncio.Lock] = {}
 # Callback injection to avoid circular imports with register_login_code_listener
 login_code_listener_callback = None
 
+def is_campaign_running_for_account(account_id: str) -> bool:
+    import web_server
+    return web_server.is_campaign_running_for_account(account_id)
+
+
 def get_account_operation_lock(account_id: str) -> asyncio.Lock:
     if account_id not in account_operation_locks:
         account_operation_locks[account_id] = asyncio.Lock()

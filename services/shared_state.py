@@ -94,6 +94,9 @@ official_messages_store = {}  # Dict[str, List[dict]]
 dm_folder_peer_cache = {}  # Dict[str, Set[int]]
 DM_FOLDER_NAME = "DM"
 
+# Cleanup progress dict
+cleanup_tasks_progress = {}  # Dict[str, dict]
+
 TASK_BUSY_PRIORITY = {"join": 10, "campaign": 20, "scraper": 30, "expansion": 40}
 
 # --- PROCESS STATUS UTILITIES ---

@@ -1,0 +1,63 @@
+=== REMOTE 429 ERROR AUDIT ===
+
+--- Searching 429 in rosepay.service since 06:30 UTC ---
+Jul 05 06:31:08 vultr python[217799]: INFO:     103.196.22.103:42959 - "GET /api/campaign/tasks HTTP/1.1" 401 Unauthorized
+Jul 05 06:46:04 vultr python[219468]: INFO:     103.196.22.103:5429 - "GET /api/campaign/tasks HTTP/1.1" 401 Unauthorized
+Jul 05 06:47:32 vultr python[219468]: INFO:     103.196.22.103:4291 - "GET /api/campaign/tasks HTTP/1.1" 401 Unauthorized
+Jul 05 07:09:28 vultr python[219468]: INFO:     103.196.22.103:19429 - "GET /api/expansion/groups HTTP/1.1" 200 OK
+Jul 05 07:10:22 vultr python[219468]: INFO:     103.196.22.103:42943 - "GET /api/expansion/status HTTP/1.1" 200 OK
+
+--- Searching MessageBox/Fatal errors in rosepay.service since 06:30 UTC ---
+No Fatal/MessageBox errors found in rosepay.service since restart.
+
+--- Recent 50 lines of journalctl output ---
+Jul 05 07:19:14 vultr python[219468]: INFO:     103.196.22.103:15849 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:19:14 vultr python[219468]: Error resolving group type: username
+Jul 05 07:19:15 vultr python[219468]: INFO:     127.0.0.1:50392 - "GET / HTTP/1.1" 200 OK
+Jul 05 07:19:18 vultr python[219468]: INFO:     103.196.22.103:35361 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:19:22 vultr python[219468]: INFO:     103.196.22.103:63663 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:19:26 vultr python[219468]: INFO:     103.196.22.103:53523 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:19:30 vultr python[219468]: Error resolving group type: username
+Jul 05 07:19:30 vultr python[219468]: INFO:     103.196.22.103:28559 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:19:34 vultr python[219468]: INFO:     103.196.22.103:22193 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:19:38 vultr python[219468]: INFO:     103.196.22.103:39833 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:19:42 vultr python[219468]: INFO:     103.196.22.103:4507 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:19:45 vultr python[219468]: INFO:     127.0.0.1:40534 - "GET / HTTP/1.1" 200 OK
+Jul 05 07:19:46 vultr python[219468]: Error resolving group type: username
+Jul 05 07:19:46 vultr python[219468]: INFO:     103.196.22.103:30073 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:19:50 vultr python[219468]: INFO:     103.196.22.103:25399 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:19:54 vultr python[219468]: INFO:     103.196.22.103:30857 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:19:58 vultr python[219468]: INFO:     103.196.22.103:61337 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:20:02 vultr python[219468]: INFO:     103.196.22.103:45503 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:20:02 vultr python[219468]: Error resolving group type: username
+Jul 05 07:20:06 vultr python[219468]: INFO:     103.196.22.103:36929 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:20:10 vultr python[219468]: INFO:     103.196.22.103:48583 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:20:14 vultr python[219468]: INFO:     103.196.22.103:54707 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:20:15 vultr python[219468]: INFO:     127.0.0.1:52930 - "GET / HTTP/1.1" 200 OK
+Jul 05 07:20:18 vultr python[219468]: INFO:     103.196.22.103:58237 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:20:19 vultr python[219468]: Error resolving group type: username
+Jul 05 07:20:22 vultr python[219468]: INFO:     103.196.22.103:24871 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:20:26 vultr python[219468]: INFO:     103.196.22.103:21857 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:20:30 vultr python[219468]: INFO:     103.196.22.103:59495 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:20:34 vultr python[219468]: INFO:     103.196.22.103:45109 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:20:35 vultr python[219468]: Error resolving group type: username
+Jul 05 07:20:38 vultr python[219468]: INFO:     103.196.22.103:30635 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:20:42 vultr python[219468]: INFO:     103.196.22.103:37581 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:20:46 vultr python[219468]: INFO:     127.0.0.1:57108 - "GET / HTTP/1.1" 200 OK
+Jul 05 07:20:46 vultr python[219468]: INFO:     103.196.22.103:53773 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:20:50 vultr python[219468]: INFO:     103.196.22.103:54935 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:20:52 vultr python[219468]: Error resolving group type: username
+Jul 05 07:20:54 vultr python[219468]: INFO:     103.196.22.103:55273 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:20:58 vultr python[219468]: INFO:     103.196.22.103:50871 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:21:02 vultr python[219468]: INFO:     103.196.22.103:18471 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:21:06 vultr python[219468]: INFO:     103.196.22.103:8643 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:21:08 vultr python[219468]: Error resolving group type: username
+Jul 05 07:21:10 vultr python[219468]: INFO:     103.196.22.103:62905 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:21:14 vultr python[219468]: INFO:     103.196.22.103:57143 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:21:16 vultr python[219468]: INFO:     127.0.0.1:60518 - "GET / HTTP/1.1" 200 OK
+Jul 05 07:21:18 vultr python[219468]: INFO:     103.196.22.103:10525 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:21:22 vultr python[219468]: INFO:     103.196.22.103:26381 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:21:24 vultr python[219468]: Error resolving group type: username
+Jul 05 07:21:26 vultr python[219468]: INFO:     103.196.22.103:52205 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:21:30 vultr python[219468]: INFO:     103.196.22.103:10713 - "GET /api/campaign/tasks HTTP/1.1" 200 OK
+Jul 05 07:21:34 vultr python[219468]: INFO:     103.196.22.103:26413 - "GET /api/campaign/tasks HTTP/1.1" 200 OK

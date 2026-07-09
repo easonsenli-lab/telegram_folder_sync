@@ -1,0 +1,50 @@
+10921:         async def join_single_account_links_this_round(account_id: str, phone: str):
+10922:             from db import engine, GroupDb, Session, select
+10923:             import re
+10924:             from telethon import errors as telethon_errors
+10925: 
+10926:             def find_group_id_by_link_or_entity(session, link: str, entity=None) -> tuple[Optional[str], Optional[str]]:
+10927:                 if entity:
+10928:                     stmt = select(GroupDb).where(GroupDb.id == str(entity.id))
+10929:                     if task.get("company") != "admin":
+10930:                         stmt = stmt.where(GroupDb.company == task.get("company"))
+10931:                     db_group = session.exec(stmt).first()
+10932:                     if db_group:
+10933:                         return db_group.id, db_group.title
+10934: 
+10935:                 public_match = re.search(r'(?:t\.me|telegram\.me)/([a-zA-Z0-9_]{5,32})', link)
+10936:                 username = public_match.group(1) if public_match else link.replace("@", "").strip()
+10937:                 if username:
+10938:                     stmt = select(GroupDb).where(GroupDb.username.ilike(username))
+10939:                     db_group = session.exec(stmt).first()
+10940:                     if db_group:
+10941:                         return db_group.id, db_group.title
+10942:                 return None, None
+10943: 
+10944:             todo_links = accounts_todo_links.get(account_id, [])
+10945:             start_idx = accounts_link_index.get(account_id, 0)
+10946: 
+10947:             added_this_round = 0
+10948:             idx = start_idx
+10949: 
+10950:             while idx < len(todo_links) and added_this_round < groups_per_round:
+10951:                 if task["status"] == "stopped":
+10952:                     task["logs"].append(f"账号 {phone} 的入群任务已被手动停止。")
+10953:                     break
+10954: 
+10955:                 link = todo_links[idx]
+10956:                 idx += 1
+10957:                 accounts_link_index[account_id] = idx # Update pointer
+10958: 
+10959:                 task["logs"].append(f"账号 {phone} 正在处理链接 ({idx}/{len(todo_links)}): {link} ...")
+10960: 
+10961:                 # Not a duplicate, proceed with joining
+10962:                 task["logs"].append(f"账号 {phone} 正在尝试加入: {link} ...")
+10963: 
+10964:                 async def join_link_logic():
+10965:                     nonlocal added_this_round
+10966:                     try:
+10967:                         client = await get_client(account_id)
+10968:                         is_authorized = await client.is_user_authorized()
+10969:                         if not is_authorized:
+10970:                             mark_account_runtime_status(account_id, is_connected=client.is_connected(), is_authorized=False)

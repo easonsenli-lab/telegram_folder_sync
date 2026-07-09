@@ -1,0 +1,8 @@
+=== TRIGGERING AUTO-RECOVERY ===
+Stdout:
+=== 开始检测 groups_library 数据库字段升级 ===
+Successfully migrated '默认公司' to 'admin' in database tables.
+Successfully auto-authorized all accounts in database.
+Triggered list API. Count: 92
+DB Record: ('938a17f6-89d1-4eb8-9b87-4131764cd0cc', 'stopped', None, '2026-07-05 09:38:55')
+

@@ -1,0 +1,179 @@
+async def join_worker_task(task_id: str, req: JoinTaskRequest):
+    import random
+    import traceback
+    import asyncio
+    task = active_join_tasks[task_id]
+    task["status"] = "running"
+    task["logs"].append("入群任务已启动...")
+    save_last_join_task(task_id)
+    register_account_task_usage(
+        "join",
+        task_id,
+        req.account_ids,
+        {"company": task.get("company"), "owner_username": task.get("owner_username")},
+    )
+
+    results = task["results"]
+
+    try:
+        account_ids = req.account_ids
+        links = req.links
+        mode = req.mode
+        strategy = req.strategy
+
+        # New parameters
+        max_rounds = req.max_rounds
+        groups_per_round = req.groups_per_round if req.groups_per_round > 0 else 10
+        round_interval_minutes = req.round_interval_minutes if req.round_interval_minutes > 0 else 5
+
+        if strategy == "fixed":
+            base_delay = req.fixed_delay
+        else:
+            base_delay = (req.safety_minutes * 60) / req.safety_groups
+
+        task["logs"].append(f"基准延迟设为: {base_delay:.1f} 秒")
+
+        from db import engine, AccountDb, Session, GroupDb, select
+        accounts_info = []
+        with Session(engine) as session:
+            for acc_id in req.account_ids:
+                db_acc = session.get(AccountDb, acc_id)
+                if db_acc:
+                    accounts_info.append((acc_id, db_acc.account_name))
+
+        task["logs"].append("开始执行账号已入群检测排重...")
+        accounts_todo_links = {}
+
+        async def check_account_todo(acc_id, phone):
+            import re
+            from telethon.tl import functions, types
+            try:
+                client = await get_client(acc_id)
+                is_auth = await client.is_user_authorized()
+                if not is_auth:
+                    return acc_id, [], 0
+
+                dialogs = await client.get_dialogs(limit=None)
+                joined_usernames = {d.entity.username.lower() for d in dialogs if getattr(d.entity, 'username', None)}
+                joined_ids = {d.entity.id for d in dialogs}
+
+                todo_links = []
+                skipped_count = 0
+                for link in links:
+                    is_joined = False
+                    private_match = re.search(r'(?:t\.me|telegram\.me)/(?:joinchat/|\+)([a-zA-Z0-9\-_]+)', link)
+                    if private_match:
+                        invite_hash = private_match.group(1)
+                        try:
+                            invite = await client(functions.messages.CheckChatInviteRequest(hash=invite_hash))
+                            if type(invite).__name__ == 'ChatInviteAlready':
+                                is_joined = True
+                            elif hasattr(invite, 'chat') and invite.chat:
+                                if invite.chat.id in joined_ids:
+                                    is_joined = True
+                        except Exception:
+                            pass
+                    else:
+                        public_match = re.search(r'(?:t\.me|telegram\.me)/([a-zA-Z0-9_]{5,32})', link)
+                        username = public_match.group(1) if public_match else link.replace("@", "").strip()
+                        if username and username.lower() in joined_usernames:
+                            is_joined = True
+
+                    if is_joined:
+                        skipped_count += 1
+                    else:
+                        todo_links.append(link)
+
+                if skipped_count > 0:
+                    task["logs"].append(f"账号 {phone} 检测到已加入其中 {skipped_count} 个群组，已自动跳过，不占任务数。")
+                return acc_id, todo_links, skipped_count
+            except Exception as ex:
+                task["logs"].append(f"账号 {phone} 检查已加入群组失败: {ex}")
+                return acc_id, links, 0
+
+        results_precheck = await asyncio.gather(*(check_account_todo(acc_id, phone) for acc_id, phone in accounts_info))
+        precheck_skipped_total = 0
+        for acc_id, todo, skipped_count in results_precheck:
+            accounts_todo_links[acc_id] = todo
+            precheck_skipped_total += int(skipped_count or 0)
+
+        task["progress"]["total"] = sum(len(todo) for todo in accounts_todo_links.values())
+        task["precheck"] = {
+            "target_groups": len(links),
+            "dedup_skipped": precheck_skipped_total,
+            "todo_total": task["progress"]["total"],
+        }
+
+        if req.move_to_folder:
+            target_folders = []
+            if req.folder_by_type:
+                target_folders = ["中文长", "中文短", "英文长", "英文短"]
+            elif req.target_folder_name and req.target_folder_name.strip():
+                target_folders = [req.target_folder_name.strip()]
+
+            if target_folders:
+                task["logs"].append(f"开始执行前置检测并创建聊天文件夹: {target_folders}...")
+                for acc_id, phone in accounts_info:
+                    try:
+                        client = await get_client(acc_id)
+                        is_authorized = await client.is_user_authorized()
+                        if is_authorized:
+                            mark_account_runtime_status(acc_id, is_connected=True, is_authorized=True)
+                            for folder_name_clean in target_folders:
+                                await try_create_folder_early(client, folder_name_clean)
+                    except Exception as ex:
+                        print(f"Failed early folder check/creation for {phone}: {ex}")
+
+        # Keep track of links index per account
+        accounts_link_index = {acc_id: 0 for acc_id, _ in accounts_info}
+
+        async def join_single_account_links_this_round(account_id: str, phone: str):
+            from db import engine, GroupDb, Session, select
+            import re
+            from telethon import errors as telethon_errors
+
+            def find_group_id_by_link_or_entity(session, link: str, entity=None) -> tuple[Optional[str], Optional[str]]:
+                if entity:
+                    stmt = select(GroupDb).where(GroupDb.id == str(entity.id))
+                    if task.get("company") != "admin":
+                        stmt = stmt.where(GroupDb.company == task.get("company"))
+                    db_group = session.exec(stmt).first()
+                    if db_group:
+                        return db_group.id, db_group.title
+
+                public_match = re.search(r'(?:t\.me|telegram\.me)/([a-zA-Z0-9_]{5,32})', link)
+                username = public_match.group(1) if public_match else link.replace("@", "").strip()
+                if username:
+                    stmt = select(GroupDb).where(GroupDb.username.ilike(username))
+                    db_group = session.exec(stmt).first()
+                    if db_group:
+                        return db_group.id, db_group.title
+                return None, None
+
+            todo_links = accounts_todo_links.get(account_id, [])
+            start_idx = accounts_link_index.get(account_id, 0)
+
+            added_this_round = 0
+            idx = start_idx
+
+            while idx < len(todo_links) and added_this_round < groups_per_round:
+                if task["status"] == "stopped":
+                    task["logs"].append(f"账号 {phone} 的入群任务已被手动停止。")
+                    break
+
+                link = todo_links[idx]
+                idx += 1
+                accounts_link_index[account_id] = idx # Update pointer
+
+                task["logs"].append(f"账号 {phone} 正在处理链接 ({idx}/{len(todo_links)}): {link} ...")
+
+                # Not a duplicate, proceed with joining
+                task["logs"].append(f"账号 {phone} 正在尝试加入: {link} ...")
+
+                async def join_link_logic():
+                    nonlocal added_this_round
+                    try:
+                        client = await get_client(account_id)
+                        is_authorized = await client.is_user_authorized()
+                        if not is_authorized:
+                            mark_account_runtime_status(account_id, is_connected=client.is_connected(), is_author

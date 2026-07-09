@@ -134,28 +134,6 @@ ENABLE_REALTIME_PRIVATE_DM = os.getenv("ROSEPAY_ENABLE_REALTIME_PRIVATE_DM", "1"
 private_relay_enabled = ENABLE_REALTIME_PRIVATE_DM
 
 
-
-# Stage 2 Modular Imports
-from services.maintenance_service import (
-    load_expansion_config,
-    save_expansion_config,
-    get_company_expansion_task,
-    run_business_expansion_loop,
-    run_account_cleanup_process
-)
-from services.scraping_service import (
-    sync_groups_status,
-    analyze_group_category_with_ai,
-    stream_groups_sync,
-    classify_group_category_for_import,
-    resolve_group,
-    get_company_scraper_task,
-    get_gemini_api_key,
-    save_gemini_api_key,
-    get_deepseek_api_key,
-    save_deepseek_api_key,
-    run_group_scraping_task
-)
 # --- MODULAR SERVICES IMPORTS ---
 from services.shared_state import (
     active_clients,
@@ -354,8 +332,6 @@ async def require_admin(user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="没有管理员权限，拒绝访问")
     return user
 
-
-
 def check_account_company(account_id: str, user: dict):
     from db import engine, AccountDb, AdminDb, Session, select
     with Session(engine) as session:
@@ -482,7 +458,12 @@ sync_db_and_files()
 # Enable CORS for local development (restrict allowed origins for security)
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex="https?://.*",
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1312,8 +1293,6 @@ class GroupModel(BaseModel):
     relevance_score: int = 0
     activity_score: int = 0
     engagement_score: int = 0
-    bot_rules_summary: Optional[str] = None
-    bot_rules_raw_logs: Optional[str] = None
 
 class GroupToggleRequest(BaseModel):
     id: str
@@ -5874,60 +5853,6 @@ def get_user_from_stream_token(token: Optional[str]) -> Dict[str, str]:
 def save_groups(groups: List[Dict[str, Any]]):
     pass
 
-@app.post("/api/groups/{group_id}/re-audit")
-async def re_audit_group_rules(group_id: str, user: dict = Depends(get_current_user)):
-    from db import engine, GroupDb, Session, select
-    from services.scraping_service import query_allowed_accounts, get_read_only_probe_client
-    from services.shared_state import filter_executable_accounts_for_task
-    from bot_rules_auditor import audit_group_bot_rules
-    import json
-    
-    with Session(engine) as session:
-        db_groups = find_group_rows_by_public_identity(session, group_id, user["company"])
-        if not db_groups:
-            raise HTTPException(status_code=404, detail="未找到指定的群组记录")
-        db_group = db_groups[0]
-        
-    with Session(engine) as session:
-        stmt = query_allowed_accounts(session, user)
-        allowed_account_ids = {a.id for a in filter_executable_accounts_for_task(session.exec(stmt).all())}
-        
-    logs = []
-    client, selected_account_id = await get_read_only_probe_client(allowed_account_ids, logs)
-    if not client:
-        raise HTTPException(
-            status_code=400,
-            detail="当前没有可用的电报账号可以执行探测，请先登录一个账号。"
-        )
-        
-    try:
-        rules_summary_json, rules_raw_logs = await audit_group_bot_rules(
-            client, 
-            db_group.id, 
-            db_group.title or group_id, 
-            db_group.username
-        )
-        
-        with Session(engine) as session:
-            for g in find_group_rows_by_public_identity(session, group_id, user["company"]):
-                g.bot_rules_summary = rules_summary_json
-                g.bot_rules_raw_logs = rules_raw_logs
-                g.updated_by = user["username"]
-                session.add(g)
-            session.commit()
-            
-        return {
-            "status": "success", 
-            "bot_rules_summary": json.loads(rules_summary_json),
-            "bot_rules_raw_logs": rules_raw_logs,
-            "logs": logs
-        }
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"重新拉取群规则失败：{exc}"
-        )
-
 @app.get("/api/groups", response_model=List[GroupModel])
 def get_api_groups(user: dict = Depends(get_current_user)):
     return load_groups(user["company"])
@@ -6181,12 +6106,703 @@ async def sync_groups_from_folders(user: dict = Depends(get_current_user)):
         "logs": logs,
         "groups": load_groups(user["company"])
     }
-# Extracted sync_groups_status
+@app.post("/api/groups/sync-status")
+async def sync_groups_status(user: dict = Depends(get_current_user)):
+    """
+    Iterates through all groups in the database and updates their status
+    (title, username, memberCount, enabled) using an active Telegram client.
+    """
+    from db import engine, GroupDb, AccountDb, Session, select
+    import asyncio
+    import random
+    logs = []
+    logs.append("开始从 Telegram 更新群组状态与成员数。")
 
-# Extracted analyze_group_category_with_ai
+    # 0. 重置 group_categories 表，确保系统内置分类为这四个新分类
+    try:
+        from sqlmodel import text
+        with Session(engine) as session:
+            session.exec(text("DELETE FROM group_categories"))
+            session.exec(text("INSERT INTO group_categories (name, company) VALUES ('中文长', 'rosepay')"))
+            session.exec(text("INSERT INTO group_categories (name, company) VALUES ('中文短', 'rosepay')"))
+            session.exec(text("INSERT INTO group_categories (name, company) VALUES ('英文长', 'rosepay')"))
+            session.exec(text("INSERT INTO group_categories (name, company) VALUES ('英文短', 'rosepay')"))
+            session.commit()
+            logs.append("已重置系统群组分类为：'中文长', '中文短', '英文长', '英文短'。")
+    except Exception as reset_err:
+        print(f"Failed to reset group categories: {reset_err}")
+        logs.append(f"重置系统内置分类失败 (将继续同步): {reset_err}")
+
+    # Get all account IDs of this user's company
+    with Session(engine) as session:
+        stmt = query_allowed_accounts(session, user)
+        allowed_account_ids = {a.id for a in filter_executable_accounts_for_task(session.exec(stmt).all())}
+        account_names = {a.id: (a.account_name or a.id) for a in session.exec(stmt).all()}
+
+    # 1. Get first active authorized client for the company
+    client = None
+    selected_account_id = None
+    for account_id, c in list(active_clients.items()):
+        if account_id in allowed_account_ids and c.is_connected() and await c.is_user_authorized():
+            client = c
+            selected_account_id = account_id
+            break
+
+    if not client:
+        # Check list of accounts to see if any can be connected and verified
+        from account_manager import list_accounts
+        accounts = list_accounts()
+        for path in accounts:
+            account_id = path.stem
+            if account_id not in allowed_account_ids:
+                continue
+            try:
+                c = await get_client(account_id)
+                if c.is_connected() and await c.is_user_authorized():
+                    client = c
+                    selected_account_id = account_id
+                    break
+            except Exception:
+                continue
+
+    if not client:
+        raise HTTPException(
+            status_code=400,
+            detail="检测到未登录任何电报账号。请先到“账号登录”页面成功登录一个账号后重试。"
+        )
+    logs.append(f"执行账号：{account_names.get(selected_account_id or '', selected_account_id or '未知账号')}，开始建立群组缓存。")
+
+    # 2. Load all groups for the company from DB
+    with Session(engine) as session:
+        if user["username"] in ("eason", "admin") or user["company"] == "admin":
+            groups = session.exec(select(GroupDb)).all()
+        else:
+            groups = session.exec(select(GroupDb).where(GroupDb.company == user["company"])).all()
+
+    if not groups:
+        return {"status": "success", "message": "群组列表为空，无需同步", "groups": [], "logs": logs}
+
+    # 3. Fetch all dialogs to build a local entity cache (fast lookups)
+    entities_map = {}
+    try:
+        async for dialog in client.iter_dialogs():
+            entity = dialog.entity
+            entities_map[str(entity.id)] = entity
+            if getattr(entity, "username", None):
+                entities_map[entity.username.lower()] = entity
+        logs.append(f"执行账号缓存建立完成：读取到 {len(entities_map)} 个可匹配实体。")
+    except Exception as e:
+        print(f"Failed to fetch dialogs for cache: {e}")
+        logs.append(f"执行账号建立实体缓存失败：{e}，后续将逐个解析。")
+
+    updated_count = 0
+    disabled_count = 0
+    invalid_groups = []
+    total_groups = len(groups)
+
+    # We will update groups one by one
+    with Session(engine) as session:
+        for index, group in enumerate(groups, start=1):
+            entity = None
+            is_valid = True
+            original_title = group.title
+            logs.append(f"[{index}/{total_groups}] 开始检测群组：{group.title or group.id}，执行账号：{account_names.get(selected_account_id or '', selected_account_id or '未知账号')}。")
+
+            # Check if this is a private invite link group
+            if group.id and group.id.startswith("invite_"):
+                invite_hash = group.id.replace("invite_", "")
+                try:
+                    invite = await client(functions.messages.CheckChatInviteRequest(hash=invite_hash))
+                    if isinstance(invite, types.ChatInviteAlready):
+                        entity = invite.chat
+                    else:
+                        # ChatInvite - valid but not joined yet
+                        group.title = invite.title
+                        group.memberCount = invite.participants_count
+                        group.type = "channel" if invite.broadcast else "group"
+                        scores = apply_group_library_scores(group, is_valid=True)
+                        session.add(group)
+                        updated_count += 1
+                        logs.append(f"[{index}/{total_groups}] 私密邀请群有效：{group.title}，成员数 {group.memberCount or 0}，基础评分 {scores['quality_score']}。")
+                        continue
+                except Exception as invite_err:
+                    print(f"Check invite link failed for {group.id}: {invite_err}")
+                    logs.append(f"[{index}/{total_groups}] 私密邀请群检测失败：{group.title or group.id}，原因：{invite_err}。")
+                    is_valid = False
+
+            # Try to find in cache first
+            if is_valid and not entity:
+                entity = entities_map.get(group.id)
+                if not entity and group.username:
+                    entity = entities_map.get(group.username.lower())
+
+            # If not in cache, try to resolve via API
+            if is_valid and not entity:
+                try:
+                    if group.username:
+                        entity = await client.get_entity(group.username)
+                    else:
+                        # Try to resolve by ID
+                        clean_id = None
+                        try:
+                            clean_id = int(group.id)
+                        except ValueError:
+                            pass
+
+                        if clean_id is not None:
+                            try:
+                                # Try channel/supergroup peer first, then chat peer
+                                if group.type in ("channel", "supergroup"):
+                                    entity = await client.get_entity(types.PeerChannel(clean_id))
+                                else:
+                                    entity = await client.get_entity(types.PeerChat(clean_id))
+                            except Exception:
+                                # Fallback to direct integer if peer types fail
+                                try:
+                                    entity = await client.get_entity(clean_id)
+                                except Exception:
+                                    entity = None
+                        else:
+                            # Fallback to resolving group.id directly
+                            try:
+                                entity = await client.get_entity(group.id)
+                            except Exception:
+                                entity = None
+                except Exception as get_err:
+                    print(f"Could not resolve group {group.id} ({group.title}): {get_err}")
+                    logs.append(f"[{index}/{total_groups}] 解析群组失败：{group.title or group.id}，原因：{get_err}。")
+                    is_valid = False
+
+            if is_valid and entity:
+                # We found the entity! Update properties
+                try:
+                    group.title = getattr(entity, "title", group.title) or group.title
+                    group.username = getattr(entity, "username", group.username) or ""
+                    group.type = "channel" if getattr(entity, "broadcast", False) else "group"
+                    if getattr(entity, "megagroup", False):
+                        group.type = "supergroup"
+                    participants_count = getattr(entity, "participants_count", None)
+                    if participants_count is not None:
+                        group.memberCount = participants_count
+
+                    # === 核心增加：跑消息分析，将广告分类划归为 "中文长", "中文短", "英文长", "英文短" ===
+                    try:
+                        import re
+                        input_peer = await client.get_input_entity(entity)
+                        msgs = await client.get_messages(input_peer, limit=10)
+
+                        # 1. 判定字数限制
+                        msg_lengths = [len(m.message) for m in msgs if m.message]
+                        is_short_ad = False
+                        if msg_lengths:
+                            max_len = max(msg_lengths)
+                            if max_len < 200:
+                                is_short_ad = True
+
+                        # 2. 判定语言 (中英文)，综合考虑群名和活跃发言
+                        has_chinese_name = False
+                        g_title = getattr(entity, "title", "") or ""
+                        if g_title:
+                            has_chinese_name = bool(re.search(r"[\u4e00-\u9fa5]", g_title)) or "🇨🇳" in g_title
+
+                        text_messages = [m.message for m in msgs if m.message]
+                        has_messages = len(text_messages) > 0
+                        combined_text = "".join(text_messages)
+                        has_chinese_messages = bool(re.search(r"[\u4e00-\u9fa5]", combined_text))
+
+                        is_chinese = False
+                        if has_messages:
+                            if has_chinese_messages:
+                                is_chinese = True
+                        else:
+                            if has_chinese_name:
+                                is_chinese = True
+
+                        # 3. 决定新的 category
+                        if is_chinese:
+                            if is_short_ad:
+                                new_cat = "中文短"
+                            else:
+                                new_cat = "中文长"
+                        else:
+                            if is_short_ad:
+                                new_cat = "英文短"
+                            else:
+                                new_cat = "英文长"
+
+                        group.category = new_cat
+                        logs.append(f"[{index}/{total_groups}] 群组分类重构：'{group.title}' -> 判定为 '{new_cat}' (字数: {'短' if is_short_ad else '长'}, 语言: {'中文' if is_chinese else '英文'})")
+                    except Exception as cat_err:
+                        # 优雅退化
+                        g_title = getattr(entity, "title", "") or ""
+                        has_chinese_name = bool(re.search(r"[\u4e00-\u9fa5]", g_title)) or "🇨🇳" in g_title
+                        new_cat = "中文长" if has_chinese_name else "英文长"
+                        group.category = new_cat
+                        logs.append(f"[{index}/{total_groups}] 拉取消息判定失败，退回名字判定：'{group.title}' -> 判定为 '{new_cat}'，原因：{cat_err}")
+
+                    scores = apply_group_library_scores(group, is_valid=True)
+                    session.add(group)
+                    updated_count += 1
+                    logs.append(f"[{index}/{total_groups}] 检测成功并重分类：{original_title} -> {group.title}，用户名 @{group.username or '-'}，类型 {group.type}，成员数 {group.memberCount or 0}，基础评分 {scores['quality_score']}。")
+                except Exception as update_err:
+                    print(f"Error updating properties for {group.id}: {update_err}")
+                    logs.append(f"[{index}/{total_groups}] 更新群组属性失败：{group.title or group.id}，原因：{update_err}。")
+                    is_valid = False
+            elif not entity and (not group.id or not group.id.startswith("invite_")):
+                is_valid = False
+
+            if not is_valid:
+                # Entity not found and cannot be resolved -> Directly delete from DB (遇到失效群组直接删掉)
+                invalid_groups.append({
+                    "id": group.id,
+                    "title": group.title,
+                    "username": group.username
+                })
+                session.delete(group)
+                disabled_count += 1
+                logs.append(f"[{index}/{total_groups}] 检测到群组已失效，已从群组库中物理删除：{group.title or group.id}。")
+
+            if index < total_groups:
+                wait_seconds = random.randint(0, 1)
+                logs.append(f"[{index}/{total_groups}] 等待 {wait_seconds} 秒后继续检测下一个群组。")
+                if wait_seconds:
+                    await asyncio.sleep(wait_seconds)
+
+        session.commit()
+
+    logs.append(f"状态同步结束：检测 {total_groups} 个群组，更新 {updated_count} 个，本次禁用 {disabled_count} 个，失效 {len(invalid_groups)} 个。")
+    return {
+        "status": "success",
+        "updated_count": updated_count,
+        "disabled_count": disabled_count,
+        "invalid_groups": invalid_groups,
+        "logs": logs,
+        "groups": load_groups(user["company"])
+    }
+
+async def analyze_group_category_with_ai(title: str, description: str, recent_msgs: list, user_permissions_str: str) -> dict:
+    """
+    使用系统配置中的 DeepSeek 或 Gemini API，对群组的语言、长短、活跃度、有效性及风控程度进行智能分类和诊断评估。
+    结合了最近 10 条消息的时间跨度和发送间隔作为物理指标。
+    """
+    import requests
+    import json
+    import re
+    from datetime import datetime, timezone
+
+    # 动态获取系统中的 API 密钥
+    deepseek_api_key = get_deepseek_api_key()
+    gemini_api_key = get_gemini_api_key()
+
+    # 提取纯文本列表
+    messages_text = [m.text for m in recent_msgs if m.text]
+
+    # 计算消息时间差与活跃指标
+    time_metrics_str = "【近期消息时间分析】: 暂无消息时间指标"
+    avg_interval_mins = 9999.0
+    latest_age_hours = 9999.0
+
+    if len(recent_msgs) >= 2:
+        first_date = recent_msgs[0].date
+        last_date = recent_msgs[-1].date
+
+        total_span_secs = (first_date - last_date).total_seconds()
+        avg_interval_mins = (total_span_secs / (len(recent_msgs) - 1)) / 60.0
+
+        now_utc = datetime.now(timezone.utc)
+        latest_age_hours = (now_utc - first_date).total_seconds() / 3600.0
+
+        time_metrics_str = f"【近期消息时间分析】:\n"
+        time_metrics_str += f"- 最新一条消息发送时间: {first_date.strftime('%Y-%m-%d %H:%M:%S')} UTC (距今约 {latest_age_hours:.2f} 小时)\n"
+        time_metrics_str += f"- 最近 {len(recent_msgs)} 条消息时间总跨度: {total_span_secs/3600.0:.2f} 小时\n"
+        time_metrics_str += f"- 消息平均发送间隔: {avg_interval_mins:.2f} 分钟/条"
+    elif len(recent_msgs) == 1:
+        first_date = recent_msgs[0].date
+        now_utc = datetime.now(timezone.utc)
+        latest_age_hours = (now_utc - first_date).total_seconds() / 3600.0
+        time_metrics_str = f"【近期消息时间分析】:\n- 仅有 1 条消息，发送时间: {first_date.strftime('%Y-%m-%d %H:%M:%S')} UTC (距今约 {latest_age_hours:.2f} 小时)"
+
+    # 格式化消息样本
+    formatted_msgs = []
+    for idx, msg in enumerate(messages_text, 1):
+        clean_msg = str(msg).replace("\n", " ").strip()[:100]
+        formatted_msgs.append(f"{idx}. {clean_msg}")
+    messages_str = "\n".join(formatted_msgs) if formatted_msgs else "(暂无近期文字消息)"
+
+    prompt = f"""
+你是一个专业的电报群发拓客与风控分析 AI。请根据以下电报群组的元数据、近期消息、发言权限及物理时间分析，进行全方位智能判定。
+
+群组基本信息：
+- 标题: {title}
+- 描述/简介: {description}
+- 当前账号在群内的发言权限: {user_permissions_str}
+
+消息样本物理时间指标：
+{time_metrics_str}
+
+最新 10 条消息样本：
+{messages_str}
+
+【判定规则（极为重要，请严格遵守）】
+1. 语言与类型判定 (category)：
+   - 必须是以下四种分类之一：["中文长", "中文短", "英文长", "英文短"]。
+   - 语言标准：如果群内大部分消息是中文，则为中文；如果是英文、印地语、或者其他拼音文字，则为英文。
+   - 长短标准：
+     - 若群员主要发布排版工整、大段文字、多段业务详情/通道介绍的复杂文案（字数多，超过 150 字符），判定为 "长"。
+     - 若群员多发布零散交流、极简短语、单句需求（如 "need yes bank", "来卡", "15s"），判定为 "短"。
+     - 如果群内几乎没有消息或以简短消息为主，优先归为 "短"。
+2. 活跃度判定 (is_active)：
+   - 必须参考“消息样本物理时间指标”：
+     - 如果最新消息距今小于 24 小时，且最近 10 条消息的平均发送间隔在数小时内，判定为 true（活跃群）。
+     - 如果最新消息距今超过 48 小时，或者 10 条消息的时间跨度跨越了数天甚至数周，判定为 false（死群/不活跃）。
+3. 有效性判定 (is_valid)：
+   - 若是活跃的跑分群、卡商群、OTC承兑群、博彩推广群，即为 true（对我们营销有价值）；若全是无价值乱码、死群、完全无互动的死号灌水，为 false。
+4. 易封禁风控判定 (is_highly_moderated)：
+   - 若群内有防垃圾 Bot（如 GHClone2Bot, RemoveHyperlinkBot, fangzhangBot）频繁发出警告、删除提示，或者当前账号在群内“已被禁言”，为 true；否则为 false。
+5. 理由 (reason)：
+   - 用一句简短的中文（35字以内）说明判定依据（必须包含时间间隔及分类原因，如：“英文短群，最新消息1小时前，平均15分钟一条，极活跃”）。
+
+你必须严格且仅返回以下 JSON 格式（不要包含 markdown ``` 代码块包装，直接返回 JSON 对象）：
+{{
+  "category": "中文长" | "中文短" | "英文长" | "英文短",
+  "is_active": true | false,
+  "is_valid": true | false,
+  "is_highly_moderated": true | false,
+  "reason": "判定依据简述"
+}}
+"""
+
+    # 1. 优先使用 DeepSeek
+    if deepseek_api_key:
+        try:
+            url = "https://api.deepseek.com/chat/completions"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {deepseek_api_key}"
+            }
+            body = {
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant that outputs JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                "response_format": {
+                    "type": "json_object"
+                }
+            }
+            response = requests.post(url, json=body, headers=headers, timeout=15)
+            if response.status_code == 200:
+                res_json = response.json()
+                text = res_json["choices"][0]["message"]["content"].strip()
+                return json.loads(text)
+        except Exception as e:
+            print(f"[AI Sync] DeepSeek analysis failed: {e}")
+
+    # 2. 兜底使用 Gemini
+    if gemini_api_key:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_api_key}"
+            body = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "responseMimeType": "application/json"
+                }
+            }
+            response = requests.post(url, json=body, timeout=15)
+            if response.status_code == 200:
+                res_data = response.json()
+                text = res_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                return json.loads(text)
+        except Exception as e:
+            print(f"[AI Sync] Gemini analysis failed: {e}")
+
+    # 3. 如果 API Key 均不可用，进行本地高精度正则兜底
+    # 统计汉字和英文字符比例
+    content_sample = (title + " " + " ".join(messages_text)).strip()
+    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', content_sample))
+    english_words = len(re.findall(r'[a-zA-Z]+', content_sample))
+
+    lang = "中文" if chinese_chars * 2 > english_words else "英文"
+
+    # 判定长短：是否有消息大于 120 字符
+    has_long = any(len(str(m)) > 120 for m in messages_text)
+    length = "长" if has_long else "短"
+
+    is_active = len(messages_text) >= 3
+    is_valid = len(messages_text) > 0
+
+    return {
+        "category": f"{lang}{length}",
+        "is_active": is_active,
+        "is_valid": is_valid,
+        "is_highly_moderated": False,
+        "reason": "本地正则兜底 analysis"
+    }
 
 
-# Extracted stream_groups_sync
+@app.get("/api/groups/sync-stream")
+async def stream_groups_sync(token: Optional[str] = None):
+    """Foreground group sync with realtime SSE logs for the UI execution modal."""
+    user = get_user_from_stream_token(token)
+
+    async def event_generator():
+        from db import engine, GroupDb, AccountDb, Session, select
+        from sync_folder_groups import collect_records
+        import asyncio
+        import random
+
+        sync_data = {
+            "status": "success",
+            "synced_count": 0,
+            "added_count": 0,
+            "skipped_count": 0,
+            "errors": [],
+        }
+        status_data = {
+            "status": "success",
+            "updated_count": 0,
+            "disabled_count": 0,
+            "invalid_groups": [],
+        }
+
+        def log(message: str) -> str:
+            return format_sse("log", {"message": message})
+
+        try:
+            yield log("已跳过账号聊天文件夹同步，直接对系统后台维护的群组执行检测与 AI 分类诊断。")
+            yield log("开始从 Telegram 更新群组状态、成员数与基础评分。")
+
+            with Session(engine) as session:
+                stmt = query_allowed_accounts(session, user)
+                allowed_accounts = filter_executable_accounts_for_task(session.exec(stmt).all())
+                allowed_account_ids = {a.id for a in allowed_accounts}
+                account_names = {a.id: (a.account_name or a.id) for a in allowed_accounts}
+
+            client = None
+            selected_account_id = None
+            for account_id, c in list(active_clients.items()):
+                if account_id in allowed_account_ids and c.is_connected() and await c.is_user_authorized():
+                    client = c
+                    selected_account_id = account_id
+                    break
+
+            if not client:
+                from account_manager import list_accounts
+                accounts = list_accounts()
+                for path in accounts:
+                    account_id = path.stem
+                    if account_id not in allowed_account_ids:
+                        continue
+                    try:
+                        c = await get_client(account_id)
+                        if c.is_connected() and await c.is_user_authorized():
+                            client = c
+                            selected_account_id = account_id
+                            break
+                    except Exception:
+                        continue
+
+            if not client:
+                yield format_sse("sync_error", {"message": "检测到未登录任何电报账号。请先到“账号登录”页面成功登录一个账号后重试。"})
+                return
+
+            selected_account_label = account_names.get(selected_account_id or "", selected_account_id or "未知账号")
+            yield log(f"执行账号：{selected_account_label}，开始建立群组缓存。")
+
+            with Session(engine) as session:
+                if user["username"] in ("eason", "admin") or user["company"] == "admin":
+                    groups = session.exec(select(GroupDb)).all()
+                else:
+                    groups = session.exec(select(GroupDb).where(GroupDb.company == user["company"])).all()
+
+            if not groups:
+                status_data["groups"] = []
+                yield log("群组列表为空，无需同步。")
+                yield format_sse("done", {"syncData": sync_data, "statusData": status_data, "groups": []})
+                return
+
+            entities_map = {}
+            try:
+                async for dialog in client.iter_dialogs():
+                    entity = dialog.entity
+                    entities_map[str(entity.id)] = entity
+                    if getattr(entity, "username", None):
+                        entities_map[entity.username.lower()] = entity
+                yield log(f"执行账号缓存建立完成：读取到 {len(entities_map)} 个可匹配实体。")
+            except Exception as e:
+                yield log(f"执行账号建立实体缓存失败：{e}，后续将逐个解析。")
+
+            total_groups = len(groups)
+            with Session(engine) as session:
+                for index, group in enumerate(groups, start=1):
+                    entity = None
+                    is_valid = True
+                    original_title = group.title
+                    yield log(f"[{index}/{total_groups}] 开始检测群组：{group.title or group.id}，执行账号：{selected_account_label}。")
+
+                    if group.id and group.id.startswith("invite_"):
+                        invite_hash = group.id.replace("invite_", "")
+                        try:
+                            invite = await client(functions.messages.CheckChatInviteRequest(hash=invite_hash))
+                            if isinstance(invite, types.ChatInviteAlready):
+                                entity = invite.chat
+                            else:
+                                group.title = invite.title
+                                group.memberCount = invite.participants_count
+                                group.type = "channel" if invite.broadcast else "group"
+                                scores = apply_group_library_scores(group, is_valid=True)
+                                session.add(group)
+                                status_data["updated_count"] += 1
+                                yield log(f"[{index}/{total_groups}] 私密邀请群有效：{group.title}，成员数 {group.memberCount or 0}，基础评分 {scores['quality_score']}。")
+                                if index < total_groups:
+                                    wait_seconds = random.randint(0, 1)
+                                    yield log(f"[{index}/{total_groups}] 等待 {wait_seconds} 秒后继续检测下一个群组。")
+                                    if wait_seconds:
+                                        await asyncio.sleep(wait_seconds)
+                                continue
+                        except Exception as invite_err:
+                            yield log(f"[{index}/{total_groups}] 私密邀请群检测失败：{group.title or group.id}，原因：{invite_err}。")
+                            is_valid = False
+
+                    if is_valid and not entity:
+                        entity = entities_map.get(group.id)
+                        if not entity and group.username:
+                            entity = entities_map.get(group.username.lower())
+
+                    if is_valid and not entity:
+                        try:
+                            if group.username:
+                                entity = await client.get_entity(group.username)
+                            else:
+                                clean_id = None
+                                try:
+                                    clean_id = int(group.id)
+                                except ValueError:
+                                    pass
+
+                                if clean_id is not None:
+                                    try:
+                                        if group.type in ("channel", "supergroup"):
+                                            entity = await client.get_entity(types.PeerChannel(clean_id))
+                                        else:
+                                            entity = await client.get_entity(types.PeerChat(clean_id))
+                                    except Exception:
+                                        try:
+                                            entity = await client.get_entity(clean_id)
+                                        except Exception:
+                                            entity = None
+                                else:
+                                    try:
+                                        entity = await client.get_entity(group.id)
+                                    except Exception:
+                                        entity = None
+                        except Exception as get_err:
+                            yield log(f"[{index}/{total_groups}] 解析群组失败：{group.title or group.id}，原因：{get_err}。")
+                            is_valid = False
+
+                    if is_valid and entity:
+                        try:
+                            group.title = getattr(entity, "title", group.title) or group.title
+                            group.username = getattr(entity, "username", group.username) or ""
+                            group.type = "channel" if getattr(entity, "broadcast", False) else "group"
+                            if getattr(entity, "megagroup", False):
+                                group.type = "supergroup"
+                            participants_count = getattr(entity, "participants_count", None)
+                            if participants_count is not None:
+                                group.memberCount = participants_count
+                            # 0. 过滤并忽略个人账号 (User)，防止爬取个人私聊
+                            from telethon.tl.types import User
+                            if isinstance(entity, User):
+                                yield log(f"[{index}/{total_groups}] 忽略个人账号：{original_title} (ID: {group.id} 为个人私聊，非群组/频道)。")
+                                group.enabled = False
+                                apply_group_library_scores(group, is_valid=False)
+                                session.add(group)
+                                session.commit()
+                                continue
+
+                            # 1. 尝试获取最近 10 条消息作为 AI 分析样本
+                            recent_msgs = []
+                            try:
+                                recent_msgs = await client.get_messages(entity, limit=10)
+                            except Exception as msg_err:
+                                print(f"[AI Sync] 获取群消息失败: {msg_err}")
+
+                            # 2. 获取当前账号在该群的发言权限状态
+                            perms_str = "正常"
+                            try:
+                                perms = await client.get_permissions(entity, 'me')
+                                if perms.has_left:
+                                    perms_str = "账号已不在该群内 (未加入/被踢出)"
+                                elif not perms.can_send_messages:
+                                    perms_str = "账号已被该群禁言"
+                            except Exception as perm_err:
+                                if "UserNotParticipant" in type(perm_err).__name__:
+                                    perms_str = "账号未加入该群 (非成员)"
+                                else:
+                                    perms_str = f"获取权限异常: {perm_err}"
+
+                            # 3. 调用 AI 智能进行分类诊断与风控评估
+                            yield log(f"[{index}/{total_groups}] 正在请 AI 智能评估群组「{original_title}」的历史消息与风控...")
+                            ai_res = await analyze_group_category_with_ai(group.title, getattr(entity, "about", "") or "", recent_msgs, perms_str)
+
+                            # 4. 应用 AI 评估结论更新群组属性
+                            if ai_res:
+                                old_cat = group.category
+                                group.category = ai_res.get("category", group.category)
+
+                                # 根据 AI 的有效性判定决定是否启用
+                                is_group_valid = bool(ai_res.get("is_valid", True))
+                                group.enabled = is_group_valid
+
+                                # 写入 AI 的判定日志到弹窗流中
+                                yield log(f"[{index}/{total_groups}] AI 评估 ➔ 类型: {group.category} | 活跃: {ai_res.get('is_active')} | 有效: {group.enabled} | 依据: {ai_res.get('reason')}")
+                                if ai_res.get("is_highly_moderated"):
+                                    yield log(f"  ⚠️ 警告：该群被检测为高风控群组，可能存在严密风控 Bot 或处于禁言状态！")
+                            else:
+                                yield log(f"[{index}/{total_groups}] AI 评估失败，使用本地兜底算法。")
+
+                            scores = apply_group_library_scores(group, is_valid=group.enabled)
+                            session.add(group)
+                            status_data["updated_count"] += 1
+                            yield log(f"[{index}/{total_groups}] 检测成功：{original_title} -> {group.title}，用户名 @{group.username or '-'}，类型 {group.type}，成员数 {group.memberCount or 0}，最终分类 【{group.category}】，基础评分 {scores['quality_score']}。")
+                        except Exception as update_err:
+                            yield log(f"[{index}/{total_groups}] 更新群组属性失败：{group.title or group.id}，原因：{update_err}。")
+                            is_valid = False
+                    elif not entity and (not group.id or not group.id.startswith("invite_")):
+                        is_valid = False
+
+                    if not is_valid:
+                        status_data["invalid_groups"].append({
+                            "id": group.id,
+                            "title": group.title,
+                            "username": group.username
+                        })
+                        if group.enabled:
+                            group.enabled = False
+                            status_data["disabled_count"] += 1
+                        apply_group_library_scores(group, is_valid=False)
+                        session.add(group)
+                        yield log(f"[{index}/{total_groups}] 检测失败并标记禁用：{group.title or group.id}，评分 0 / 疑似失效。")
+
+                    session.commit()
+
+                    if index < total_groups:
+                        wait_seconds = random.randint(0, 1)
+                        yield log(f"[{index}/{total_groups}] 等待 {wait_seconds} 秒后继续检测下一个群组。")
+                        if wait_seconds:
+                            await asyncio.sleep(wait_seconds)
+
+            status_data["groups"] = load_groups(user["company"])
+            yield log(f"状态同步结束：检测 {total_groups} 个群组，更新 {status_data['updated_count']} 个，本次禁用 {status_data['disabled_count']} 个，失效 {len(status_data['invalid_groups'])} 个。")
+            yield format_sse("done", {
+                "syncData": sync_data,
+                "statusData": status_data,
+                "groups": status_data["groups"],
+            })
+        except Exception as e:
+            yield format_sse("sync_error", {"message": f"同步执行异常：{type(e).__name__}: {e}"})
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 def map_telegram_error(e: Exception, default_msg: str) -> str:
@@ -6227,9 +6843,173 @@ def classify_group_category_from_text(title: str, messages: List[str]) -> str:
         return "中文短" if is_short_ad else "中文长"
     return "英文短" if is_short_ad else "英文长"
 
-# Extracted classify_group_category_for_import
+async def classify_group_category_for_import(client, entity, fallback_title: str, fallback_category: Optional[str] = None) -> str:
+    valid_categories = {"中文长", "中文短", "英文长", "英文短"}
+    if fallback_category in valid_categories:
+        default_category = fallback_category
+    else:
+        default_category = classify_group_category_from_text(fallback_title or "", [])
+    if not entity:
+        return default_category
+    try:
+        input_peer = await client.get_input_entity(entity)
+        msgs = await client.get_messages(input_peer, limit=10)
+        return classify_group_category_from_text(
+            getattr(entity, "title", fallback_title) or fallback_title or "",
+            [getattr(m, "message", "") or "" for m in msgs],
+        )
+    except Exception:
+        return default_category
 
-# Extracted resolve_group
+@app.post("/api/groups/resolve", response_model=GroupModel)
+async def resolve_group(req: GroupResolveRequest, user: dict = Depends(get_current_user)):
+    # Get all account IDs of this user's company
+    from db import engine, AccountDb, Session, select
+    with Session(engine) as session:
+        stmt = query_allowed_accounts(session, user)
+        allowed_account_ids = {a.id for a in filter_executable_accounts_for_task(session.exec(stmt).all())}
+
+    # 1. Get first authorized client
+    client = None
+    for account_id, c in list(active_clients.items()):
+        if account_id in allowed_account_ids and c.is_connected() and await c.is_user_authorized():
+            client = c
+            break
+
+    if not client:
+        # Check list of accounts to see if any can be connected and verified
+        from account_manager import list_accounts
+        accounts = list_accounts()
+        for path in accounts:
+            account_id = path.stem
+            if account_id not in allowed_account_ids:
+                continue
+            try:
+                c = await get_client(account_id)
+                if c.is_connected() and await c.is_user_authorized():
+                    client = c
+                    break
+            except Exception:
+                continue
+
+    if not client:
+        raise HTTPException(
+            status_code=400,
+            detail="检测到未登录任何电报账号。请先到“账号登录”页面成功登录一个账号后重试。"
+        )
+
+    link = req.link.strip()
+    if not link:
+        raise HTTPException(status_code=400, detail="群组链接不能为空")
+
+    import re
+    invite_hash = None
+    private_match = re.search(r'(?:t\.me|telegram\.me)/(?:joinchat/|\+)?([a-zA-Z0-9_\-]{5,32})', re.sub(r"^https?:/*", "", link, flags=re.IGNORECASE))
+    if private_match and ("joinchat/" in link or "+" in link):
+        invite_hash = private_match.group(1)
+
+    if invite_hash:
+        try:
+            invite = await client(functions.messages.CheckChatInviteRequest(hash=invite_hash))
+            if isinstance(invite, types.ChatInviteAlready):
+                chat = invite.chat
+                chat_type = "channel" if getattr(chat, "broadcast", False) else "group"
+                member_count = getattr(chat, "participants_count", 0) or 0
+                res_data = {
+                    "id": str(chat.id),
+                    "title": chat.title,
+                    "username": getattr(chat, "username", "") or "",
+                    "type": chat_type,
+                    "memberCount": member_count,
+                    "enabled": True,
+                    "category": classify_group_category_from_text(chat.title, []),
+                    "price": req.price or 0.0
+                }
+            else: # ChatInvite
+                chat_type = "channel" if invite.broadcast else "group"
+                res_data = {
+                    "id": f"invite_{invite_hash}",
+                    "title": invite.title,
+                    "username": "",
+                    "type": chat_type,
+                    "memberCount": invite.participants_count,
+                    "enabled": True,
+                    "category": classify_group_category_from_text(invite.title, []),
+                    "price": req.price or 0.0
+                }
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=map_telegram_error(e, "解析私有邀请链接失败"))
+    else:
+        # Public username, link, or ID
+        identifier = normalize_group_identifier(link)
+
+        # Handle numeric ID
+        if isinstance(identifier, str) and (identifier.isdigit() or (identifier.startswith("-") and identifier[1:].isdigit())):
+            identifier = int(identifier)
+
+        try:
+            entity = await client.get_entity(identifier)
+            if isinstance(entity, types.User):
+                raise HTTPException(status_code=400, detail="该链接指向的是个人账户，群组库只允许添加群组或频道。")
+
+            chat_type = "channel" if getattr(entity, "broadcast", False) else "group"
+
+            # Get participant count
+            member_count = 0
+            try:
+                if isinstance(entity, types.Chat):
+                    full_chat = await client(functions.messages.GetFullChatRequest(chat_id=entity.id))
+                else:
+                    full_chat = await client(functions.channels.GetFullChannelRequest(channel=entity))
+
+                if hasattr(full_chat, "full_chat") and hasattr(full_chat.full_chat, "participants_count"):
+                    member_count = full_chat.full_chat.participants_count
+                elif hasattr(full_chat, "chats") and len(full_chat.chats) > 0:
+                    member_count = getattr(full_chat.chats[0], "participants_count", 0) or 0
+            except Exception:
+                member_count = getattr(entity, "participants_count", 0) or 0
+
+            res_data = {
+                "id": str(entity.id),
+                "title": getattr(entity, "title", ""),
+                "username": getattr(entity, "username", "") or "",
+                "type": chat_type,
+                "memberCount": member_count,
+                "enabled": True,
+                "category": await classify_group_category_for_import(client, entity, getattr(entity, "title", ""), req.category),
+                "price": req.price or 0.0
+            }
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=map_telegram_error(e, "无法解析该群组/频道标识符"))
+
+    # 3. Add to database if not already there
+    from db import engine, GroupDb, Session, select
+    with Session(engine) as session:
+        db_group = find_group_by_username_or_id(
+            session,
+            res_data.get("id"),
+            res_data.get("username"),
+            user["company"],
+        )
+        if db_group:
+            raise HTTPException(status_code=400, detail=f"群组/频道 '{res_data['title']}' 已在列表中，无需重复添加")
+
+        new_db_group = GroupDb(
+            id=str(res_data["id"]),
+            company=user["company"],
+            title=res_data.get("title", ""),
+            username=res_data.get("username", ""),
+            type=res_data.get("type", "group"),
+            enabled=res_data.get("enabled", True),
+            memberCount=res_data.get("memberCount", 0),
+            category=res_data.get("category", "中文广告"),
+            price=res_data.get("price", 0.0),
+            created_by=user["username"],
+            updated_by=user["username"]
+        )
+        session.add(new_db_group)
+        session.commit()
+    return res_data
 
 async def update_account_name_from_tg(account_id: str, client):
     """Automatically updates AccountDb.account_name with the Telegram profile name if it is currently just a phone number or empty."""
@@ -8416,9 +9196,24 @@ def save_scraper_config(keywords: List[str], min_members: int, max_pages: int, c
 init_keywords, init_min_members, init_max_pages, init_continuous, init_interval_minutes = load_scraper_config()
 
 # Global task states keyed by company
-# Removed variable active_scraper_tasks
+active_scraper_tasks = {}
 
-# Extracted get_company_scraper_task
+def get_company_scraper_task(company: str) -> dict:
+    if company not in active_scraper_tasks:
+        init_keywords, init_min_members, init_max_pages, init_continuous, init_interval_minutes = load_scraper_config()
+        active_scraper_tasks[company] = {
+            "status": "idle",  # 'idle', 'running', 'completed', 'failed', 'stopped'
+            "progress": {"current": 0, "total": 0},
+            "logs": [],
+            "error": None,
+            "keywords": init_keywords,
+            "min_members": init_min_members,
+            "max_pages": init_max_pages,
+            "continuous": init_continuous,
+            "interval_minutes": init_interval_minutes,
+            "account_id": None
+        }
+    return active_scraper_tasks[company]
 
 class StartExpansionRequest(BaseModel):
     target_desc: str
@@ -8429,27 +9224,466 @@ class StartExpansionRequest(BaseModel):
     groups_per_round: Optional[int] = 10
     round_interval_minutes: Optional[int] = 5
 
-# Extracted load_expansion_config
+def load_expansion_config() -> tuple[str, int]:
+    config_path = Path(__file__).resolve().parent / "config.json"
+    default_target = "在印度当地的生活聊天群（交友、生活交流）以及 OTC/USDT/支付相关的专业群中拓展业务"
+    default_interval = 15
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            target = data.get("expansion_target", default_target)
+            interval = data.get("expansion_interval", default_interval)
+            return target, interval
+        except Exception:
+            pass
+    return default_target, default_interval
 
-# Extracted save_expansion_config
+def save_expansion_config(target: str, interval: int):
+    config_path = Path(__file__).resolve().parent / "config.json"
+    data = {}
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            pass
+    data["expansion_target"] = target
+    data["expansion_interval"] = interval
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Failed to save expansion config: {e}")
 
 init_target, init_interval = load_expansion_config()
 
 # Global expansion task states keyed by company
-# Removed variable active_expansion_tasks
+active_expansion_tasks = {}
 
-# Extracted get_company_expansion_task
+def get_company_expansion_task(company: str) -> dict:
+    if company not in active_expansion_tasks:
+        init_target, init_interval = load_expansion_config()
+        active_expansion_tasks[company] = {
+            "status": "idle",  # 'idle', 'running', 'paused', 'failed'
+            "target_desc": init_target,
+            "current_keyword": "",
+            "logs": [],
+            "error": None,
+            "interval_minutes": init_interval,
+            "account_id": None
+        }
+    return active_expansion_tasks[company]
 
 
-# Extracted get_gemini_api_key
+def get_gemini_api_key() -> str:
+    config_path = Path(__file__).resolve().parent / "config.json"
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("gemini_api_key", "")
+        except Exception:
+            pass
+    return ""
 
-# Extracted save_gemini_api_key
+def save_gemini_api_key(key: str):
+    config_path = Path(__file__).resolve().parent / "config.json"
+    data = {}
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            pass
+    data["gemini_api_key"] = key
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Failed to save gemini_api_key: {e}")
 
-# Extracted get_deepseek_api_key
+def get_deepseek_api_key() -> str:
+    config_path = Path(__file__).resolve().parent / "config.json"
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("deepseek_api_key", "")
+        except Exception:
+            pass
+    return ""
 
-# Extracted save_deepseek_api_key
+def save_deepseek_api_key(key: str):
+    config_path = Path(__file__).resolve().parent / "config.json"
+    data = {}
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            pass
+    data["deepseek_api_key"] = key
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Failed to save deepseek_api_key: {e}")
 
-# Extracted run_group_scraping_task
+async def run_group_scraping_task(
+    keywords: List[str],
+    min_members: int,
+    max_pages: int,
+    company: str,
+    continuous: bool = False,
+    interval_minutes: int = 30,
+    auto_join: bool = False,
+    auto_join_min_score: int = 70,
+    max_rounds: Optional[int] = None,
+    groups_per_round: int = 10,
+    round_interval_minutes: int = 5,
+    owner_username: Optional[str] = None
+):
+    current_round = 1
+    from datetime import datetime
+    active_scraper_task = get_company_scraper_task(company)
+    scraper_task_id = f"scraper:{company}"
+    release_account_task_usage(scraper_task_id, source="scraper-task-reset")
+    active_scraper_task["status"] = "running"
+    active_scraper_task["progress"] = {"current": 0, "total": 0}
+    active_scraper_task["logs"] = []
+    active_scraper_task["error"] = None
+
+    def log(msg):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        active_scraper_task["logs"].append(f"[{timestamp}] {msg}")
+        print(f"[ScrapeTask] {msg}")
+
+    try:
+        gemini_api_key = get_gemini_api_key()
+        deepseek_api_key = get_deepseek_api_key()
+        if not gemini_api_key and not deepseek_api_key:
+            log("错误: 未配置 AI API Key，请先在配置中保存您的 API Key（支持 Gemini 或 DeepSeek）。")
+            active_scraper_task["status"] = "failed"
+            active_scraper_task["error"] = "未配置 AI API Key"
+            return
+
+        while active_scraper_task["status"] == "running":
+            log(f"开始搜群任务 [第 {current_round} 轮]。目标保存群组数: {groups_per_round} 个 | 最少成员数: {min_members}")
+
+            added_this_round = 0
+            history_skip_count = 0
+            member_skip_count = 0
+            fetch_fail_count = 0
+
+            # Step 1: Find a healthy, authorized Telegram account under this company
+            from db import engine, AccountDb, Session, select, ScrapedGroupDb, GroupDb, GroupCategoryDb
+
+            authorized_account_id = None
+            authorized_phone = None
+            active_scraper_task["account_id"] = None
+
+            with Session(engine) as session:
+                if owner_username:
+                    from sqlmodel import or_
+                    stmt_acc = select(AccountDb).where(
+                        or_(AccountDb.owner_username == owner_username, AccountDb.created_by == owner_username)
+                    )
+                else:
+                    stmt_acc = select(AccountDb).where(AccountDb.company == company)
+                accounts = filter_executable_accounts_for_task(session.exec(stmt_acc).all())
+
+            for acc in accounts:
+                try:
+                    cl = await get_client(acc.id)
+                    if await cl.is_user_authorized():
+                        authorized_account_id = acc.id
+                        authorized_phone = acc.account_name
+                        break
+                except Exception:
+                    pass
+
+            if not authorized_account_id:
+                log("错误: 当前公司下没有可用的、已授权在线的电报账号，无法进行群消息获取。请至少登录一个账号！")
+                active_scraper_task["status"] = "failed"
+                active_scraper_task["error"] = "没有可在线 of 电报账号进行解析"
+                return
+
+            active_scraper_task["account_id"] = authorized_account_id
+            register_account_task_usage(
+                "scraper",
+                scraper_task_id,
+                [authorized_account_id],
+                {"company": company, "owner_username": owner_username},
+            )
+            log(f"使用账号 [{authorized_phone}] 进行群组消息抓取 and 解析...")
+            client = await get_client(authorized_account_id)
+
+            current_page = 0
+            max_safety_pages = 30
+            exhausted = False
+
+            while added_this_round < groups_per_round and current_page < max_safety_pages:
+                if active_scraper_task["status"] != "running":
+                    break
+
+                log(f"正在搜寻第 {current_page + 1} 页的潜在公开群组链接 (当前本轮已保存: {added_this_round}/{groups_per_round}) ...")
+                from group_scraper import scrape_links_by_keywords_for_page, fetch_group_messages, analyze_group_with_gemini, analyze_group_with_deepseek, calculate_scraped_group_metrics
+
+                links = scrape_links_by_keywords_for_page(keywords, current_page)
+
+                if not links:
+                    log(f"第 {current_page + 1} 页未找到任何潜在链接，搜索引擎结果已耗尽。")
+                    exhausted = True
+                    break
+
+                log(f"第 {current_page + 1} 页搜寻结束，共找到 {len(links)} 个潜在链接。开始进行提取与分析...")
+
+                active_scraper_task["progress"]["total"] = len(links)
+
+                for idx, link in enumerate(links):
+                    if active_scraper_task["status"] != "running":
+                        break
+                    if added_this_round >= groups_per_round:
+                        break
+
+                    active_scraper_task["progress"]["current"] = idx + 1
+
+                    # Extract username
+                    public_match = re.search(r'(?:t\.me|telegram\.me)/(?:joinchat/|\+)?([a-zA-Z0-9_\+]{5,32})', link)
+                    if not public_match:
+                        continue
+
+                    username = public_match.group(1)
+
+                    # Deduplication check
+                    with Session(engine) as session:
+                        existing = session.get(ScrapedGroupDb, username)
+                    if existing:
+                        log(f"  [排重] 跳过历史已存在重复群组: @{username}")
+                        history_skip_count += 1
+                        continue
+
+                    # Check if this is a joinchat/private hash
+                    if "joinchat/" in link or "+" in link:
+                        log(f"  [过滤] 跳过私有加群链接: {link}")
+                        continue
+
+                    log(f"  正在免加群提取群组信息: @{username} ...")
+                    res = await fetch_group_messages(client, username)
+                    if not res.get("success"):
+                        err_msg = res.get("error", "")
+                        log(f"  获取群 @{username} 失败: {err_msg}")
+                        if "FloodWait" in err_msg or "wait of" in err_msg:
+                            log(f"⚠️ [限制警告] 检测到当前电报账号已触发限制 (FloodWait): {err_msg}。为防止封号，已自动暂停搜群任务，请稍后再试。")
+                            active_scraper_task["status"] = "paused"
+                            active_scraper_task["error"] = f"触发电报限制: {err_msg}"
+                            break
+                        fetch_fail_count += 1
+                        await asyncio.sleep(4)
+                        continue
+
+                    title = res["title"]
+                    member_count = res["member_count"]
+                    messages = res["messages"]
+
+                    log(f"  获取成功! 标题: '{title}' | 成员数: {member_count}。")
+
+                    if member_count < min_members:
+                        log(f"  群成员数 ({member_count}) 低于最低成员数限制 ({min_members})。跳过。")
+                        member_skip_count += 1
+                        await asyncio.sleep(4)
+                        continue
+
+                    # Perform AI analysis
+                    analysis = None
+                    if deepseek_api_key:
+                        log("  正在交由 DeepSeek 进行智能属性与业务粘合度评估...")
+                        analysis = analyze_group_with_deepseek(deepseek_api_key, title, res.get("description", ""), messages, target_keywords=keywords)
+                        if (not analysis or analysis.get("relevance_score") is None) and gemini_api_key:
+                            log("  DeepSeek 评估失败或受限，尝试使用 Gemini 进行评估...")
+                            analysis = analyze_group_with_gemini(gemini_api_key, title, res.get("description", ""), messages, target_keywords=keywords)
+                    elif gemini_api_key:
+                        log("  正在交由 Gemini 进行智能属性与业务粘合度评估...")
+                        analysis = analyze_group_with_gemini(gemini_api_key, title, res.get("description", ""), messages, target_keywords=keywords)
+
+                    if not analysis:
+                        analysis = {
+                            "category": "unknown",
+                            "relevance_score": None,
+                            "analysis_summary": "未配置或调用 AI 接口失败，使用本地兜底计算",
+                            "recommendation": "请在配置中保存有效的 AI 密钥"
+                        }
+
+                    category = analysis.get("category", "unknown")
+                    relevance = analysis.get("relevance_score")
+                    summary = analysis.get("analysis_summary", "")
+                    recom = analysis.get("recommendation", "")
+
+                    # Compute Python metrics and combined quality score
+                    metrics = calculate_scraped_group_metrics(member_count, messages, keywords, api_relevance_score=relevance, group_type=res.get("group_type", "group"), is_dead=res.get("is_dead", False))
+                    score = metrics["quality_score"]
+
+                    log(f"  AI/Python 评估结果 -> 分类: {category} | 综合评分: {score}")
+
+                    # Save/Update in DB
+                    with Session(engine) as session:
+                        db_group = session.get(ScrapedGroupDb, username)
+                        if not db_group:
+                            db_group = ScrapedGroupDb(
+                                id=username,
+                                title=title,
+                                link=f"https://t.me/{username}",
+                                member_count=member_count,
+                                category=category,
+                                quality_score=score,
+                                analysis_summary=f"{summary} | 建议: {recom}",
+                                keyword=keywords[0] if keywords else "",
+                                company=company,
+                                group_type=res.get("group_type", "group"),
+                                is_active=res.get("is_active", True),
+                                is_dead=res.get("is_dead", False),
+                                relevance_score=metrics["relevance_score"],
+                                activity_score=metrics["activity_score"],
+                                engagement_score=metrics["engagement_score"],
+                                spam_penalty=metrics["spam_penalty"]
+                            )
+                        else:
+                            db_group.title = title
+                            db_group.member_count = member_count
+                            db_group.category = category
+                            db_group.quality_score = score
+                            db_group.analysis_summary = f"{summary} | 建议: {recom}"
+                            db_group.keyword = keywords[0] if keywords else ""
+                            db_group.group_type = res.get("group_type", "group")
+                            db_group.is_active = res.get("is_active", True)
+                            db_group.is_dead = res.get("is_dead", False)
+                            db_group.relevance_score = metrics["relevance_score"]
+                            db_group.activity_score = metrics["activity_score"]
+                            db_group.engagement_score = metrics["engagement_score"]
+                            db_group.spam_penalty = metrics["spam_penalty"]
+                            db_group.created_at = datetime.utcnow()
+                        session.add(db_group)
+                        session.commit()
+
+                    # Save GroupDb record (Auto save)
+                    if auto_join and score >= auto_join_min_score and category != "spam":
+                        log(f"  [自动保存] 评分 {score} 符合门槛 {auto_join_min_score}，自动保存至群组库...")
+                        category_mapping = {
+                            "life": "生活聊天",
+                            "business": "广告同行",
+                            "spam": "垃圾/灌水",
+                            "unknown": "待测/私有"
+                        }
+                        group_category = category_mapping.get(category, "待测/私有")
+
+                        is_duplicate = False
+                        with Session(engine) as session:
+                            stmt_dup = select(GroupDb).where(GroupDb.company == company)
+                            for g_item in session.exec(stmt_dup).all():
+                                if g_item.username and g_item.username.strip('@').lower() == username.lower():
+                                    is_duplicate = True
+                                    break
+                                if g_item.title and g_item.title.strip() == title.strip():
+                                    is_duplicate = True
+                                    break
+
+                        if is_duplicate:
+                            log(f"  [自动保存] 触发排重：群组 @{username} 已存在于主群组库中，跳过。")
+                        else:
+                            try:
+                                with Session(engine) as session:
+                                    existing_cat = session.exec(
+                                        select(GroupCategoryDb)
+                                        .where(GroupCategoryDb.company == company)
+                                        .where(GroupCategoryDb.name == group_category)
+                                    ).first()
+                                    if not existing_cat:
+                                        new_cat = GroupCategoryDb(name=group_category, company=company)
+                                        session.add(new_cat)
+                                        session.commit()
+
+                                group_id_str = username
+                                group_type_str = res.get("group_type", "group")
+                                try:
+                                    entity = await client.get_entity(username)
+                                    if entity:
+                                        group_id_str = str(entity.id)
+                                        group_type_str = "channel" if getattr(entity, 'broadcast', False) else "group"
+                                except Exception as ee:
+                                    log(f"  [自动保存] 获取实体ID失败: {ee}")
+
+                                if group_type_str == "channel":
+                                    log(f"  [自动保存] 检测到 @{username} 是频道，触发‘频道不自动保存’规则，跳过。")
+                                else:
+                                    with Session(engine) as session:
+                                        db_g = GroupDb(
+                                            id=group_id_str,
+                                            company=company,
+                                            title=title,
+                                            username=username,
+                                            type=group_type_str,
+                                            enabled=True,
+                                            memberCount=member_count,
+                                            category=group_category
+                                        )
+                                        session.merge(db_g)
+                                        session.commit()
+                                    log(f"  [自动保存] 自动保存群组成功: @{username} (分类: {group_category})")
+                                    added_this_round += 1
+
+                                    with Session(engine) as session:
+                                        db_group = session.get(ScrapedGroupDb, username)
+                                        if db_group:
+                                            db_group.status = "joined"
+                                            session.add(db_group)
+                                            session.commit()
+                            except Exception as se:
+                                log(f"  [自动保存] 自动保存失败: {str(se)}")
+                    else:
+                        if not auto_join:
+                            added_this_round += 1
+
+                    await asyncio.sleep(5)
+
+                current_page += 1
+
+            # Summary report at the end of each round
+            log("阶段性搜寻分析汇报：")
+            log(f"- 本轮已搜寻并处理的新增/更新群组: {added_this_round}/{groups_per_round} 个")
+            log(f"- 跳过历史已存在重复群组: {history_skip_count} 个")
+            log(f"- 跳过成员数不达标群组: {member_skip_count} 个")
+            log(f"- 跳过消息提取失败群组: {fetch_fail_count} 个")
+
+            if exhausted:
+                log("由于所有搜索页面均已被穷尽，本轮搜寻提前结束。")
+
+            if max_rounds is not None and current_round >= max_rounds:
+                log(f"已达到最大限制轮数 {max_rounds} 轮，任务正常结束。")
+                break
+
+            if not continuous:
+                break
+
+            log(f"本轮任务完成。休眠 {interval_minutes} 分钟后继续搜寻新群组...")
+            current_round += 1
+            for _ in range(interval_minutes * 60):
+                if active_scraper_task["status"] != "running":
+                    break
+                await asyncio.sleep(1)
+
+        if active_scraper_task["status"] != "stopped":
+            log("搜群与分析任务全部完成！")
+            active_scraper_task["status"] = "completed"
+
+    except Exception as e:
+        import traceback
+        err_msg = f"任务运行异常: {str(e)}\n{traceback.format_exc()}"
+        log(err_msg)
+        active_scraper_task["status"] = "failed"
+        active_scraper_task["error"] = str(e)
+    finally:
+        release_account_task_usage(scraper_task_id, source="scraper-task-finish")
 
 @app.post("/api/config/gemini")
 def update_gemini_config(req: GeminiApiKeyRequest, user: dict = Depends(get_current_user)):
@@ -8662,7 +9896,336 @@ def batch_action_scraped_groups(req: ScrapedGroupsBatchActionRequest, user: dict
 
 # --- BUSINESS EXPANSION AUTONOMOUS AGENT ---
 
-# Extracted run_business_expansion_loop
+async def run_business_expansion_loop(
+    target_desc: str,
+    interval_minutes: int,
+    company: str,
+    auto_join: bool = False,
+    auto_join_min_score: int = 70,
+    max_rounds: Optional[int] = None,
+    groups_per_round: int = 10,
+    round_interval_minutes: int = 5
+):
+    current_round = 1
+    added_this_round = 0
+    active_expansion_task = get_company_expansion_task(company)
+    expansion_task_id = f"expansion:{company}"
+    release_account_task_usage(expansion_task_id, source="expansion-task-reset")
+    active_expansion_task["status"] = "running"
+    active_expansion_task["target_desc"] = target_desc
+    active_expansion_task["interval_minutes"] = interval_minutes
+    active_expansion_task["error"] = None
+
+    def log(msg):
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%m-%d %H:%M:%S")
+        active_expansion_task["logs"].append(f"[{timestamp}] {msg}")
+        # Keep logs size reasonable (last 500 lines)
+        if len(active_expansion_task["logs"]) > 500:
+            active_expansion_task["logs"] = active_expansion_task["logs"][-500:]
+        print(f"[ExpandAgent] {msg}")
+
+    log(f"业务拓展自主 Agent 已启动。目标: '{target_desc}'，循环间隔: {interval_minutes} 分钟")
+
+    try:
+        from group_scraper import (
+            generate_keyword_with_gemini,
+            generate_keyword_with_deepseek,
+            scrape_links_by_keywords,
+            fetch_group_messages,
+            analyze_group_with_gemini,
+            analyze_group_with_deepseek,
+            calculate_scraped_group_metrics
+        )
+        from db import engine, AccountDb, ScrapedGroupDb, GroupDb, Session, select
+        from datetime import datetime
+        import random
+
+        while active_expansion_task["status"] in ("running", "paused"):
+            if active_expansion_task["status"] == "paused":
+                await asyncio.sleep(5)
+                continue
+
+            gemini_api_key = get_gemini_api_key()
+            deepseek_api_key = get_deepseek_api_key()
+            if not gemini_api_key and not deepseek_api_key:
+                log("错误: 未配置 AI API Key，请先保存您的 API Key 后启动 Agent。")
+                active_expansion_task["status"] = "failed"
+                active_expansion_task["error"] = "未配置 AI API Key"
+                break
+
+            # 1. Gather previously searched keywords from DB to avoid duplication
+            with Session(engine) as session:
+                stmt = select(ScrapedGroupDb.keyword).where(ScrapedGroupDb.company == company).distinct()
+                searched = list(session.exec(stmt).all())
+                searched = [s for s in searched if s]
+
+            log("正在请 AI 构思下一步搜寻的关键词...")
+            res_kw = None
+            if gemini_api_key:
+                res_kw = generate_keyword_with_gemini(gemini_api_key, active_expansion_task.get("target_desc", target_desc), searched)
+            elif deepseek_api_key:
+                res_kw = generate_keyword_with_deepseek(deepseek_api_key, active_expansion_task.get("target_desc", target_desc), searched)
+
+            if not res_kw:
+                res_kw = {"keyword": "", "reasoning": "未配置有效的 AI 密钥"}
+
+            kw = res_kw.get("keyword", "").strip()
+            reason = res_kw.get("reasoning", "未提供理由").strip()
+
+            if not kw:
+                log(f"AI 构思关键词失败或为空。原因: {reason}。将在 2 分钟后重试...")
+                await asyncio.sleep(120)
+                continue
+
+            active_expansion_task["current_keyword"] = kw
+            log(f"[AI 思考结论] 决定搜寻关键词: '{kw}'")
+            log(f"[AI 思考逻辑] {reason}")
+
+            # 2. Scrape group links using combined scraper
+            log(f"正在抓取关键词 '{kw}' 相关的电报群链接...")
+            active_expansion_task["account_id"] = None
+            links = scrape_links_by_keywords([kw], max_pages=1)
+            log(f"抓取完成。共找到 {len(links)} 个潜在公开群链接。")
+
+            if not links:
+                log("此轮未找到合适的新链接，等待下一个周期。")
+            else:
+                # 3. Find online authorized account under this company
+                authorized_account_id = None
+                authorized_phone = None
+                with Session(engine) as session:
+                    accounts = filter_executable_accounts_for_task(session.exec(select(AccountDb).where(AccountDb.company == company)).all())
+
+                for acc in accounts:
+                    try:
+                        cl = await get_client(acc.id)
+                        if await cl.is_user_authorized():
+                            authorized_account_id = acc.id
+                            authorized_phone = acc.account_name
+                            break
+                    except Exception:
+                        pass
+
+                if not authorized_account_id:
+                    log("警告: 当前公司下没有在线已登录的电报账号！无法拉取群消息进行评估，此轮跳过。")
+                else:
+                    active_expansion_task["account_id"] = authorized_account_id
+                    register_account_task_usage(
+                        "expansion",
+                        expansion_task_id,
+                        [authorized_account_id],
+                        {"company": company},
+                    )
+                    log(f"使用账号 [{authorized_phone}] 进行群组消息拉取与 AI 质量评估...")
+                    client = await get_client(authorized_account_id)
+
+                    # 4. Iterate and analyze
+                    for idx, link in enumerate(links):
+                        if active_expansion_task["status"] != "running":
+                            break
+
+                        # Extract public username
+                        public_match = re.search(r'(?:t\.me|telegram\.me)/(?:joinchat/|\+)?([a-zA-Z0-9_\+]{5,32})', link)
+                        if not public_match or "joinchat/" in link or "+" in link:
+                            # Skip private links
+                            continue
+
+                        username = public_match.group(1)
+
+                        # Check if this group was already analyzed in database
+                        with Session(engine) as session:
+                            existing = session.get(ScrapedGroupDb, username)
+                        if existing and existing.category != "unknown":
+                            # Already processed
+                            continue
+
+                        log(f"正在拉取群组 @{username} 的详情与消息...")
+                        fetch_res = await fetch_group_messages(client, username)
+
+                        if not fetch_res.get("success"):
+                            err_msg = fetch_res.get("error", "")
+                            log(f"  拉取群组 @{username} 消息失败: {err_msg}")
+                            if "FloodWait" in err_msg or "wait of" in err_msg:
+                                log(f"⚠️ [限制警告] 检测到当前电报账号已触发限制 (FloodWait): {err_msg}。为防止封号，已自动暂停业务拓展任务，请稍后再试。")
+                                active_expansion_task["status"] = "paused"
+                                active_expansion_task["error"] = f"触发电报限制: {err_msg}"
+                                break
+                            await asyncio.sleep(4)
+                            continue
+
+                        title = fetch_res["title"]
+                        member_count = fetch_res["member_count"]
+                        messages = fetch_res["messages"]
+
+                        log(f"  拉取成功。标题: '{title}' | 成员数: {member_count}。提交 AI 进行质量打分...")
+
+                        # Run AI analysis (Prioritize DeepSeek, fallback to Gemini, then local)
+                        analysis = None
+                        if deepseek_api_key:
+                            analysis = analyze_group_with_deepseek(deepseek_api_key, title, fetch_res.get("description", ""), messages, target_keywords=[kw], target_desc=target_desc)
+                            if (not analysis or analysis.get("relevance_score") is None) and gemini_api_key:
+                                log("  DeepSeek 评估失败，尝试使用 Gemini 进行评估...")
+                                analysis = analyze_group_with_gemini(gemini_api_key, title, fetch_res.get("description", ""), messages, target_keywords=[kw], target_desc=target_desc)
+                        elif gemini_api_key:
+                            analysis = analyze_group_with_gemini(gemini_api_key, title, fetch_res.get("description", ""), messages, target_keywords=[kw], target_desc=target_desc)
+
+                        if not analysis:
+                            analysis = {
+                                "category": "unknown",
+                                "relevance_score": None,
+                                "analysis_summary": "未配置或调用 AI 接口失败，使用本地兜底计算",
+                                "recommendation": "请在配置中保存有效的 AI 密钥"
+                            }
+
+                        category = analysis.get("category", "unknown")
+                        relevance = analysis.get("relevance_score") # can be None
+                        summary = analysis.get("analysis_summary", "")
+                        recom = analysis.get("recommendation", "")
+
+                        # Compute Python metrics and combined quality score
+                        metrics = calculate_scraped_group_metrics(member_count, messages, [kw], api_relevance_score=relevance, group_type=fetch_res.get("group_type", "group"), is_dead=fetch_res.get("is_dead", False))
+                        score = metrics["quality_score"]
+
+                        log(f"  AI/Python 评估结果 -> 分类: {category} | 粘合度: {metrics['relevance_score']} | 活跃度: {metrics['activity_score']} | 互动率: {metrics['engagement_score']} | 垃圾扣分: {metrics['spam_penalty']} | 综合评分: {score}")
+
+                        # Save in database
+                        with Session(engine) as session:
+                            db_group = session.get(ScrapedGroupDb, username)
+                            if not db_group:
+                                db_group = ScrapedGroupDb(
+                                    id=username,
+                                    title=title,
+                                    link=f"https://t.me/{username}",
+                                    member_count=member_count,
+                                    category=category,
+                                    quality_score=score,
+                                    analysis_summary=f"{summary} | 建议: {recom}",
+                                    keyword=kw,
+                                    company=company,
+                                    group_type=fetch_res.get("group_type", "group"),
+                                    is_active=fetch_res.get("is_active", True),
+                                    is_dead=fetch_res.get("is_dead", False),
+                                    relevance_score=metrics["relevance_score"],
+                                    activity_score=metrics["activity_score"],
+                                    engagement_score=metrics["engagement_score"],
+                                    spam_penalty=metrics["spam_penalty"]
+                                )
+                            else:
+                                db_group.title = title
+                                db_group.member_count = member_count
+                                db_group.category = category
+                                db_group.quality_score = score
+                                db_group.analysis_summary = f"{summary} | 建议: {recom}"
+                                db_group.keyword = kw
+                                db_group.group_type = fetch_res.get("group_type", "group")
+                                db_group.is_active = fetch_res.get("is_active", True)
+                                db_group.is_dead = fetch_res.get("is_dead", False)
+                                db_group.relevance_score = metrics["relevance_score"]
+                                db_group.activity_score = metrics["activity_score"]
+                                db_group.engagement_score = metrics["engagement_score"]
+                                db_group.spam_penalty = metrics["spam_penalty"]
+                            session.add(db_group)
+                            session.commit()
+
+                        # --- AUTO JOIN & SAFETY WIND CONTROL ---
+                        if auto_join and score >= auto_join_min_score and category != "spam":
+                            if fetch_res.get("group_type") == "channel":
+                                log(f"  [加群控制] 检测到 @{username} 是频道，触发‘频道不自动加入’规则，跳过。")
+                            # 1. Round Wind Control Check
+                            elif max_rounds is not None and current_round > max_rounds:
+                                log(f"  [加群控制] 已达到最大限制轮数 {max_rounds} 轮，不执行对 @{username} 的加群操作。")
+                            else:
+                                # 2. Local Database Deduplication Check
+                                from db import GroupDb
+                                is_duplicate = False
+                                with Session(engine) as session:
+                                    # Check by username, title, or internal group ID
+                                    stmt_dup = select(GroupDb).where(GroupDb.company == company)
+                                    for g_item in session.exec(stmt_dup).all():
+                                        # Compare username
+                                        if g_item.username and g_item.username.strip('@').lower() == username.lower():
+                                            is_duplicate = True
+                                            break
+                                        # Compare title
+                                        if g_item.title and g_item.title.strip() == title.strip():
+                                            is_duplicate = True
+                                            break
+
+                                if is_duplicate:
+                                    log(f"  [加群控制] 触发排重机制跳过：群组 @{username} ('{title}') 已存在于群组库中，不往下执行。")
+                                else:
+                                    # 3. Check if we need to sleep due to round limit
+                                    if added_this_round >= groups_per_round:
+                                        log(f"  [加群控制] 当前第 {current_round} 轮已成功添加 {added_this_round} 个群组，达到单轮上限。进入休眠间隔...")
+                                        log(f"  [加群控制] 轮次休眠间隔: {round_interval_minutes} 分钟，暂停加群进程。")
+                                        # Sleep safely in chunks to allow quick termination
+                                        for _ in range(round_interval_minutes * 60):
+                                            if active_expansion_task["status"] != "running":
+                                                break
+                                            await asyncio.sleep(1)
+                                        # Move to next round
+                                        current_round += 1
+                                        added_this_round = 0
+                                        log(f"  [加群控制] 休眠结束，进入第 {current_round} 轮。")
+
+                                    # Double check max_rounds after potential sleep round increments
+                                    if max_rounds is None or current_round <= max_rounds:
+                                        if active_expansion_task["status"] == "running":
+                                            log(f"  [加群控制] 开始自动加入群组 @{username} ...")
+                                            try:
+                                                # Invoke join_group_or_channel directly (takes client and username/link)
+                                                entity = await join_group_or_channel(client, username)
+                                                log(f"  [加群控制] 自动加入成功: @{username}")
+                                                added_this_round += 1
+
+                                                # Save to GroupDb
+                                                from db import GroupDb
+                                                with Session(engine) as session:
+                                                    db_g = GroupDb(
+                                                        id=str(entity.id),
+                                                        company=company,
+                                                        title=title,
+                                                        username=username,
+                                                        type="channel" if getattr(entity, 'broadcast', False) else "group",
+                                                        enabled=True,
+                                                        memberCount=member_count,
+                                                        category="自动加群"
+                                                    )
+                                                    session.merge(db_g)
+                                                    session.commit()
+
+                                                # Mark scraped status as joined
+                                                with Session(engine) as session:
+                                                    db_group = session.get(ScrapedGroupDb, username)
+                                                    if db_group:
+                                                        db_group.status = "joined"
+                                                        session.add(db_group)
+                                                        session.commit()
+                                            except Exception as je:
+                                                log(f"  [加群控制] 自动加入失败: {str(je)}")
+
+                        # Avoid Telegram rate limits
+                        await asyncio.sleep(5)
+
+            # Sleep for the interval
+            current_interval = active_expansion_task.get("interval_minutes", interval_minutes)
+            log(f"此轮自主搜群拓展完成。休眠 {current_interval} 分钟后继续...")
+            for _ in range(current_interval * 60):
+                if active_expansion_task["status"] != "running":
+                    break
+                await asyncio.sleep(1)
+
+        log("自主业务拓展任务已终止。")
+
+    except Exception as e:
+        import traceback
+        err_msg = f"自主业务拓展循环异常: {str(e)}\n{traceback.format_exc()}"
+        log(err_msg)
+        active_expansion_task["status"] = "failed"
+        active_expansion_task["error"] = str(e)
+    finally:
+        release_account_task_usage(expansion_task_id, source="expansion-task-finish")
 
 
 @app.post("/api/expansion/start")
@@ -8833,7 +10396,533 @@ def get_internal_bot_status():
 
 cleanup_tasks_progress: Dict[str, dict] = {}
 
-# Extracted run_account_cleanup_process
+async def run_account_cleanup_process(account_id: str):
+    import datetime
+    import re
+    from datetime import timezone
+
+    progress = {
+        "status": "running",
+        "started_at": time.time(),
+        "logs": [],
+        "left_groups": 0,
+        "grouped_channels": 0,
+        "synced_dms": 0,
+        "archived_chats": 0
+    }
+    failed_folders = set()
+    cleanup_tasks_progress[account_id] = progress
+
+    def log(msg):
+        print(f"[{account_id} Cleanup] {msg}")
+        progress["logs"].append(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+    log("初始化账号整理任务...")
+
+    client = None
+    try:
+        # 获取 Telethon 客户端，必须在 locks 保护内获取以防写冲突
+        if account_id not in client_locks:
+            client_locks[account_id] = asyncio.Lock()
+
+        async with client_locks[account_id]:
+            # 假定此时账号已经在线，如果没有连上，则临时 connect
+            client = active_clients.get(account_id)
+            if not client:
+                # 从配置加载并获取
+                config_path = account_config_path(account_id)
+                if not config_path.exists():
+                    raise Exception("Account config not found")
+                config = load_json(config_path)
+                base_dir = config_path.parent.parent
+                client = await build_client(config, base_dir)
+                await client.connect()
+                active_clients[account_id] = client
+
+            if not await client.is_user_authorized():
+                raise Exception("账号未授权登录，请先登录")
+
+            if not client.is_connected():
+                await client.connect()
+
+            # 获取翻译 Bot 和 AI Bot 的 InputPeer
+            ai_bot_username = "RosePayTest_bot"
+            translate_bot_username = "RosePay_translation_bot"
+            try:
+                db_path = get_db_path()
+                import sqlite3
+                with sqlite3.connect(db_path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT bot_username, bot_type FROM telegram_bots WHERE is_active = 1")
+                    for row in cursor.fetchall():
+                        if row["bot_type"] == "ai_bot":
+                            ai_bot_username = row["bot_username"]
+                        elif row["bot_type"] == "translate_bot":
+                            translate_bot_username = row["bot_username"]
+            except Exception as e:
+                log(f"查询数据库 bots 失败，使用默认值: {e}")
+
+            translate_bot_peer = None
+            ai_bot_peer = None
+            try:
+                if translate_bot_username:
+                    translate_bot_peer = await client.get_input_entity(translate_bot_username)
+            except Exception as e:
+                log(f"获取翻译 Bot '{translate_bot_username}' InputPeer 失败: {e}")
+
+            try:
+                if ai_bot_username:
+                    ai_bot_peer = await client.get_input_entity(ai_bot_username)
+            except Exception as e:
+                log(f"获取 AI Bot '{ai_bot_username}' InputPeer 失败: {e}")
+
+            # 开始获取会话列表
+            log("正在拉取对话列表...")
+            dialogs = await client.get_dialogs()
+            log(f"拉取完成。共发现 {len(dialogs)} 个对话窗口")
+
+            now_dt = datetime.datetime.now(timezone.utc)
+
+            # --- 第一阶段：清理不活跃群组 ---
+            log("=== 第一阶段：检测并退出不活跃群组 ===")
+            groups_to_cleanup = []
+            for dialog in dialogs:
+                if dialog.is_group or dialog.is_channel:
+                    is_megagroup = getattr(dialog.entity, 'megagroup', False) if dialog.is_channel else True
+                    if not is_megagroup and dialog.is_channel:
+                        # 排除纯频道，只清理群组
+                        continue
+
+                    last_msg_date = None
+                    if dialog.message and dialog.message.date:
+                        last_msg_date = dialog.message.date
+
+                    if last_msg_date:
+                        diff = now_dt - last_msg_date
+                        if diff.days >= 7:
+                            groups_to_cleanup.append(dialog)
+
+            log(f"共检测到 {len(groups_to_cleanup)} 个超过 7 天无新发言的不活跃群组。")
+            for idx, g in enumerate(groups_to_cleanup):
+                try:
+                    log(f"({idx+1}/{len(groups_to_cleanup)}) 正在退出群组: {g.name} ...")
+                    if g.is_channel:
+                        await client(functions.channels.LeaveChannelRequest(channel=g.input_entity))
+                    else:
+                        await client(functions.messages.DeleteChatUserRequest(chat_id=g.id, user_id='self'))
+                    progress["left_groups"] += 1
+                    # 退出群组后静默 5 秒
+                    await asyncio.sleep(5)
+                except errors.FloodWaitError as fwe:
+                    log(f"遭遇 429 频限，需要等待 {fwe.seconds} 秒。中断后续退群操作。")
+                    auto_private_listener_cooldowns[account_id] = time.time() + fwe.seconds
+                    break
+                except Exception as e:
+                    log(f"退出群组 {g.name} 失败: {e}")
+                    await asyncio.sleep(2)
+
+            # 重新拉取一次 Dialog 列表，以排除已经退出的群
+            log("重新刷新对话列表以准备分类文件夹...")
+            dialogs = await client.get_dialogs()
+
+            # --- 第二阶段：分析字数与中英文，即时分配并写入文件夹 ---
+            log("=== 第二阶段：群组字数/语言特征判别、即时归类与文件夹写入 ===")
+
+            # 在第二阶段开始前，先清理所有旧的文件夹分类
+            log("正在清理云端旧的分类文件夹...")
+            try:
+                filters_res = await client(functions.messages.GetDialogFiltersRequest())
+                current_filters = filters_res.filters
+
+                old_titles_to_remove = ["中文广告群", "英文广告群", "短广告群", "DM", "中文长", "中文短", "英文长", "英文短"]
+                for f in current_filters:
+                    if isinstance(f, types.DialogFilter):
+                        f_title = getattr(f, "title", "")
+                        should_remove = False
+                        for ot in old_titles_to_remove:
+                            if normalize_title(f_title) == normalize_title(ot):
+                                should_remove = True
+                                break
+                        if should_remove:
+                            log(f"正在删除旧文件夹: '{f_title}' (ID: {f.id})")
+                            await client(functions.messages.UpdateDialogFilterRequest(id=f.id))
+                            await asyncio.sleep(1)
+            except Exception as e:
+                log(f"清理旧分类文件夹失败: {e}")
+
+            all_classified_peers = set() # 记录已命中规则的所有 Peer 引用，方便后续归档
+
+            # 归类群组
+            for idx, dialog in enumerate(dialogs):
+                if dialog.is_group or (dialog.is_channel and getattr(dialog.entity, 'megagroup', False)):
+                    try:
+                        # 拉取最近 10 条消息来判定发言限制和中英文
+                        msgs = await client.get_messages(dialog.input_entity, limit=10)
+                        await asyncio.sleep(2) # 每次拉取消息静默 2 秒
+
+                        if not msgs:
+                            continue
+
+                        # 1. 判定字数限制
+                        msg_lengths = [len(m.message) for m in msgs if m.message]
+                        is_short_ad = False
+                        if msg_lengths:
+                            max_len = max(msg_lengths)
+                            if max_len < 200:
+                                is_short_ad = True
+
+                        # 2. 判定语言 (中英文)，综合考虑群名和活跃发言
+                        has_chinese_name = False
+                        if dialog.name:
+                            has_chinese_name = bool(re.search(r"[\u4e00-\u9fa5]", dialog.name)) or "🇨🇳" in dialog.name
+
+                        text_messages = [m.message for m in msgs if m.message]
+                        has_messages = len(text_messages) > 0
+                        combined_text = "".join(text_messages)
+                        has_chinese_messages = bool(re.search(r"[\u4e00-\u9fa5]", combined_text))
+
+                        is_chinese = False
+                        if has_messages:
+                            # 活跃发言中必须包含中文，方可判定为中文群（起到了中英文的区别）
+                            if has_chinese_messages:
+                                is_chinese = True
+                        else:
+                            # 如果最近没有发言，降级使用群名判定
+                            if has_chinese_name:
+                                is_chinese = True
+
+                        input_peer = dialog.input_entity
+                        all_classified_peers.add(dialog.id)
+
+                        if is_chinese:
+                            if is_short_ad:
+                                title = "中文短"
+                            else:
+                                title = "中文长"
+                        else:
+                            if is_short_ad:
+                                title = "英文短"
+                            else:
+                                title = "英文长"
+
+                        log_info = f"群组: {dialog.name} | 判定类别: {title} | 字数: {'短' if is_short_ad else '长'} | 语言: {'中文' if is_chinese else '英文'}"
+                        log(log_info)
+
+                        if title in failed_folders:
+                            continue
+
+                        # 即时写入/更新 Telegram 文件夹
+                        try:
+                            filters_res = await client(functions.messages.GetDialogFiltersRequest())
+                            current_filters = filters_res.filters
+
+                            f_obj = None
+                            for f in current_filters:
+                                if isinstance(f, types.DialogFilter) and normalize_title(f.title) == normalize_title(title):
+                                    f_obj = f
+                                    break
+                            if not f_obj:
+                                existing_ids = [f.id for f in current_filters if hasattr(f, 'id')]
+                                new_id = max(existing_ids) + 1 if existing_ids else 2
+                                f_obj = types.DialogFilter(
+                                    id=new_id,
+                                    title=title,
+                                    include_peers=[],
+                                    exclude_peers=[],
+                                    pinned_peers=[],
+                                    contacts=False,
+                                    non_contacts=False,
+                                    groups=False,
+                                    broadcasts=False,
+                                    bots=False,
+                                    exclude_muted=False,
+                                    exclude_read=False,
+                                    exclude_archived=False
+                                )
+                                current_filters.append(f_obj)
+                                log(f"已新建文件夹: '{title}'")
+
+                            existing_peer_ids = []
+                            for p in f_obj.include_peers:
+                                p_id = getattr(p, 'user_id', None) or getattr(p, 'channel_id', None) or getattr(p, 'chat_id', None)
+                                if p_id:
+                                    existing_peer_ids.append(p_id)
+
+                            new_p_id = dialog.entity.id
+                            peer_obj = await client.get_input_entity(dialog.entity)
+
+                            if new_p_id and new_p_id not in existing_peer_ids:
+                                # 重新实例化一个全新的 DialogFilter，清洗所有的 include_peers/pinned_peers/exclude_peers
+                                updated_peers = list(f_obj.include_peers) + [peer_obj]
+                                clean_include = await clean_and_convert_peers_async(client, updated_peers)
+                                clean_pinned = await clean_and_convert_peers_async(client, getattr(f_obj, "pinned_peers", []) or [])
+                                clean_exclude = await clean_and_convert_peers_async(client, getattr(f_obj, "exclude_peers", []) or [])
+
+                                title_text = getattr(f_obj, "title", title)
+                                if isinstance(title_text, str):
+                                    title_obj = types.TextWithEntities(text=title_text, entities=[])
+                                else:
+                                    title_obj = title_text
+
+                                new_filter = types.DialogFilter(
+                                    id=f_obj.id,
+                                    title=title_obj,
+                                    pinned_peers=clean_pinned,
+                                    include_peers=clean_include,
+                                    exclude_peers=clean_exclude,
+                                    contacts=getattr(f_obj, "contacts", False),
+                                    non_contacts=getattr(f_obj, "non_contacts", False),
+                                    groups=getattr(f_obj, "groups", False),
+                                    broadcasts=getattr(f_obj, "broadcasts", False),
+                                    bots=getattr(f_obj, "bots", False)
+                                )
+                                await client(functions.messages.UpdateDialogFilterRequest(id=f_obj.id, filter=new_filter))
+                                log(f"已即时将群组 '{dialog.name}' 移入文件夹 '{title}'。")
+                                await asyncio.sleep(1)
+                        except Exception as fe:
+                            err_msg = str(fe)
+                            if "DIALOG_FILTERS_TOO_MUCH" in err_msg:
+                                failed_folders.add(title)
+                                log(f"账号文件夹数量已达 Telegram 上限，无法创建新文件夹 '{title}'，请手动清理一些不用的文件夹后再试。")
+                            else:
+                                log(f"即时移动群组 {dialog.name} 到文件夹 {title} 失败: {fe}")
+
+                        progress["grouped_channels"] += 1
+                    except errors.FloodWaitError as fwe:
+                        log(f"分析群组时遭遇 429 频限，需要等待 {fwe.seconds} 秒。跳过其余群递析。")
+                        auto_private_listener_cooldowns[account_id] = time.time() + fwe.seconds
+                        break
+                    except Exception as e:
+                        err_str = str(e)
+                        log(f"分析群组 {dialog.name} 异常: {e}")
+
+                        # 判定是否为失效群组，如果是则直接退群（删掉）
+                        is_invalid_group = False
+                        if any(k in err_str for k in [
+                            "CHANNEL_PRIVATE",
+                            "CHAT_WRITE_FORBIDDEN",
+                            "USER_BANNED_IN_CHANNEL",
+                            "CHAT_ADMIN_REQUIRED",
+                            "ChannelPrivateError",
+                            "ChatWriteForbiddenError"
+                        ]):
+                            is_invalid_group = True
+
+                        if is_invalid_group:
+                            try:
+                                log(f"检测到群组 '{dialog.name}' 已失效，正在执行退群物理删除...")
+                                if dialog.is_channel:
+                                    await client(functions.channels.LeaveChannelRequest(channel=dialog.input_entity))
+                                else:
+                                    await client(functions.messages.DeleteChatUserRequest(chat_id=dialog.id, user_id='self'))
+                                log(f"已成功退出并删除失效群组 '{dialog.name}'。")
+                                progress["left_groups"] += 1
+                                await asyncio.sleep(3)
+                            except Exception as le:
+                                log(f"退出失效群组 '{dialog.name}' 失败: {le}")
+
+            # --- 第三阶段：私聊同步 DM 文件夹 (即时同步) ---
+            log("=== 第三阶段：同步私聊窗口至 DM 文件夹 ===")
+            dm_count = 0
+            for dialog in dialogs:
+                if dialog.is_user and getattr(dialog.entity, 'bot', False) is False:
+                    try:
+                        all_classified_peers.add(dialog.id)
+
+                        if "DM" in failed_folders:
+                            continue
+
+                        filters_res = await client(functions.messages.GetDialogFiltersRequest())
+                        current_filters = filters_res.filters
+
+                        f_obj = None
+                        for f in current_filters:
+                            if isinstance(f, types.DialogFilter) and normalize_title(f.title) == normalize_title("DM"):
+                                f_obj = f
+                                break
+                        if not f_obj:
+                            existing_ids = [f.id for f in current_filters if hasattr(f, 'id')]
+                            new_id = max(existing_ids) + 1 if existing_ids else 2
+                            f_obj = types.DialogFilter(
+                                id=new_id,
+                                title="DM",
+                                include_peers=[],
+                                exclude_peers=[],
+                                pinned_peers=[],
+                                contacts=False,
+                                non_contacts=False,
+                                groups=False,
+                                broadcasts=False,
+                                bots=False,
+                                exclude_muted=False,
+                                exclude_read=False,
+                                exclude_archived=False
+                            )
+                            current_filters.append(f_obj)
+                            log("已新建文件夹: 'DM'")
+
+                        existing_peer_ids = []
+                        for p in f_obj.include_peers:
+                            p_id = getattr(p, 'user_id', None) or getattr(p, 'channel_id', None) or getattr(p, 'chat_id', None)
+                            if p_id:
+                                existing_peer_ids.append(p_id)
+
+                        new_p_id = dialog.entity.id
+                        peer_obj = await client.get_input_entity(dialog.entity)
+                        if new_p_id and new_p_id not in existing_peer_ids:
+                            # 重新实例化全新的 DialogFilter 并清洗
+                            updated_peers = list(f_obj.include_peers) + [peer_obj]
+                            clean_include = await clean_and_convert_peers_async(client, updated_peers)
+                            clean_pinned = await clean_and_convert_peers_async(client, getattr(f_obj, "pinned_peers", []) or [])
+                            clean_exclude = await clean_and_convert_peers_async(client, getattr(f_obj, "exclude_peers", []) or [])
+
+                            title_text = getattr(f_obj, "title", "DM")
+                            if isinstance(title_text, str):
+                                title_obj = types.TextWithEntities(text=title_text, entities=[])
+                            else:
+                                title_obj = title_text
+
+                            new_filter = types.DialogFilter(
+                                id=f_obj.id,
+                                title=title_obj,
+                                pinned_peers=clean_pinned,
+                                include_peers=clean_include,
+                                exclude_peers=clean_exclude,
+                                contacts=getattr(f_obj, "contacts", False),
+                                non_contacts=getattr(f_obj, "non_contacts", False),
+                                groups=getattr(f_obj, "groups", False),
+                                broadcasts=getattr(f_obj, "broadcasts", False),
+                                bots=getattr(f_obj, "bots", False)
+                            )
+                            await client(functions.messages.UpdateDialogFilterRequest(id=f_obj.id, filter=new_filter))
+                            log(f"已即时将私聊 '{dialog.name}' 移入文件夹 'DM'。")
+                            await asyncio.sleep(0.5)
+
+                        dm_count += 1
+                        progress["synced_dms"] = dm_count
+                    except Exception as fe:
+                        err_msg = str(fe)
+                        if "DIALOG_FILTERS_TOO_MUCH" in err_msg:
+                            failed_folders.add("DM")
+                            log("账号文件夹数量已达 Telegram 上限，无法创建新文件夹 'DM'，请手动清理一些不用的文件夹后再试。")
+                        else:
+                            log(f"同步私聊 {dialog.name} 失败: {fe}")
+
+            # --- 第五阶段：将所有整理命中会话进行“归档隐藏” ---
+            log("=== 第五阶段：批量隐藏归档会话 (Archive) ===")
+            peers_to_archive = []
+
+            for dialog in dialogs:
+                if dialog.id in all_classified_peers:
+                    if dialog.folder_id != 1:
+                        peers_to_archive.append(dialog)
+
+            if peers_to_archive:
+                log(f"共有 {len(peers_to_archive)} 个会话需要进行归档隐藏...")
+                for i in range(0, len(peers_to_archive), 20):
+                    batch = peers_to_archive[i:i+20]
+                    try:
+                        folder_peers = []
+                        for item in batch:
+                            folder_peers.append(types.InputFolderPeer(peer=item.input_entity, folder_id=1))
+                        log(f"正在将本批 {len(batch)} 个会话移动到归档夹...")
+                        await client(functions.folders.EditPeerFoldersRequest(folder_peers=folder_peers))
+                        progress["archived_chats"] += len(batch)
+                        await asyncio.sleep(3)
+                    except errors.FloodWaitError as fwe:
+                        log(f"归档操作遭遇 429 频限，需要等待 {fwe.seconds} 秒。中断后续归档。")
+                        auto_private_listener_cooldowns[account_id] = time.time() + fwe.seconds
+                        break
+                    except Exception as e:
+                        log(f"归档批量操作失败: {e}")
+                        await asyncio.sleep(2)
+            else:
+                log("没有检测到需要移动归档的非归档会话。")
+
+            # --- 第六阶段：确保翻译 Bot 存在于每一个分类文件夹中，并且置顶 ---
+            log("=== 第六阶段：将翻译 Bot 同步并置顶到每一个分类文件夹 ===")
+            if translate_bot_peer:
+                try:
+                    filters_res = await client(functions.messages.GetDialogFiltersRequest())
+                    current_filters = filters_res.filters
+
+                    # 4个我们要管理的文件夹名称
+                    target_folder_titles = ["中文长", "中文短", "英文长", "英文短"]
+
+                    for f_obj in current_filters:
+                        if isinstance(f_obj, types.DialogFilter):
+                            f_title = getattr(f_obj, "title", "")
+                            is_target = False
+                            for target_title in target_folder_titles:
+                                if normalize_title(f_title) == normalize_title(target_title):
+                                    is_target = True
+                                    break
+
+                            if is_target:
+                                # 清洗现有的 include/pinned/exclude
+                                clean_include = await clean_and_convert_peers_async(client, list(f_obj.include_peers) or [])
+                                clean_pinned = await clean_and_convert_peers_async(client, getattr(f_obj, "pinned_peers", []) or [])
+                                clean_exclude = await clean_and_convert_peers_async(client, getattr(f_obj, "exclude_peers", []) or [])
+
+                                t_user_id = getattr(translate_bot_peer, 'user_id', None)
+                                if t_user_id:
+                                    # 1. 确保翻译 Bot 存在于 include 中
+                                    exists_in_include = False
+                                    for p in clean_include:
+                                        if getattr(p, 'user_id', None) == t_user_id:
+                                            exists_in_include = True
+                                            break
+                                    if not exists_in_include:
+                                        clean_include.append(translate_bot_peer)
+
+                                    # 2. 确保翻译 Bot 在 pinned 中且在第一位
+                                    clean_pinned = [p for p in clean_pinned if getattr(p, 'user_id', None) != t_user_id]
+                                    clean_pinned.insert(0, translate_bot_peer)
+
+                                    # 构造更新后的 DialogFilter
+                                    title_text = getattr(f_obj, "title", f_title)
+                                    if isinstance(title_text, str):
+                                        title_obj = types.TextWithEntities(text=title_text, entities=[])
+                                    else:
+                                        title_obj = title_text
+
+                                    new_filter = types.DialogFilter(
+                                        id=f_obj.id,
+                                        title=title_obj,
+                                        pinned_peers=clean_pinned,
+                                        include_peers=clean_include,
+                                        exclude_peers=clean_exclude,
+                                        contacts=getattr(f_obj, "contacts", False),
+                                        non_contacts=getattr(f_obj, "non_contacts", False),
+                                        groups=getattr(f_obj, "groups", False),
+                                        broadcasts=getattr(f_obj, "broadcasts", False),
+                                        bots=getattr(f_obj, "bots", False)
+                                    )
+                                    await client(functions.messages.UpdateDialogFilterRequest(id=f_obj.id, filter=new_filter))
+                                    log(f"已将翻译 Bot 置顶并同步到文件夹 '{f_title}'。")
+                                    await asyncio.sleep(1)
+                except Exception as fe:
+                    log(f"同步/置顶翻译 Bot 到分类文件夹失败: {fe}")
+
+            # --- 第七阶段：把 aibot 在主文件夹（默认会话列表）置顶 ---
+            if ai_bot_peer:
+                try:
+                    log(f"正在将 AI Bot '{ai_bot_username}' 置顶在主文件夹...")
+                    await client(functions.messages.ToggleDialogPinRequest(
+                        peer=ai_bot_peer,
+                        pinned=True
+                    ))
+                    log(f"AI Bot '{ai_bot_username}' 置顶在主文件夹成功。")
+                except Exception as e:
+                    log(f"置顶 AI Bot 失败 (可能已置顶或已达上限): {e}")
+
+            progress["status"] = "success"
+            log("🎉 账号整理整理完毕！完美闭环成功。")
+
+    except Exception as exc:
+        progress["status"] = "failed"
+        log(f"❌ 账号整理失败中断: {exc}")
 
 
 @app.post("/api/internal/cleanup")
@@ -9257,20 +11346,9 @@ def delete_bot_auto_reply(bot_type: str, reply_id: int, user: dict = Depends(get
 
     return {"ok": True, "message": "已删除该回复模板"}
 
-# --- Groups Scraping and Syncing API Routes (Stage 2 Delegation) ---
-@app.post("/api/groups/sync-status")
-async def web_sync_groups_status(user: dict = Depends(get_current_user)):
-    return await sync_groups_status(user)
 
-@app.get("/api/groups/sync-stream")
-async def web_stream_groups_sync(token: Optional[str] = None):
-    user = get_user_from_stream_token(token)
-    generator = await stream_groups_sync(user)
-    return StreamingResponse(generator, media_type="text/event-stream")
 
-@app.post("/api/groups/resolve", response_model=GroupModel)
-async def web_resolve_group(req: GroupResolveRequest, user: dict = Depends(get_current_user)):
-    return await resolve_group(req, user)
+
 
 
 if __name__ == "__main__":

@@ -1,0 +1,40 @@
+11066:                             db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link, entity)
+11067:                         results.append({
+11068:                             "account_id": account_id,
+11069:                             "phone": phone,
+11070:                             "link": link,
+11071:                             "status": status_str,
+11072:                             "error": err_msg,
+11073:                             "group_id": db_group_id,
+11074:                             "title": db_group_title or getattr(entity, 'title', '')
+11075:                         })
+11076:                         added_this_round += 1
+11077: 
+11078:                         if req.move_to_folder:
+11079:                             folder_name_clean = ""
+11080:                             if req.folder_by_type:
+11081:                                 try:
+11082:                                     company = task.get("company", "rosepay")
+11083:                                     folder_name_clean = await determine_group_folder_name(client, entity, link, company)
+11084:                                     task["logs"].append(f"根据群组类型自动分类，判定该群归属文件夹: '{folder_name_clean}'")
+11085:                                 except Exception as de:
+11086:                                     task["logs"].append(f"判定群组类型失败，退回默认分类 '中文长': {de}")
+11087:                                     folder_name_clean = "中文长"
+11088:                             elif req.target_folder_name and req.target_folder_name.strip():
+11089:                                 folder_name_clean = req.target_folder_name.strip()
+11090: 
+11091:                             if folder_name_clean:
+11092:                                 try:
+11093:                                     await add_peer_to_folder(client, entity, folder_name_clean)
+11094:                                     task["logs"].append(f"已成功将群组移入文件夹: '{folder_name_clean}'")
+11095:                                 except Exception as fe:
+11096:                                     task["logs"].append(f"移动群组到文件夹 '{folder_name_clean}' 失败: {str(fe)}")
+11097: 
+11098:                     except errors.UserAlreadyParticipantError:
+11099:                         try:
+11100:                             client = await get_client(account_id)
+11101:                             entity = await join_group_or_channel_get_entity_only(client, link)
+11102: 
+11103:                             is_restricted = getattr(entity, 'restricted', False) if entity else False
+11104:                             restriction_reason_str = ""
+11105:                             if is_restricted:

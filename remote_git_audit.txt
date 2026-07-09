@@ -1,0 +1,89 @@
+=== REMOTE FILE AND WORKSPACE AUDIT ===
+
+--- Directory List ---
+total 3512
+drwxr-xr-x  9 root root   4096 Jul  5 06:33 .
+drwx------ 16 root root   4096 Jul  1 16:53 ..
+drwxr-xr-x  2 root root   4096 Jul  1 17:11 .agents
+-rw-rw-rw-  1 root root    518 Jun 30 14:12 .gitignore
+lrwxrwxrwx  1 root root     47 Jul  1 16:57 .venv -> /root/rosepay_shared_telegram_folder_sync/.venv
+-rw-r--r--  1 root root    817 Jun 10 18:36 00_检测环境并安装依赖.cmd
+-rw-r--r--  1 root root    607 Jun 10 18:36 01_登录电报.cmd
+-rw-r--r--  1 root root    638 Jun 10 18:36 02_执行广告任务.cmd
+-rw-r--r--  1 root root    600 Jun 10 18:36 03_清除登录Session.cmd
+-rw-r--r--  1 root root    913 Jun 10 18:36 04_网络诊断.cmd
+-rw-r--r--  1 root root    736 Jun 10 18:36 05_QuickQ网络诊断_无需Python.cmd
+-rw-r--r--  1 root root    642 Jun 12 14:11 06_启动网页控制台.cmd
+-rw-r--r--  1 root root    643 Jun 10 18:36 99_打包前清理.cmd
+-rw-rw-rw-  1 root root   4345 Jun 30 14:12 ANTIGRAVITY_GIT_WORKFLOW.md
+-rw-rw-rw-  1 root root    648 Jun 22 15:38 CODEX_VERSION_MARKER.md
+drwxr-xr-x  4 root root   4096 Jun 25 10:39 E:
+-rw-rw-rw-  1 root root  23393 Jun 30 18:52 HANDOFF_20260630_AFTER_1200.md
+-rw-rw-rw-  1 root root   3513 Jun 29 18:05 HANDOFF_FOR_ANTIGRAVITY.md
+-rw-rw-rw-  1 root root   8579 Jun 25 13:01 README.md
+-rw-rw-rw-  1 root root    515 Jun 22 15:07 RECOVERY_MANIFEST.txt
+-rw-rw-rw-  1 root root   7975 Jun 25 13:24 REMOVE_REALTIME_DM_LISTENER_PLAN.md
+drwxr-xr-x  2 root root   4096 Jul  5 06:33 __pycache__
+-rw-r--r--  1 root root    519 Jun 10 18:36 _ensure_runtime.cmd
+-rw-rw-rw-  1 root root    696 Jun 10 18:32 account_login.py
+-rw-rw-rw-  1 root root   4707 Jun 10 18:35 account_manager.py
+lrwxrwxrwx  1 root root     50 Jul  1 16:57 accounts -> /root/rosepay_shared_telegram_folder_sync/accounts
+-rw-rw-rw-  1 root root  31636 Jul  1 15:21 ad_sender.py
+-rw-rw-rw-  1 root root    306 Jun 10 18:33 ad_sender_config.example.json
+-rw-rw-rw-  1 root root    302 Jun 10 10:33 ad_sender_config.json
+-rw-r--r--  1 root root  16150 Jul  3 06:31 bot_rules_auditor.py
+-rw-rw-rw-  1 root root   2247 Jun 15 21:15 cleanup_all_accounts_folders.py
+-rw-rw-rw-  1 root root   2472 Jun 15 21:16 cleanup_folders.py
+-rw-rw-rw-  1 root root    804 Jun 10 18:35 clear_session.py
+-rw-rw-rw-  1 root root    561 Jun 26 15:34 config.example.json
+-rw-r--r--  1 root root    814 Jul  3 14:17 config.json
+lrwxrwxrwx  1 root root     46 Jul  1 16:57 data -> /root/rosepay_shared_telegram_folder_sync/data
+-rw-rw-rw-  1 root root  52826 Jul  4 10:46 db.py
+-rw-rw-rw-  1 root root    480 Jun 10 08:25 env_config.json
+drwxr-xr-x  6 root root   4096 Jul  4 18:02 frontend
+-rw-rw-rw-  1 root root  34614 Jun 18 15:52 group_scraper.py
+-rw-rw-rw-  1 root root  24315 Jun 21 14:26 historical_names.py
+drwxrwxrwx  2 root root   4096 Jun 23 10:38 logs
+-rw-rw-rw-  1 root root     40 Jun 10 14:58 message.txt
+-rw-rw-rw-  1 root root   3256 Jun 16 12:43 migrate_data_to_rosepay.py
+-rw-rw-rw-  1 root root   5760 Jun 10 17:44 network_check.py
+-rw-rw-rw-  1 root root  26502 Jul  4 16:35 private_dm_events.py
+-rw-rw-rw-  1 root root   3705 Jun 10 16:52 quickq_network_check.ps1
+-rw-rw-rw-  1 root root    193 Jul  1 00:42 requirements.txt
+drwxr-xr-x  2 root root   4096 Jul  1 17:11 scripts
+lrwxrwxrwx  1 root root     14 Jul  1 16:57 sessions -> /root/sessions
+-rw-rw-rw-  1 root root   4823 Jun 10 18:35 setup_env.py
+-rw-rw-rw-  1 root root   7508 Jun 10 18:03 setup_env_bootstrap.ps1
+lrwxrwxrwx  1 root root     47 Jul  1 16:57 state -> /root/rosepay_shared_telegram_folder_sync/state
+-rw-rw-rw-  1 root root   9450 Jul  4 16:51 static_proxy_pool.py
+-rw-rw-rw-  1 root root  27425 Jun 30 16:17 sync_folder_groups.py
+drwxr-xr-x  2 root root   4096 Jul  1 17:11 templates
+-rw-rw-rw-  1 root root   4394 Jun 15 21:16 test_create_folder.py
+-rw-rw-rw-  1 root root  26116 Jul  4 10:46 walkthrough.md
+-rw-r--r--  1 root root 661616 Jul  5 06:33 web_server.py
+-rw-rw-rw-  1 root root 611313 Jun 30 12:30 web_server.py.bak_before_restore_bot_permissions_20260630_130449
+-rw-rw-rw-  1 root root 497865 Jun 25 20:08 web_server.py.bak_local_20260625
+-rw-r--r--  1 root root 655544 Jul  5 04:57 web_server.py.before_upload_20260705_125702
+-rw-r--r--  1 root root 657132 Jul  5 06:33 web_server.py.predeploy_last
+
+--- File Stats ---
+  File: /root/telegram_folder_sync/web_server.py
+  size: 661616    	Blocks: 1296       IO Block: 4096   regular file
+Device: 253,2	Inode: 3145983     Links: 1
+Access: (0644/-rw-r--r--)  Uid: (    0/    root)   Gid: (    0/    root)
+Access: 2026-07-05 06:33:28.117111750 +0000
+Modify: 2026-07-05 06:33:26.881105164 +0000
+Change: 2026-07-05 06:33:28.050111393 +0000
+ Birth: 2026-07-05 06:33:20.748072408 +0000
+  File: /root/telegram_folder_sync/db.py
+  size: 52826     	Blocks: 104        IO Block: 4096   regular file
+Device: 253,2	Inode: 3141439     Links: 1
+Access: (0666/-rw-rw-rw-)  Uid: (    0/    root)   Gid: (    0/    root)
+Access: 2026-07-04 10:46:30.812037926 +0000
+Modify: 2026-07-04 10:46:16.292992639 +0000
+Change: 2026-07-04 10:46:16.292992639 +0000
+ Birth: 2026-07-01 17:11:34.888913373 +0000
+
+--- Remote MD5 Sums ---
+ad4dc5ed06879cee0e9142d6a39124de  /root/telegram_folder_sync/web_server.py
+7c9caea580e3921e574b9a63a1908915  /root/telegram_folder_sync/db.py

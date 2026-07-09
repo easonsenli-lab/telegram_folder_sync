@@ -1,0 +1,120 @@
+13481:                                 clean_pinned = await clean_and_convert_peers_async(client, getattr(f_obj, "pinned_peers", []) or [])
+13482:                                 clean_exclude = await clean_and_convert_peers_async(client, getattr(f_obj, "exclude_peers", []) or [])
+13483: 
+13484:                                 t_user_id = getattr(translate_bot_peer, 'user_id', None)
+13485:                                 if t_user_id:
+13486:                                     # 1. 确保翻译 Bot 存在于 include 中
+13487:                                     exists_in_include = False
+13488:                                     for p in clean_include:
+13489:                                         if getattr(p, 'user_id', None) == t_user_id:
+13490:                                             exists_in_include = True
+13491:                                             break
+13492:                                     if not exists_in_include:
+13493:                                         clean_include.append(translate_bot_peer)
+13494: 
+13495:                                     # 2. 确保翻译 Bot 在 pinned 中且在第一位
+13496:                                     clean_pinned = [p for p in clean_pinned if getattr(p, 'user_id', None) != t_user_id]
+13497:                                     clean_pinned.insert(0, translate_bot_peer)
+13498: 
+13499:                                     # 构造更新后的 DialogFilter
+13500:                                     title_text = getattr(f_obj, "title", f_title)
+13501:                                     if isinstance(title_text, str):
+13502:                                         title_obj = types.TextWithEntities(text=title_text, entities=[])
+13503:                                     else:
+13504:                                         title_obj = title_text
+13505: 
+13506:                                     new_filter = types.DialogFilter(
+13507:                                         id=f_obj.id,
+13508:                                         title=title_obj,
+13509:                                         pinned_peers=clean_pinned,
+13510:                                         include_peers=clean_include,
+13511:                                         exclude_peers=clean_exclude,
+13512:                                         contacts=getattr(f_obj, "contacts", False),
+13513:                                         non_contacts=getattr(f_obj, "non_contacts", False),
+13514:                                         groups=getattr(f_obj, "groups", False),
+13515:                                         broadcasts=getattr(f_obj, "broadcasts", False),
+13516:                                         bots=getattr(f_obj, "bots", False)
+13517:                                     )
+13518:                                     await client(functions.messages.UpdateDialogFilterRequest(id=f_obj.id, filter=new_filter))
+13519:                                     log(f"已将翻译 Bot 置顶并同步到文件夹 '{f_title}'。")
+13520:                                     await asyncio.sleep(1)
+13521:                 except Exception as fe:
+13522:                     log(f"同步/置顶翻译 Bot 到分类文件夹失败: {fe}")
+13523: 
+13524:             # --- 第七阶段：把 aibot 在主文件夹（默认会话列表）置顶 ---
+13525:             if ai_bot_peer:
+13526:                 try:
+13527:                     log(f"正在将 AI Bot '{ai_bot_username}' 置顶在主文件夹...")
+13528:                     await client(functions.messages.ToggleDialogPinRequest(
+13529:                         peer=ai_bot_peer,
+13530:                         pinned=True
+13531:                     ))
+13532:                     log(f"AI Bot '{ai_bot_username}' 置顶在主文件夹成功。")
+13533:                 except Exception as e:
+13534:                     log(f"置顶 AI Bot 失败 (可能已置顶或已达上限): {e}")
+13535: 
+13536:             progress["status"] = "success"
+13537:             log("🎉 账号整理整理完毕！完美闭环成功。")
+13538: 
+13539:     except Exception as exc:
+13540:         progress["status"] = "failed"
+13541:         log(f"❌ 账号整理失败中断: {exc}")
+13542: 
+13543: 
+13544: @app.post("/api/internal/cleanup")
+13545: async def trigger_cleanup_tasks(background_tasks: BackgroundTasks, payload: dict = Body(...)):
+13546:     account_ids = payload.get("account_ids", [])
+13547:     if not account_ids:
+13548:         raise HTTPException(status_code=400, detail="account_ids is required")
+13549: 
+13550:     for acc_id in account_ids:
+13551:         background_tasks.add_task(run_account_cleanup_process, acc_id)
+13552: 
+13553:     return {"ok": True, "message": f"已提交 {len(account_ids)} 个账号的后台整理任务"}
+13554: 
+13555: 
+13556: @app.get("/api/internal/cleanup/progress/{account_id}")
+13557: def get_cleanup_progress(account_id: str):
+13558:     prog = cleanup_tasks_progress.get(account_id)
+13559:     if not prog:
+13560:         return {"ok": False, "status": "not_found", "message": "未找到整理记录"}
+13561:     return {
+13562:         "ok": True,
+13563:         "status": prog["status"],
+13564:         "started_at": prog["started_at"],
+13565:         "logs": prog["logs"][-30:],
+13566:         "left_groups": prog["left_groups"],
+13567:         "grouped_channels": prog["grouped_channels"],
+13568:         "synced_dms": prog["synced_dms"],
+13569:         "archived_chats": prog["archived_chats"]
+13570:     }
+13571: 
+13572: # --- TELEGRAM BOTS CONFIGURATION & CRUD API ---
+13573: 
+13574: from pydantic import BaseModel
+13575: 
+13576: class TelegramBotRequest(BaseModel):
+13577:     bot_username: str
+13578:     bot_token: str
+13579:     bot_type: str
+13580:     title: str
+13581:     description: str
+13582:     is_active: int = 1
+13583: 
+13584: @app.get("/api/bots")
+13585: def list_telegram_bots(user: dict = Depends(get_current_user)):
+13586:     """列出系统里所有已注册的电报 Bot"""
+13587:     from db import engine, Session, select
+13588:     import sqlite3
+13589: 
+13590:     # 统计每个 Bot 绑定的账号数量
+13591:     stats = {}
+13592:     try:
+13593:         from db import DB_PATH
+13594:         with sqlite3.connect(str(DB_PATH)) as conn:
+13595:             cursor = conn.cursor()
+13596:             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='bot_authorized_users';")
+13597:             if cursor.fetchone():
+13598:                 cursor.execute("SELECT bot_type, COUNT(*) FROM bot_authorized_users GROUP BY bot_type;")
+13599:                 for b_type, count in cursor.fetchall():
+13600:                     stats[b_type] = count

@@ -1,0 +1,10 @@
+=== DETAILED AUTO-RECOVERY TEST ===
+Stdout:
+Forced task state to running in DB.
+Before trigger: ('running', None, '2026-07-05 07:09:57')
+=== 开始检测 groups_library 数据库字段升级 ===
+Successfully migrated '默认公司' to 'admin' in database tables.
+Successfully auto-authorized all accounts in database.
+Triggered list_campaign_tasks API.
+After trigger: ('stopped', '检测到发送进程已异常退出，已自动同步状态为停止。', '2026-07-05 17:48:00')
+

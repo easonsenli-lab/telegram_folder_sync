@@ -1,0 +1,150 @@
+11201:                             db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link)
+11202: 
+11203:                         if is_invalid:
+11204:                             task["logs"].append(f"账号 {phone} 检测到 {link} 为无效群组: {err_msg}")
+11205:                             results.append({
+11206:                                 "account_id": account_id,
+11207:                                 "phone": phone,
+11208:                                 "link": link,
+11209:                                 "status": "invalid",
+11210:                                 "error": f"无效群组: {err_msg}",
+11211:                                 "group_id": db_group_id,
+11212:                                 "title": db_group_title
+11213:                             })
+11214:                         else:
+11215:                             task["logs"].append(f"账号 {phone} 加入 {link} 失败: {err_msg}")
+11216:                             results.append({
+11217:                                 "account_id": account_id,
+11218:                                 "phone": phone,
+11219:                                 "link": link,
+11220:                                 "status": "failed",
+11221:                                 "error": err_msg,
+11222:                                 "group_id": db_group_id,
+11223:                                 "title": db_group_title
+11224:                             })
+11225: 
+11226:                 try:
+11227:                     await asyncio.wait_for(join_link_logic(), timeout=10.0)
+11228:                 except asyncio.TimeoutError:
+11229:                     task["logs"].append(f"⚠️ 警告：账号 {phone} 加入 {link} 超时超过 10 秒，账号可能已被限制/假死！")
+11230:                     with Session(engine) as session:
+11231:                         db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link)
+11232:                     results.append({
+11233:                         "account_id": account_id,
+11234:                         "phone": phone,
+11235:                         "link": link,
+11236:                         "status": "timeout",
+11237:                         "error": "加群超时已超10秒，账号可能被限制或假死",
+11238:                         "group_id": db_group_id,
+11239:                         "title": db_group_title
+11240:                     })
+11241: 
+11242:                 task["progress"]["current"] += 1
+11243:                 save_last_join_task(task_id)
+11244: 
+11245:                 if idx < len(todo_links) and added_this_round < groups_per_round:
+11246:                     delay = base_delay * random.uniform(0.85, 1.15)
+11247:                     task["logs"].append(f"账号 {phone} 等待延迟 {delay:.1f} 秒...")
+11248:                     slept_links = 0
+11249:                     while slept_links < delay and task["status"] == "running":
+11250:                         await asyncio.sleep(1)
+11251:                         slept_links += 1
+11252: 
+11253:             task["logs"].append(f"账号 {phone} 本轮执行完毕，本轮成功加入 {added_this_round} 个群组。")
+11254: 
+11255:         # Outer loop to run rounds
+11256:         current_round = 1
+11257:         while task["status"] == "running":
+11258:             # Check if all links processed for all accounts
+11259:             all_accounts_done = True
+11260:             for acc_id, _ in accounts_info:
+11261:                 idx = accounts_link_index.get(acc_id, 0)
+11262:                 todo = accounts_todo_links.get(acc_id, [])
+11263:                 if idx < len(todo):
+11264:                     all_accounts_done = False
+11265:                     break
+11266: 
+11267:             if all_accounts_done:
+11268:                 task["logs"].append("所有账号的所有目标链接均已处理完毕！")
+11269:                 break
+11270: 
+11271:             if max_rounds and current_round > max_rounds:
+11272:                 task["logs"].append(f"已达到设定的执行轮数上限 ({max_rounds} 轮)，任务结束。")
+11273:                 break
+11274: 
+11275:             task["logs"].append(f"--- 启动第 {current_round} 轮加群 ---")
+11276: 
+11277:             if mode == "simultaneous":
+11278:                 await asyncio.gather(*(join_single_account_links_this_round(acc_id, phone) for acc_id, phone in accounts_info))
+11279:             else:
+11280:                 for acc_id, phone in accounts_info:
+11281:                     if task["status"] == "stopped":
+11282:                         break
+11283:                     await join_single_account_links_this_round(acc_id, phone)
+11284: 
+11285:             if task["status"] == "stopped":
+11286:                 break
+11287: 
+11288:             # Verify again if we should run next round
+11289:             all_accounts_done = True
+11290:             for acc_id, _ in accounts_info:
+11291:                 idx = accounts_link_index.get(acc_id, 0)
+11292:                 todo = accounts_todo_links.get(acc_id, [])
+11293:                 if idx < len(todo):
+11294:                     all_accounts_done = False
+11295:                     break
+11296: 
+11297:             if all_accounts_done:
+11298:                 task["logs"].append("所有链接处理完毕！")
+11299:                 break
+11300: 
+11301:             # Wait between rounds
+11302:             if not max_rounds or current_round < max_rounds:
+11303:                 task["logs"].append(f"第 {current_round} 轮执行完毕。进入轮次休眠间隔，等待 {round_interval_minutes} 分钟开始下一轮...")
+11304:                 sleep_time_sec = round_interval_minutes * 60
+11305:                 slept_sec = 0
+11306:                 while slept_sec < sleep_time_sec and task["status"] == "running":
+11307:                     await asyncio.sleep(5)
+11308:                     slept_sec += 5
+11309: 
+11310:                 current_round += 1
+11311: 
+11312:         if task["status"] != "stopped":
+11313:             task["status"] = "completed"
+11314:         task["logs"].append("入群任务执行完毕！")
+11315:     except Exception as e:
+11316:         task["status"] = "failed"
+11317:         task["logs"].append(f"任务执行出错: {str(e)}")
+11318:         print(f"Error in join_worker_task: {e}")
+11319:         traceback.print_exc()
+11320:     finally:
+11321:         task["results"] = results
+11322:         save_last_join_task(task_id)
+11323:         try:
+11324:             status_label = {
+11325:                 "completed": "已完成",
+11326:                 "failed": "失败",
+11327:                 "stopped": "已停止",
+11328:                 "running": "结束处理中",
+11329:             }.get(task.get("status"), task.get("status"))
+11330:             result_counts: Dict[str, int] = {}
+11331:             for item in results:
+11332:                 status = str(item.get("status") or "unknown")
+11333:                 result_counts[status] = result_counts.get(status, 0) + 1
+11334:             success_count = (
+11335:                 result_counts.get("joined", 0)
+11336:                 + result_counts.get("already_joined", 0)
+11337:                 + result_counts.get("success", 0)
+11338:             )
+11339:             invalid_groups = []
+11340:             for item in results:
+11341:                 if str(item.get("status") or "") == "invalid":
+11342:                     group_id = str(item.get("group_id") or "").strip()
+11343:                     if group_id:
+11344:                         invalid_groups.append({
+11345:                             "id": group_id,
+11346:                             "title": item.get("title") or item.get("link") or group_id,
+11347:                             "link": item.get("link") or "",
+11348:                         })
+11349:             dedup_invalid = {}
+11350:             for item in invalid_groups:

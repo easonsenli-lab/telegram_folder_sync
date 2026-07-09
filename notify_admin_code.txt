@@ -1,0 +1,110 @@
+def async_notify_admin_of_dm(account_id: str, account_label: str, sender_id: int, sender_name: str, sender_username: str, message_text: str, message_id: int) -> None:
+    import sqlite3
+    import urllib.request
+    import urllib.parse
+    import json
+    from pathlib import Path
+    import os
+    import asyncio
+
+    # 1. Query rosepay.db to find the admin details
+    db_path = Path(__file__).resolve().parent / "data" / "rosepay.db"
+    if not db_path.exists():
+        print(f"[NotifyAdmin] DB path not found: {db_path}")
+        return
+
+    telegram_chat_id = None
+    owner_username = None
+    admin_contact = None
+    db_account_name = None
+    forum_chat_id = None
+    try:
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+        cursor.execute("SELECT owner_username, account_name FROM accounts WHERE id = ?", (account_id,))
+        row = cursor.fetchone()
+        if row:
+            if row[0]:
+                owner_username = row[0]
+                cursor.execute("SELECT telegram_chat_id, telegram_contact, forum_chat_id FROM admins WHERE username = ?", (owner_username,))
+                admin_row = cursor.fetchone()
+                if admin_row:
+                    telegram_chat_id = admin_row[0]
+                    admin_contact = admin_row[1]
+                    forum_chat_id = admin_row[2]
+            if row[1]:
+                db_account_name = row[1]
+        conn.close()
+    except Exception as exc:
+        print(f"[NotifyAdmin] Failed to query database: {exc}")
+        return
+
+    display_account_name = db_account_name if db_account_name else account_label
+
+    # 2. Retrieve Bot Token
+    bot_token = None
+    try:
+        if os.name != "nt":
+            bot_env_path = Path("/opt/rosepay-telegram-bot/.env")
+        else:
+            bot_env_path = Path(__file__).resolve().parent.parent.parent / "telegram_bot_workspace" / ".env"
+        if bot_env_path.exists():
+            with bot_env_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip().startswith("BOT_TOKEN="):
+                        bot_token = line.split("=", 1)[1].strip()
+                        break
+    except Exception as exc:
+        print(f"[NotifyAdmin] Failed to read Bot Token from env: {exc}")
+
+    if not bot_token:
+        bot_token = os.getenv("BOT_TOKEN", "").strip()
+
+    if not bot_token:
+        print("[NotifyAdmin] Bot token not found, cannot send notification")
+        return
+
+    # 3. Read notify_config.json or use user's forum_chat_id
+    notify_chat_id = forum_chat_id if forum_chat_id else None
+    if not notify_chat_id:
+        try:
+            if os.name != "nt":
+                notify_config_path = Path("/opt/rosepay-telegram-bot/notify_config.json")
+            else:
+                notify_config_path = Path(__file__).resolve().parent.parent.parent / "telegram_bot_workspace" / "notify_config.json"
+            if notify_config_path.exists():
+                with notify_config_path.open("r", encoding="utf-8") as f:
+                    config_data = json.load(f)
+                    notify_chat_id = config_data.get("notify_chat_id")
+        except Exception as exc:
+            print(f"[NotifyAdmin] Failed to read notify_config.json: {exc}")
+
+    sender_display = sender_username if sender_username else sender_name
+    sender_username_clean = sender_username.strip().lstrip("@") if sender_username else ""
+    if sender_username_clean:
+        sender_display_html = f"<b>{sender_name}</b> (@{sender_username_clean})"
+    else:
+        sender_display_html = f"<b>{sender_name}</b>"
+
+    # CASE A: Supergroup Forum Topic Mode is configured (Recommended)
+    if notify_chat_id:
+        thread_id = get_topic_thread_id(account_id, sender_id)
+        is_new_topic = False
+
+        # If no thread_id exists, create a new Forum Topic dynamically
+        if not thread_id:
+            create_url = f"https://api.telegram.org/bot{bot_token}/createForumTopic"
+            create_payload = {
+                "chat_id": int(notify_chat_id),
+                "name": f"[{display_account_name}] {sender_display}"
+            }
+            try:
+                c_data = json.dumps(create_payload).encode("utf-8")
+                c_res = await asyncio.to_thread(
+                    _send_urllib_request_sync,
+                    create_url,
+                    c_data,
+                    {"Content-Type": "application/json"},
+                    10
+                )
+                if c_res.get("ok

@@ -1,0 +1,61 @@
+first_chat_notified_set.add(cache_key)
+
+                        welcome_text = ""
+                        try:
+                            import sqlite3
+                            import random
+                            from db import DB_PATH
+                            with sqlite3.connect(str(DB_PATH)) as conn:
+                                cursor = conn.cursor()
+                                # 读取当前 bot 对应激活的自动回复模板
+                                cursor.execute("SELECT reply_text FROM bot_auto_replies WHERE bot_type = 'ai_bot' AND is_enabled = 1;")
+                                rows = cursor.fetchall()
+                                if rows:
+                                    welcome_text = random.choice(rows)[0]
+                                    print(f"[Welcome] Selected random welcome template from {len(rows)} enabled options.")
+                        except Exception as db_err:
+                            print(f"[Welcome] Failed to query welcome templates from database: {db_err}")
+
+                        if not welcome_text:
+                            welcome_text = (
+                                "🌹 <b>Hello! Welcome to RosePay!</b>\n\n"
+                                "Please join our group first: https://t.me/RosePayChatGroup\n\n"
+                                "⚠️ <b>Anti-Scam & Security Notice</b>:\n"
+                                "RosePay customer support and administrators will <b>NEVER private message (DM) you first</b>. "
+                                "Anyone who DMs you first is a scammer. Please verify carefully to protect your assets!\n\n"
+                                "💬 Please state your specific business needs here. Our support team will get back to you shortly. "
+                                "Have a great day!"
+                            )
+                        welcome_target = sender if sender is not None else sender_id_int
+                        await client.send_message(welcome_target, welcome_text, parse_mode="HTML")
+                        mark_private_welcome_sent(account_id, sender_id_int)
+                        print(f"[Welcome] Auto sent first-chat welcome message to {sender_id_int} from account {account_id}.")
+                except RuntimeError as welcome_skip:
+                    if str(welcome_skip) != "skip-heavy-private-listener-work-while-account-busy":
+                        print(f"[Welcome] Skipped: {welcome_skip}")
+                except Exception as welcome_err:
+                    try:
+                        first_chat_notified_set.discard(cache_key)
+                    except Exception:
+                        pass
+                    if is_telegram_transport_rate_error(welcome_err):
+                        mark_private_listener_cooldown(account_id, welcome_err, "welcome private message")
+                    print(f"[Welcome] Failed to send welcome message: {welcome_err}")
+            except Exception as event_exc:
+                if is_telegram_transport_rate_error(event_exc):
+                    mark_private_listener_cooldown(account_id, event_exc, "private event handling")
+                else:
+                    print(f"[PrivateListener] Failed to process private event for {account_id}: {event_exc}")
+
+            if not account_is_busy and sender is not None:
+                cache = dm_folder_peer_cache.setdefault(account_id, set())
+                if sender_id_int not in cache:
+                    try:
+                        await add_peer_to_folder(client, sender, DM_FOLDER_NAME)
+                        cache.add(sender_id_int)
+                        print(f"[{account_id}] Added private dialog {sender_id_int} to {DM_FOLDER_NAME} folder.")
+                    except Exception as folder_exc:
+                        if is_telegram_transport_rate_error(folder_exc):
+                            mark_private_listener_cooldown(account_id, folder_exc, "dm folder sync")
+                        else:
+                            print(f"[{account_id

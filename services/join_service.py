@@ -6,6 +6,8 @@ import json
 import time
 import re
 import os
+import random
+import traceback
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 from fastapi import HTTPException
@@ -18,7 +20,8 @@ from services.shared_state import (
     release_account_task_usage,
     set_account_status,
     background_tasks,
-    get_beijing_time_str
+    get_beijing_time_str,
+    account_status_store
 )
 
 from services.client_manager import get_client
@@ -64,7 +67,50 @@ def set_login_status_check_failed(account_id: str, message: str, *, source: str,
     import web_server
     return web_server.set_login_status_check_failed(account_id, message, source=source, is_connected=is_connected)
 
+def find_group_by_username_or_id(
+    session,
+    group_id: Optional[Any] = None,
+    username: Optional[str] = None,
+    company: Optional[str] = None,
+):
+    import web_server
+    if username is None and isinstance(group_id, str):
+        username = group_id
+        group_id = None
+    return web_server.find_group_by_username_or_id(session, group_id, username, company)
+
+def is_banned_or_deactivated_error(exc: Exception) -> bool:
+    import web_server
+    return web_server.is_banned_or_deactivated_error(exc)
+
+async def handle_deactivated_or_banned_account(account_id: str, exc: Exception) -> None:
+    import web_server
+    return await web_server.handle_deactivated_or_banned_account(account_id, exc)
+
+def mark_account_runtime_status(
+    account_id: str,
+    is_connected: bool,
+    is_authorized: Optional[bool] = None,
+    status_msg: Optional[str] = None,
+    me: Optional[str] = None,
+) -> None:
+    import web_server
+    if me is None and status_msg is not None:
+        me = status_msg
+    return web_server.mark_account_runtime_status(
+        account_id,
+        is_connected=is_connected,
+        is_authorized=is_authorized,
+        me=me,
+    )
+
+async def check_can_speak(client, entity, phone: Optional[str] = None) -> bool:
+    import web_server
+    return await web_server.check_can_speak(client, entity)
+
+
 from pydantic import BaseModel
+from sync_folder_groups import normalize_title
 
 class JoinTaskRequest(BaseModel):
     account_ids: List[str]

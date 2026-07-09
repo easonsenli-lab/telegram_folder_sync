@@ -1,0 +1,70 @@
+13011: 
+13012: 
+13013: cleanup_tasks_progress: Dict[str, dict] = {}
+13014: 
+13015: async def run_account_cleanup_process(account_id: str):
+13016:     import datetime
+13017:     import re
+13018:     from datetime import timezone
+13019: 
+13020:     progress = {
+13021:         "status": "running",
+13022:         "started_at": time.time(),
+13023:         "logs": [],
+13024:         "left_groups": 0,
+13025:         "grouped_channels": 0,
+13026:         "synced_dms": 0,
+13027:         "archived_chats": 0
+13028:     }
+13029:     failed_folders = set()
+13030:     cleanup_tasks_progress[account_id] = progress
+13031: 
+13032:     def log(msg):
+13033:         print(f"[{account_id} Cleanup] {msg}")
+13034:         progress["logs"].append(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}")
+13035: 
+13036:     log("初始化账号整理任务...")
+13037: 
+13038:     client = None
+13039:     try:
+13040:         # 获取 Telethon 客户端，必须在 locks 保护内获取以防写冲突
+13041:         if account_id not in client_locks:
+13042:             client_locks[account_id] = asyncio.Lock()
+13043: 
+13044:         async with client_locks[account_id]:
+13045:             # 假定此时账号已经在线，如果没有连上，则临时 connect
+13046:             client = active_clients.get(account_id)
+13047:             if not client:
+13048:                 # 从配置加载并获取
+13049:                 config_path = account_config_path(account_id)
+13050:                 if not config_path.exists():
+13051:                     raise Exception("Account config not found")
+13052:                 config = load_json(config_path)
+13053:                 base_dir = config_path.parent.parent
+13054:                 client = await build_client(config, base_dir)
+13055:                 await client.connect()
+13056:                 active_clients[account_id] = client
+13057: 
+13058:             if not await client.is_user_authorized():
+13059:                 raise Exception("账号未授权登录，请先登录")
+13060: 
+13061:             if not client.is_connected():
+13062:                 await client.connect()
+13063: 
+13064:             # 获取翻译 Bot 和 AI Bot 的 InputPeer
+13065:             ai_bot_username = "RosePayTest_bot"
+13066:             translate_bot_username = "RosePay_translation_bot"
+13067:             try:
+13068:                 db_path = get_db_path()
+13069:                 import sqlite3
+13070:                 with sqlite3.connect(db_path) as conn:
+13071:                     conn.row_factory = sqlite3.Row
+13072:                     cursor = conn.cursor()
+13073:                     cursor.execute("SELECT bot_username, bot_type FROM telegram_bots WHERE is_active = 1")
+13074:                     for row in cursor.fetchall():
+13075:                         if row["bot_type"] == "ai_bot":
+13076:                             ai_bot_username = row["bot_username"]
+13077:                         elif row["bot_type"] == "translate_bot":
+13078:                             translate_bot_username = row["bot_username"]
+13079:             except Exception as e:
+13080:                 log(f"查询数据库 bots 失败，使用默认值: {e}")

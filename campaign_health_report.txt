@@ -1,0 +1,18 @@
+=== REMOTE CAMPAIGN HEALTH CHECK ===
+
+--- Active ad_sender.py processes ---
+No active ad_sender.py processes running.
+
+--- Campaign Task Summary (Last 10) ---
+ID: 23a79b6d | Phone: RosePay 雷迪嘎嘎 | Status: stopped | Success/Fail: 101/0 | Error: None | Updated: 2026-07-05 07:10:05
+ID: 938a17f6 | Phone: RosePay 杨广 | Status: running | Success/Fail: 35/0 | Error: None | Updated: 2026-07-05 07:09:57
+ID: 1256dadc | Phone: RosePay 杨广 | Status: stopped | Success/Fail: 14/0 | Error: None | Updated: 2026-07-05 05:01:56
+ID: 861de4e6 | Phone: RosePay 秦始皇 | Status: stopped | Success/Fail: 21/0 | Error: None | Updated: 2026-07-05 01:07:43
+ID: d5c97ff1 | Phone: RosePay Baby | Status: stopped | Success/Fail: 23/1 | Error: None | Updated: 2026-07-04 17:10:50
+ID: 5c160699 | Phone: RosePay 雷迪嘎嘎 | Status: stopped | Success/Fail: 15/0 | Error: None | Updated: 2026-07-04 14:06:40
+ID: dcb8da8f | Phone: RosePay Baby | Status: stopped | Success/Fail: 1/0 | Error: None | Updated: 2026-07-04 04:09:14
+ID: 60abc3be | Phone: RosePay 雷迪嘎嘎 | Status: stopped | Success/Fail: 42/0 | Error: None | Updated: 2026-07-03 13:01:21
+ID: c79b7f8d | Phone: RosePay 秦始皇 | Status: stopped | Success/Fail: 468/9 | Error: None | Updated: 2026-07-03 12:19:41
+ID: 6470f73f | Phone: RosePay Ryan | Status: stopped | Success/Fail: 533/13 | Error: None | Updated: 2026-07-03 12:01:52
+
+--- Campaign Log Analytics (Last 200 logs) ---

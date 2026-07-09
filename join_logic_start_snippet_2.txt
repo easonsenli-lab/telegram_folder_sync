@@ -1,0 +1,95 @@
+10971:                             raise Exception("账号未登录")
+10972:                         mark_account_runtime_status(account_id, is_connected=True, is_authorized=True)
+10973: 
+10974:                         # Pre-check entity restriction
+10975:                         entity = None
+10976:                         try:
+10977:                             entity = await join_group_or_channel_get_entity_only(client, link)
+10978:                         except Exception:
+10979:                             pass
+10980: 
+10981:                         is_restricted = False
+10982:                         restriction_reason_str = ""
+10983:                         is_channel = False
+10984:                         if entity:
+10985:                             if getattr(entity, 'restricted', False):
+10986:                                 is_restricted = True
+10987:                                 reasons = getattr(entity, 'restriction_reason', []) or []
+10988:                                 reasons_text = [getattr(r, 'text', '') for r in reasons]
+10989:                                 restriction_reason_str = "; ".join(filter(None, reasons_text)) or "该群组已被屏蔽限制 (restricted)"
+10990: 
+10991:                             from telethon.tl.types import Channel, ChatInvite
+10992:                             if isinstance(entity, Channel) and getattr(entity, 'broadcast', False):
+10993:                                 is_channel = True
+10994:                             elif isinstance(entity, ChatInvite) and getattr(entity, 'broadcast', False):
+10995:                                 is_channel = True
+10996: 
+10997:                         if is_channel:
+10998:                             task["logs"].append(f"账号 {phone} 检测到 {link} 是频道，触发‘频道不自动加入’规则，跳过。")
+10999:                             results.append({
+11000:                                 "account_id": account_id,
+11001:                                 "phone": phone,
+11002:                                 "link": link,
+11003:                                 "status": "skipped",
+11004:                                 "error": "频道不自动加入",
+11005:                                 "group_id": str(entity.id) if hasattr(entity, 'id') else None,
+11006:                                 "title": getattr(entity, 'title', link)
+11007:                             })
+11008:                             task["progress"]["current"] += 1
+11009:                             save_last_join_task(task_id)
+11010:                             return
+11011: 
+11012:                         if is_restricted:
+11013:                             with Session(engine) as session:
+11014:                                 db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link, entity)
+11015:                             task["logs"].append(f"账号 {phone} 检测到 {link} 是无效限制群组: {restriction_reason_str}")
+11016:                             results.append({
+11017:                                 "account_id": account_id,
+11018:                                 "phone": phone,
+11019:                                 "link": link,
+11020:                                 "status": "invalid",
+11021:                                 "error": restriction_reason_str,
+11022:                                 "group_id": db_group_id,
+11023:                                 "title": db_group_title or getattr(entity, 'title', '')
+11024:                             })
+11025:                             task["progress"]["current"] += 1
+11026:                             save_last_join_task(task_id)
+11027:                             return
+11028: 
+11029:                         # Try to join
+11030:                         entity = await join_group_or_channel(client, link)
+11031: 
+11032:                         # Check restriction after join
+11033:                         if getattr(entity, 'restricted', False):
+11034:                             is_restricted = True
+11035:                             reasons = getattr(entity, 'restriction_reason', []) or []
+11036:                             reasons_text = [getattr(r, 'text', '') for r in reasons]
+11037:                             restriction_reason_str = "; ".join(filter(None, reasons_text)) or "该群组已被屏蔽限制 (restricted)"
+11038: 
+11039:                         if is_restricted:
+11040:                             with Session(engine) as session:
+11041:                                 db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link, entity)
+11042:                             task["logs"].append(f"账号 {phone} 检测到 {link} 是无效限制群组: {restriction_reason_str}")
+11043:                             results.append({
+11044:                                 "account_id": account_id,
+11045:                                 "phone": phone,
+11046:                                 "link": link,
+11047:                                 "status": "invalid",
+11048:                                 "error": restriction_reason_str,
+11049:                                 "group_id": db_group_id,
+11050:                                 "title": db_group_title or getattr(entity, 'title', '')
+11051:                             })
+11052:                             task["progress"]["current"] += 1
+11053:                             save_last_join_task(task_id)
+11054:                             return
+11055: 
+11056:                         can_speak = await check_can_speak(client, entity)
+11057:                         status_str = "success" if can_speak else "restricted"
+11058:                         err_msg = ""
+11059:                         if not can_speak:
+11060:                             err_msg = "成功加入但无法直接发言（属于频道或被禁言限制）"
+11061:                             task["logs"].append(f"账号 {phone} 成功加入 {link}，但检测到无法直接发言。")
+11062:                         else:
+11063:                             task["logs"].append(f"账号 {phone} 成功加入 {link} 并确认可以直接发言！")
+11064: 
+11065:                         with Session(engine) as session:

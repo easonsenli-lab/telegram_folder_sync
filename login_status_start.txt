@@ -1,0 +1,80 @@
+7251:         if messages:
+7252:             msg = messages[0]
+7253:             if not msg.out:
+7254:                 text = msg.message
+7255:                 lower_text = text.lower()
+7256:                 # Parse the response text
+7257:                 if "no limits" in lower_text or "no restrictions" in lower_text or "free as a bird" in lower_text:
+7258:                     return {"status": "free", "details": text}
+7259:                 else:
+7260:                     return {"status": "restricted", "details": text}
+7261:         return {"status": "unknown", "details": "没有收到 SpamBot 响应"}
+7262:     except Exception as e:
+7263:         return {"status": "unknown", "details": f"SpamBot 检测失败: {str(e)}"}
+7264: 
+7265: @app.get("/api/login/status/{account_id}")
+7266: @account_api_operation("login_status", label="检测登录状态")
+7267: async def get_login_status(account_id: str, force: bool = False, user: dict = Depends(get_current_user)):
+7268:     """Checks the connection and authorization status of a Telegram account."""
+7269:     check_account_company(account_id, user)
+7270:     try:
+7271:         client = await asyncio.wait_for(get_client(account_id), timeout=15)
+7272:         is_connected = client.is_connected()
+7273:         is_authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=8) if is_connected else False
+7274:         me_info = None
+7275:         spambot_status = "unknown"
+7276:         spambot_details = ""
+7277:         spambot_time = None
+7278:         db_acc = None
+7279:         check_warnings = []
+7280: 
+7281:         if is_authorized:
+7282:             try:
+7283:                 me = await asyncio.wait_for(client.get_me(), timeout=8)
+7284:                 if me:
+7285:                     username = f"@{me.username}" if me.username else ""
+7286:                     me_info = f"{me.first_name or ''} {me.last_name or ''} {username} (ID: {me.id})".strip()
+7287:                     # 只有在 force=True 时才才去同步账号名到 TG（或更新数据库），日常同步避免该重型操作
+7288:                     if force:
+7289:                         try:
+7290:                             await asyncio.wait_for(update_account_name_from_tg(account_id, client), timeout=5)
+7291:                         except asyncio.TimeoutError:
+7292:                             warning = "账号名同步超时，登录状态已确认"
+7293:                             check_warnings.append(warning)
+7294:                             print(f"[LoginStatus] update_account_name timeout for {account_id}")
+7295:             except Exception as e:
+7296:                 warning = f"读取账号资料失败，登录状态已确认: {e}"
+7297:                 check_warnings.append(warning)
+7298:                 print(f"[LoginStatus] get_me failed for {account_id}: {e}")
+7299: 
+7300:             # Check and update translation bot status (只有 force=True 时才执行重型检测)
+7301:             if force:
+7302:                 try:
+7303:                     from db import engine, AccountDb, Session
+7304:                     with Session(engine) as db_session:
+7305:                         db_acc = db_session.get(AccountDb, account_id)
+7306:                         if db_acc and db_acc.bot_setup_status != "approved":
+7307:                             await asyncio.wait_for(check_and_update_bot_approval_status(account_id, client, db_session), timeout=8)
+7308:                 except Exception as e:
+7309:                     warning = f"Bot 授权状态检查失败，登录状态已确认: {e}"
+7310:                     check_warnings.append(warning)
+7311:                     print(f"Error checking bot status in login/status check: {e}")
+7312: 
+7313:             # Fetch or use cached spambot status (日常 force=False 的检测不重新查 SpamBot 以规避限流)
+7314:             import time
+7315:             cached = spambot_cache.get(account_id)
+7316:             if cached and not force:
+7317:                 # 日常同步直接复用历史缓存，不查 SpamBot
+7318:                 spambot_status = cached["status"]
+7319:                 spambot_details = cached["details"]
+7320:                 spambot_time = cached["timestamp"]
+7321:             elif cached and force and (time.time() - cached["timestamp"] < 300):
+7322:                 # 即使 force=True，如果 5 分钟内刚查过，也复用缓存，防止频率过高被限流
+7323:                 spambot_status = cached["status"]
+7324:                 spambot_details = cached["details"]
+7325:                 spambot_time = cached["timestamp"]
+7326:             else:
+7327:                 # 只有没有缓存，或 force=True 且缓存过期时才去查重型的 get_spambot_status
+7328:                 try:
+7329:                     res = await asyncio.wait_for(get_spambot_status(client), timeout=12)
+7330:                     spambot_status = res["status"]

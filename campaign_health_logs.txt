@@ -1,0 +1,52 @@
+=== REMOTE CAMPAIGN HEALTH LOG DUMP ===
+
+--- Running python processes list ---
+root        1380       1  0 Jul01 ?        00:06:48 /usr/bin/python3 /usr/bin/fail2ban-server -xf start
+root        1457       1  0 Jul01 ?        00:00:00 /usr/bin/python3 /usr/share/unattended-upgrades/unattended-upgrade-shutdown --wait-for-signal
+root      166048       1  0 Jul04 ?        00:03:30 /root/telegram_folder_sync/.venv/bin/python3 /root/telegram_folder_sync/.venv/bin/uvicorn backend.app:app --host 127.0.0.1 --port 8765
+root      184758       1  0 Jul04 ?        00:05:20 /root/rosepay_monitor/monitor_backend/.venv/bin/python main.py
+root      184760       1  0 Jul04 ?        00:00:28 /opt/rosepay-translate-bot/.venv/bin/python /opt/rosepay-translate-bot/bot.py
+root      184764       1  0 Jul04 ?        00:00:29 /opt/rosepay-telegram-bot/.venv/bin/python /opt/rosepay-telegram-bot/bot.py
+root      219468       1 30 06:33 ?        00:14:16 /root/telegram_folder_sync/.venv/bin/python /root/telegram_folder_sync/web_server.py
+
+--- Campaign Logs (Detailed) ---
+[2026-07-05 07:19:31] | SUCCESS | Phone: RosePay Baby | Group: LumPay🇨🇮 India official group | Detail: RosePay Baby 消息发送成功
+[2026-07-05 07:19:15] | SUCCESS | Phone: RosePay 雷迪嘎嘎 | Group: 印度‼️印度支付 | Detail: RosePay 雷迪嘎嘎 消息发送成功
+[2026-07-05 07:18:59] | SUCCESS | Phone: RosePay 巴金 | Group: Usdt indian sellers | Detail: RosePay 巴金 消息发送成功
+[2026-07-05 07:18:43] | SUCCESS | Phone: RosePay kiki | Group: India-China Pay 🇮🇳🇨🇳 | Detail: RosePay kiki 消息发送成功
+[2026-07-05 07:18:26] | SUCCESS | Phone: RosePay 杨广 | Group: Inr to usdt India | Detail: RosePay 杨广 消息发送成功
+[2026-07-05 07:18:09] | SUCCESS | Phone: RosePay Baby | Group: 🌸 Sakura 🌸 𝗨𝗦𝗗𝗧 India 𝗕𝗨𝗬 𝗔𝗡𝗗 𝗦𝗘𝗟𝗟💲💰 | Detail: RosePay Baby 消息发送成功
+[2026-07-05 07:17:53] | SUCCESS | Phone: RosePay 雷迪嘎嘎 | Group: EPay_China-India payment | Detail: RosePay 雷迪嘎嘎 消息发送成功
+[2026-07-05 07:17:37] | SUCCESS | Phone: RosePay 巴金 | Group: IND USDT DEAL 🇮🇳 | Detail: RosePay 巴金 消息发送成功
+[2026-07-05 07:17:22] | SUCCESS | Phone: RosePay kiki | Group: Angpay Account Group（Pure Gaming Fund）👍👍 | Detail: RosePay kiki 消息发送成功
+[2026-07-05 07:17:04] | SUCCESS | Phone: RosePay 杨广 | Group: Big daddy pay | Detail: RosePay 杨广 消息发送成功
+[2026-07-05 07:16:47] | SUCCESS | Phone: RosePay Baby | Group: TopPay Official | Detail: RosePay Baby 消息发送成功
+[2026-07-05 07:16:31] | SUCCESS | Phone: RosePay 雷迪嘎嘎 | Group: 777PAY OFFICIAL GROUP | Detail: RosePay 雷迪嘎嘎 消息发送成功
+[2026-07-05 07:16:15] | SUCCESS | Phone: RosePay 杨广 | Group: Usdt Buy&sell Mumbai | Detail: RosePay 杨广 消息发送成功
+[2026-07-05 07:15:58] | SUCCESS | Phone: RosePay 巴金 | Group: RUPEES TO USDT EXCHANGE | Detail: RosePay 巴金 消息发送成功
+[2026-07-05 07:15:42] | SUCCESS | Phone: RosePay Baby | Group: teayang海外华人娱乐 | Detail: RosePay Baby 消息发送成功
+[2026-07-05 07:15:27] | SUCCESS | Phone: RosePay kiki | Group: CS PAY | Detail: RosePay kiki 消息发送成功
+[2026-07-05 07:15:09] | SUCCESS | Phone: RosePay 雷迪嘎嘎 | Group: Indian Bank Cards | Detail: RosePay 雷迪嘎嘎 消息发送成功
+[2026-07-05 07:14:53] | SUCCESS | Phone: RosePay 巴金 | Group: 𝗔𝗣𝗘𝗫 𝗕𝗔𝗡𝗞𝗜𝗡𝗚 𝗦𝗢𝗟𝗨𝗧𝗜𝗢𝗡𝗦 | Detail: RosePay 巴金 消息发送成功
+[2026-07-05 07:14:38] | SUCCESS | Phone: RosePay 杨广 | Group: HINDI CHAT 🎈✨ | Detail: RosePay 杨广 消息发送成功
+[2026-07-05 07:14:21] | SUCCESS | Phone: RosePay Baby | Group: 卢比 USDT 互换交流群 | Detail: RosePay Baby 消息发送成功
+[2026-07-05 07:14:05] | SUCCESS | Phone: RosePay kiki | Group: TommyPay 印度支付 | Detail: RosePay kiki 消息发送成功
+[2026-07-05 07:13:48] | SUCCESS | Phone: RosePay 杨广 | Group: Redpay 游戏公司 | Detail: RosePay 杨广 消息发送成功
+[2026-07-05 07:13:30] | SUCCESS | Phone: RosePay 雷迪嘎嘎 | Group: Money transfer dropsss 💸 | Detail: RosePay 雷迪嘎嘎 消息发送成功
+[2026-07-05 07:13:14] | SUCCESS | Phone: RosePay 巴金 | Group: Peak Payment Focus on Indian banks | Detail: RosePay 巴金 消息发送成功
+[2026-07-05 07:12:58] | SUCCESS | Phone: RosePay Baby | Group: USDT P2P INDIA USDT DUBAI | Detail: RosePay Baby 消息发送成功
+[2026-07-05 07:12:43] | SUCCESS | Phone: RosePay kiki | Group: India China Resource Corporation | Detail: RosePay kiki 消息发送成功
+[2026-07-05 07:12:25] | SUCCESS | Phone: RosePay 杨广 | Group: Usdt Seller India | Detail: RosePay 杨广 消息发送成功
+[2026-07-05 07:12:09] | SUCCESS | Phone: RosePay 雷迪嘎嘎 | Group: Bitpay Gaming | Detail: RosePay 雷迪嘎嘎 消息发送成功
+[2026-07-05 07:11:53] | SUCCESS | Phone: RosePay 巴金 | Group: What are you do in Bank and Company | Detail: RosePay 巴金 消息发送成功
+[2026-07-05 07:11:37] | SUCCESS | Phone: RosePay Baby | Group: 𝐘𝐈𝐘𝐩𝐚𝐲 𝐩𝐮𝐛𝐥𝐢𝐜 𝐠𝐫𝐨𝐮𝐩 | Detail: RosePay Baby 消息发送成功
+[2026-07-05 07:11:21] | SUCCESS | Phone: RosePay kiki | Group: ZenPay🇨🇳 | Detail: RosePay kiki 消息发送成功
+[2026-07-05 07:11:03] | SUCCESS | Phone: RosePay 雷迪嘎嘎 | Group: India Job communication | Detail: RosePay 雷迪嘎嘎 消息发送成功
+[2026-07-05 07:10:48] | SUCCESS | Phone: RosePay 杨广 | Group: 𝑺𝑴𝑨𝑹𝑻 𝑷𝒂𝒚 𝒙 𝑴-𝑴𝑶𝑵𝑬𝒀 ⚡️𝑶𝑭𝑭𝑰𝑪𝑰𝑨𝑳 | Detail: RosePay 杨广 消息发送成功
+[2026-07-05 07:10:30] | SUCCESS | Phone: RosePay Baby | Group: 𝑬𝑫𝑬𝑵𝒑𝒂𝒚_𝑰𝒏𝒅𝒊𝒂 | Detail: RosePay Baby 消息发送成功
+[2026-07-05 07:10:14] | SUCCESS | Phone: RosePay 巴金 | Group: 🇮🇳JD pay 🔝 🎮 India-China | Detail: RosePay 巴金 消息发送成功
+[2026-07-05 07:09:58] | SUCCESS | Phone: RosePay 雷迪嘎嘎 | Group: Indian Bank-Goapy-China Payment | Detail: RosePay 雷迪嘎嘎 消息发送成功
+[2026-07-05 06:33:28] | SUCCESS | Phone: RosePay 雷迪嘎嘎 | Group: FalconPay Public Group | Detail: RosePay 雷迪嘎嘎 消息发送成功
+[2026-07-05 06:33:12] | SUCCESS | Phone: RosePay kiki | Group: What are you do in Bank and Company | Detail: RosePay kiki 消息发送成功
+[2026-07-05 06:32:56] | SUCCESS | Phone: RosePay Baby | Group: Usdt indian sellers | Detail: RosePay Baby 消息发送成功
+[2026-07-05 06:32:39] | SUCCESS | Phone: RosePay 雷迪嘎嘎 | Group: 昱鼎支付三方四方交流群 | Detail: RosePay 雷迪嘎嘎 消息发送成功

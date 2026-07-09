@@ -1,0 +1,100 @@
+7361:         status_res = set_account_status(account_id, status_res, source="login-status")
+7362:         if is_authorized and spambot_status == "restricted":
+7363:             send_ops_bot_notification(
+7364:                 "\n".join([
+7365:                     "🚨 <b>账号可能被限制</b>",
+7366:                     html_line("账号", get_account_notify_label(account_id)),
+7367:                     html_line("状态", "SpamBot restricted"),
+7368:                     html_line("详情", spambot_details[:800] if spambot_details else "未知"),
+7369:                     html_line("时间", ops_event_time()),
+7370:                 ]),
+7371:                 dedup_key=f"spambot_restricted:{account_id}",
+7372:                 cooldown_seconds=1800,
+7373:             )
+7374:         return status_res
+7375:     except asyncio.TimeoutError:
+7376:         return set_login_status_check_failed(
+7377:             account_id,
+7378:             "检测登录状态超时，已保留上一次登录状态；请稍后重试，或检查代理/Telegram 限流。",
+7379:             source="login-status-timeout",
+7380:             is_connected=bool(active_clients.get(account_id) and active_clients[account_id].is_connected()),
+7381:         )
+7382:     except Exception as e:
+7383:         err_msg = str(e).lower()
+7384:         is_deactivated = False
+7385:         if "deactivated" in err_msg or "deleted" in err_msg or "deactive" in err_msg or isinstance(e, UserDeactivatedError):
+7386:             is_deactivated = True
+7387:         is_auth_lost = any(
+7388:             marker in err_msg
+7389:             for marker in [
+7390:                 "auth key unregistered",
+7391:                 "authkeyunregistered",
+7392:                 "session revoked",
+7393:                 "user deactivated",
+7394:                 "unauthorized",
+7395:                 "not authorized",
+7396:             ]
+7397:         )
+7398:         if not is_deactivated and not is_auth_lost:
+7399:             return set_login_status_check_failed(
+7400:                 account_id,
+7401:                 f"检测登录状态失败，已保留上一次登录状态: {str(e)}",
+7402:                 source="login-status-error",
+7403:                 is_connected=bool(active_clients.get(account_id) and active_clients[account_id].is_connected()),
+7404:             )
+7405:         status_res = {
+7406:             "is_connected": False,
+7407:             "is_authorized": False,
+7408:             "is_deactivated": is_deactivated,
+7409:             "error": str(e),
+7410:             "last_error": str(e),
+7411:             "status_check_failed": True,
+7412:         }
+7413:         status_res = set_account_status(account_id, status_res, source="login-status-error")
+7414:         if is_deactivated:
+7415:             send_ops_bot_notification(
+7416:                 "\n".join([
+7417:                     "⛔ <b>账号疑似被封禁/注销</b>",
+7418:                     html_line("账号", get_account_notify_label(account_id)),
+7419:                     html_line("错误", str(e)[:800]),
+7420:                     html_line("时间", ops_event_time()),
+7421:                 ]),
+7422:                 dedup_key=f"deactivated:{account_id}",
+7423:                 cooldown_seconds=1800,
+7424:             )
+7425:         return status_res
+7426: 
+7427: @app.post("/api/login/send-code")
+7428: async def login_send_code(req: LoginStartRequest, user: dict = Depends(get_current_user)):
+7429:     """Initializes connection and requests login verification code."""
+7430:     account_id = req.account_id
+7431:     phone = req.phone.strip()
+7432:     if not phone:
+7433:         raise HTTPException(status_code=400, detail="Phone number is required")
+7434: 
+7435:     try:
+7436:         # Check if config exists in DB first
+7437:         from db import engine, AccountDb, Session
+7438:         with Session(engine) as session:
+7439:             db_account = session.get(AccountDb, account_id)
+7440: 
+7441:         config_path = account_config_path(account_id)
+7442:         if not db_account:
+7443:             # Create config in DB and sync to disk
+7444:             template_path = Path(__file__).resolve().parent / "config.json"
+7445:             if not template_path.exists():
+7446:                 template_path = Path(__file__).resolve().parent / "config.example.json"
+7447: 
+7448:             if not template_path.exists():
+7449:                 template = {
+7450:                     "auth_mode": "builtin_telegram_desktop",
+7451:                     "folder_name": "广告",
+7452:                     "connection_timeout_seconds": 12,
+7453:                     "connection_retries": 2,
+7454:                     "proxy": {"enabled": False, "type": "http", "host": "127.0.0.1", "port": 8800, "username": "", "password": ""}
+7455:                 }
+7456:             else:
+7457:                 template = load_json(template_path)
+7458: 
+7459:             config = build_account_config(account_id, phone, template)
+7460:             config["company"] = user["company"]

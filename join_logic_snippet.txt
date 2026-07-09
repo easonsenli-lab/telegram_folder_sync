@@ -1,0 +1,101 @@
+11101:                             entity = await join_group_or_channel_get_entity_only(client, link)
+11102: 
+11103:                             is_restricted = getattr(entity, 'restricted', False) if entity else False
+11104:                             restriction_reason_str = ""
+11105:                             if is_restricted:
+11106:                                 reasons = getattr(entity, 'restriction_reason', []) or []
+11107:                                 reasons_text = [getattr(r, 'text', '') for r in reasons]
+11108:                                 restriction_reason_str = "; ".join(filter(None, reasons_text)) or "该群组已被屏蔽限制 (restricted)"
+11109: 
+11110:                             if is_restricted:
+11111:                                 with Session(engine) as session:
+11112:                                     db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link, entity)
+11113:                                 task["logs"].append(f"账号 {phone} 检测到已加入的 {link} 变为无效限制群组: {restriction_reason_str}")
+11114:                                 results.append({
+11115:                                     "account_id": account_id,
+11116:                                     "phone": phone,
+11117:                                     "link": link,
+11118:                                     "status": "invalid",
+11119:                                     "error": restriction_reason_str,
+11120:                                     "group_id": db_group_id,
+11121:                                     "title": db_group_title or getattr(entity, 'title', '')
+11122:                                 })
+11123:                             else:
+11124:                                 can_speak = await check_can_speak(client, entity)
+11125:                                 status_str = "success" if can_speak else "restricted"
+11126:                                 err_msg = "已在群组中" if can_speak else "已在群组中但无法直接发言"
+11127:                                 with Session(engine) as session:
+11128:                                     db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link, entity)
+11129:                                 results.append({
+11130:                                     "account_id": account_id,
+11131:                                     "phone": phone,
+11132:                                     "link": link,
+11133:                                     "status": status_str,
+11134:                                     "error": err_msg,
+11135:                                     "group_id": db_group_id,
+11136:                                     "title": db_group_title or getattr(entity, 'title', '')
+11137:                                 })
+11138:                                 task["logs"].append(f"账号 {phone} 已经在 {link} 中。是否可发言: {can_speak}")
+11139: 
+11140:                                 # Since we were already a participant, count as success added
+11141:                                 added_this_round += 1
+11142: 
+11143:                                 if req.move_to_folder:
+11144:                                     folder_name_clean = ""
+11145:                                     if req.folder_by_type:
+11146:                                         try:
+11147:                                             company = task.get("company", "rosepay")
+11148:                                             folder_name_clean = await determine_group_folder_name(client, entity, link, company)
+11149:                                             task["logs"].append(f"根据群组类型自动分类，判定该群归属文件夹: '{folder_name_clean}'")
+11150:                                         except Exception as de:
+11151:                                             task["logs"].append(f"判定群组类型失败，退回默认分类 '中文长': {de}")
+11152:                                             folder_name_clean = "中文长"
+11153:                                     elif req.target_folder_name and req.target_folder_name.strip():
+11154:                                         folder_name_clean = req.target_folder_name.strip()
+11155: 
+11156:                                     if folder_name_clean:
+11157:                                         try:
+11158:                                             await add_peer_to_folder(client, entity, folder_name_clean)
+11159:                                             task["logs"].append(f"已成功将群组移入文件夹: '{folder_name_clean}'")
+11160:                                         except Exception as fe:
+11161:                                             task["logs"].append(f"移动群组到文件夹 '{folder_name_clean}' 失败: {str(fe)}")
+11162:                         except Exception as ex:
+11163:                             err_msg = str(ex)
+11164:                             err_msg_lower = err_msg.lower()
+11165:                             is_invalid = False
+11166:                             if "copyright" in err_msg_lower or "unavailable" in err_msg_lower or "forbidden" in err_msg_lower:
+11167:                                 is_invalid = True
+11168:                             if isinstance(ex, (telethon_errors.ChannelPrivateError, telethon_errors.ChatForbiddenError, telethon_errors.ChannelInvalidError)):
+11169:                                 is_invalid = True
+11170: 
+11171:                             with Session(engine) as session:
+11172:                                 db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link)
+11173:                             results.append({
+11174:                                 "account_id": account_id,
+11175:                                 "phone": phone,
+11176:                                 "link": link,
+11177:                                 "status": "invalid" if is_invalid else "restricted",
+11178:                                 "error": f"已在群中但获取信息失败: {err_msg}",
+11179:                                 "group_id": db_group_id,
+11180:                                 "title": db_group_title
+11181:                             })
+11182:                     except errors.FloodWaitError as fwe:
+11183:                         task["logs"].append(f"账号 {phone} 触发 FloodWait，必须等待 {fwe.seconds} 秒。跳过当前群组。")
+11184:                         results.append({
+11185:                             "account_id": account_id,
+11186:                             "phone": phone,
+11187:                             "link": link,
+11188:                             "status": "failed",
+11189:                             "error": f"触发电报 FloodWait 限制，需等待 {fwe.seconds} 秒"
+11190:                         })
+11191:                     except Exception as e:
+11192:                         err_msg = str(e)
+11193:                         err_msg_lower = err_msg.lower()
+11194:                         is_invalid = False
+11195:                         if "copyright" in err_msg_lower or "unavailable" in err_msg_lower or "forbidden" in err_msg_lower:
+11196:                             is_invalid = True
+11197:                         if isinstance(e, (telethon_errors.ChannelPrivateError, telethon_errors.ChatForbiddenError, telethon_errors.ChannelInvalidError)):
+11198:                             is_invalid = True
+11199: 
+11200:                         with Session(engine) as session:
+11201:                             db_group_id, db_group_title = find_group_id_by_link_or_entity(session, link)

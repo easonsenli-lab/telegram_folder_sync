@@ -1,0 +1,35 @@
+=== CHECKING TASK 938a17f6 RECENT RUNS & ERRORS ===
+
+--- Current DB Status of Task ---
+('938a17f6-89d1-4eb8-9b87-4131764cd0cc', 'stopped', 148, 2, '检测到发送进程已异常退出，已自动同步状态为停止。', '2026-07-05 17:48:00')
+
+--- Running ad_sender.py processes ---
+No active ad_sender.py processes.
+
+--- Campaign Logs Analysis ---
+Total recent logs found: 100
+  - [SUCCESS]: 96
+  - [SKIPPED]: 3
+  - [FAILED]: 1
+
+--- Detailed Logs (Last 20) ---
+[2026-07-05 07:50:46] | SUCCESS | Detail: RosePay Baby 消息发送成功
+[2026-07-05 07:50:30] | SUCCESS | Detail: RosePay 杨广 消息发送成功
+[2026-07-05 07:50:28] | SKIPPED | Detail: RosePay kiki 发送失败：无发言权限或账号被群限制 (UserBannedInChannelError)
+[2026-07-05 07:50:11] | SUCCESS | Detail: RosePay 雷迪嘎嘎 消息发送成功
+[2026-07-05 07:49:55] | SUCCESS | Detail: RosePay 杨广 消息发送成功
+[2026-07-05 07:49:53] | SKIPPED | Detail: RosePay kiki 发送失败：无发言权限或账号被群限制 (UserBannedInChannelError)
+[2026-07-05 07:49:36] | SUCCESS | Detail: RosePay 巴金 消息发送成功
+[2026-07-05 07:49:20] | SUCCESS | Detail: RosePay Baby 消息发送成功
+[2026-07-05 07:49:04] | SUCCESS | Detail: RosePay 杨广 消息发送成功
+[2026-07-05 07:48:47] | SUCCESS | Detail: RosePay 雷迪嘎嘎 消息发送成功
+[2026-07-05 07:48:31] | SUCCESS | Detail: RosePay kiki 消息发送成功
+[2026-07-05 07:48:14] | SUCCESS | Detail: RosePay Baby 消息发送成功
+[2026-07-05 07:47:58] | SUCCESS | Detail: RosePay 杨广 消息发送成功
+[2026-07-05 07:47:41] | SUCCESS | Detail: RosePay kiki 消息发送成功
+[2026-07-05 07:47:23] | SUCCESS | Detail: RosePay 巴金 消息发送成功
+[2026-07-05 07:47:07] | SUCCESS | Detail: RosePay 雷迪嘎嘎 消息发送成功
+[2026-07-05 07:46:51] | FAILED | Detail: RosePay kiki 发送失败：You cannot send plain results in this chat (caused by SendMessageRequest)
+[2026-07-05 07:46:35] | SUCCESS | Detail: RosePay Baby 消息发送成功
+[2026-07-05 07:46:19] | SUCCESS | Detail: RosePay 杨广 消息发送成功
+[2026-07-05 07:46:01] | SUCCESS | Detail: RosePay 巴金 消息发送成功

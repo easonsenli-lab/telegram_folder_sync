@@ -29,29 +29,6 @@ from services.shared_state import (
 
 from services.client_manager import get_client
 
-def check_ad_against_rules(ad_text: str, rules_summary: dict) -> tuple[bool, str]:
-    """
-    校验广告文本是否符合群组限制。符合返回 (True, ""), 不符合返回 (False, 违规原因描述)
-    """
-    if not ad_text:
-        return False, "文案为空"
-        
-    ad_len_bytes = len(ad_text.encode('utf-8'))
-    max_len_limit = int(rules_summary.get("max_length", 0))
-    # 默认全局安全字数限制为 350 字节，除非群组限制有更小值
-    effective_max = min(350, max_len_limit) if max_len_limit > 0 else 350
-    
-    if ad_len_bytes > effective_max:
-        return False, f"字数超限 (文案字节: {ad_len_bytes}，本群上限: {effective_max}字节)"
-        
-    if rules_summary.get("banned_links", False):
-        ad_text_lower = ad_text.lower()
-        if "http://" in ad_text_lower or "https://" in ad_text_lower or "t.me/" in ad_text_lower or "@" in ad_text_lower:
-            return False, "本群禁发链接或@提及用户名"
-            
-    return True, ""
-
-
 # Forward-declare or import helpers that are used inside the extracted block
 # Let's import other things from web_server if they are needed, or we can resolve them.
 # We will check if there are any undefined names after writing.
@@ -651,68 +628,25 @@ async def campaign_worker_task(task_id: str):
                     current_gtype = "英文短"
 
                 try:
-                    # 获取该群组的限制规则
-                    rules_summary = {}
-                    if db_g and db_g.bot_rules_summary:
-                        try:
-                            rules_summary = json.loads(db_g.bot_rules_summary)
-                        except Exception:
-                            pass
-
                     with Session(engine) as temp_session:
                         from db import PredefinedAdDb
-                        
-                        def get_filtered_ads(gtype):
-                            stmt = select(PredefinedAdDb).where(
-                                PredefinedAdDb.group_type == gtype,
-                                PredefinedAdDb.company == task_company
-                            )
-                            ads = temp_session.exec(stmt).all()
-                            if not ads:
-                                stmt_admin = select(PredefinedAdDb).where(
-                                    PredefinedAdDb.group_type == gtype,
-                                    PredefinedAdDb.company == "admin"
-                                )
-                                ads = temp_session.exec(stmt_admin).all()
-                            # 过滤合规广告
-                            valid_ads = []
-                            blocked_reasons = []
-                            for ad in ads:
-                                ok, reason = check_ad_against_rules(ad.content, rules_summary)
-                                if ok:
-                                    valid_ads.append(ad)
-                                else:
-                                    blocked_reasons.append(f"AD_{ad.id}:{reason}")
-                            return valid_ads, blocked_reasons
-
-                        # 第一步尝试：按群组当前的 category 筛选并过滤
-                        matching_ads, reasons = get_filtered_ads(current_gtype)
-                        
-                        # 第二步尝试：如果过滤后无可用广告文案，尝试分类降级 (长广告分类降级到短广告分类)
+                        stmt = select(PredefinedAdDb).where(
+                            PredefinedAdDb.group_type == current_gtype,
+                            PredefinedAdDb.company == task_company
+                        )
+                        matching_ads = temp_session.exec(stmt).all()
                         if not matching_ads:
-                            fallback_gtype = None
-                            if current_gtype == "中文长":
-                                fallback_gtype = "中文短"
-                            elif current_gtype == "英文长":
-                                fallback_gtype = "英文短"
-                                
-                            if fallback_gtype:
-                                print(f"[发信规则过滤] 分类 '{current_gtype}' 下无合规文案，自动降级至 '{fallback_gtype}' 重新匹配...")
-                                matching_ads, fallback_reasons = get_filtered_ads(fallback_gtype)
-                                reasons.extend(fallback_reasons)
-                                if matching_ads:
-                                    current_gtype = fallback_gtype
-                        
+                            stmt_admin = select(PredefinedAdDb).where(
+                                PredefinedAdDb.group_type == current_gtype,
+                                PredefinedAdDb.company == "admin"
+                            )
+                            matching_ads = temp_session.exec(stmt_admin).all()
                         if matching_ads:
                             ad = random.choice(matching_ads)
                             selected = ad.content
                             ad_ref = f"predefined:{ad.id}"
-                        else:
-                            # 终极安全拦截：未发现任何合规文案，安全返回 None 并记录原因
-                            selected = None
-                            ad_ref = f"filtered:无符合此群规格的合规广告文案({', '.join(reasons)})"
                 except Exception as e:
-                    print(f"Error fetching and filtering strategy ad: {e}")
+                    print(f"Error fetching strategy ad: {e}")
             elif msg_pool:
                 msg_index = random.randrange(len(msg_pool))
                 selected = msg_pool[msg_index]
@@ -775,24 +709,6 @@ async def campaign_worker_task(task_id: str):
                 title = group["title"]
                 username = group.get("username")
                 selected_msg, current_gtype, selected_ad_ref = choose_campaign_message_for_group(group, chat_id, title, username)
-
-                # 智能防护核心拦截：如果广告语因规则过滤为 None，本轮直接跳过，保护大号！
-                if selected_msg is None:
-                    reason = "本群存在敏感限制，且广告库中无合规文案，安全跳过。"
-                    if "filtered:" in selected_ad_ref:
-                        reason = selected_ad_ref.split(":", 1)[1]
-                    await write_campaign_log(
-                        cycle,
-                        title,
-                        str(chat_id),
-                        username,
-                        None,
-                        None,
-                        "skipped",
-                        reason,
-                        selected_ad_ref,
-                    )
-                    continue
 
                 log_status = "success"
                 log_detail = ""

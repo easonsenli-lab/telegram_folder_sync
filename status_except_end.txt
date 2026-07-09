@@ -1,0 +1,35 @@
+7476:                 source="login-status-error",
+7477:                 is_connected=bool(active_clients.get(account_id) and active_clients[account_id].is_connected()),
+7478:             )
+7479:         status_res = {
+7480:             "is_connected": False,
+7481:             "is_authorized": False,
+7482:             "is_deactivated": is_deactivated,
+7483:             "error": str(e),
+7484:             "last_error": str(e),
+7485:             "status_check_failed": True,
+7486:         }
+7487:         status_res = set_account_status(account_id, status_res, source="login-status-error")
+7488:         if is_deactivated:
+7489:             send_ops_bot_notification(
+7490:                 "\n".join([
+7491:                     "⛔ <b>账号疑似被封禁/注销</b>",
+7492:                     html_line("账号", get_account_notify_label(account_id)),
+7493:                     html_line("错误", str(e)[:800]),
+7494:                     html_line("时间", ops_event_time()),
+7495:                 ]),
+7496:                 dedup_key=f"deactivated:{account_id}",
+7497:                 cooldown_seconds=1800,
+7498:             )
+7499:         return status_res
+7500: 
+7501: @app.post("/api/login/send-code")
+7502: async def login_send_code(req: LoginStartRequest, user: dict = Depends(get_current_user)):
+7503:     """Initializes connection and requests login verification code."""
+7504:     account_id = req.account_id
+7505:     phone = req.phone.strip()
+7506:     if not phone:
+7507:         raise HTTPException(status_code=400, detail="Phone number is required")
+7508: 
+7509:     try:
+7510:         # Check if config exists in DB first

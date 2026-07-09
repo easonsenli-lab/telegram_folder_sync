@@ -16,7 +16,9 @@ from services.shared_state import (
     set_account_status,
     is_account_busy_with_task,
     get_account_busy_status,
-    spambot_cache
+    spambot_cache,
+    active_account_operations,
+    registered_listeners
 )
 
 from services.client_manager import get_client, mark_account_runtime_status, account_has_session_file
@@ -48,11 +50,14 @@ def mark_private_listener_cooldown(account_id: str, exc: Exception, context: str
 
 def list_accounts(company: Optional[str] = None) -> List[Any]:
     import web_server
-    return web_server.list_accounts(company)
+    return web_server.list_accounts()
 
-def check_account_status(account_id: str, *, run_spambot_check: bool = False, source: str = "manual") -> dict:
+async def check_account_status(account_or_client: Any, *, run_spambot_check: bool = False, source: str = "manual") -> Any:
     import web_server
-    return web_server.check_account_status(account_id, run_spambot_check=run_spambot_check, source=source)
+    client = account_or_client
+    if isinstance(account_or_client, str):
+        client = await get_client(account_or_client)
+    return await web_server.check_account_status(client)
 
 from account_manager import account_config_path
 

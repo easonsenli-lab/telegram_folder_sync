@@ -1,0 +1,34 @@
+=== REMOTE FORMAL ARCHIVE BACKUP ===
+Backup stderr (if any): 
+
+--- Backup Files List ---
+total 238M
+-rw-r--r-- 1 root root 2.8M Jul  1 08:14 code_before_ad_350_limit_20260701_161408.tar.gz
+-rw-r--r-- 1 root root 2.8M Jul  1 07:55 code_before_ellipsis_block_20260701_155526.tar.gz
+-rw-r--r-- 1 root root 2.8M Jul  1 08:24 code_before_utf8_byte_count_20260701_162416.tar.gz
+-rw-r--r-- 1 root root 2.6M Jul  1 07:52 frontend_before_template_full_display_20260701_155213.tar.gz
+-rw-r--r-- 1 root root 2.8M Jul  1 07:45 telegram_folder_sync_code_before_ad_400_guard_20260701_154537.tar.gz
+-rw-r--r-- 1 root root  14M Jun 30 05:58 telegram_folder_sync_code_before_ad_tabs_align_20260630_135834.tar.gz
+-rw-r--r-- 1 root root 9.8M Jul  2 04:00 telegram_folder_sync_code_before_ai_bot_rules_20260702_120031.tar.gz
+-rw-r--r-- 1 root root  25M Jul  1 05:52 telegram_folder_sync_code_before_campaign_log_copy_20260701_135227.tar.gz
+-rw-r--r-- 1 root root 5.5M Jun 23 10:38 telegram_folder_sync_code_before_deploy_20260623_103844.tar.gz
+-rw-r--r-- 1 root root  14M Jun 30 07:31 telegram_folder_sync_code_before_deploy_20260630_153120.tar.gz
+-rw-r--r-- 1 root root 2.6M Jul  1 07:35 telegram_folder_sync_code_before_group_name_full_20260701_153547.tar.gz
+-rw-r--r-- 1 root root  25M Jul  1 07:28 telegram_folder_sync_code_before_group_title_width_20260701_152755.tar.gz
+-rw-r--r-- 1 root root  25M Jul  1 05:56 telegram_folder_sync_code_before_log_single_line_20260701_135650.tar.gz
+-rw-r--r-- 1 root root  25M Jul  1 07:22 telegram_folder_sync_code_before_remove_send_audit_20260701_152223.tar.gz
+-rw-r--r-- 1 root root  13M Jun 30 06:07 telegram_folder_sync_code_before_source_unify_20260630_140658.tar.gz
+-rw-r--r-- 1 root root  13M Jun 30 06:07 telegram_folder_sync_code_before_source_unify_retry_20260630_140745.tar.gz
+-rw-r--r-- 1 root root 8.7M Jun 30 08:20 telegram_folder_sync_code_before_static_proxy_pool_20260630_162021.tar.gz
+-rw-r--r-- 1 root root  11M Jul  5 09:52 telegram_folder_sync_code_before_timezone_fix_20260705_175200.tar.gz
+-rw-r--r-- 1 root root  17M Jun 30 05:49 telegram_folder_sync_code_before_ui_folder_sync_20260630_134912.tar.gz
+-rw-r--r-- 1 root root 2.5M Jul  1 08:14 var_www_html_before_ad_350_limit_20260701_161408.tar.gz
+-rw-r--r-- 1 root root 2.5M Jul  1 07:45 var_www_html_before_ad_400_guard_20260701_154537.tar.gz
+-rw-r--r-- 1 root root 2.4M Jul  1 05:52 var_www_html_before_campaign_log_copy_20260701_135227.tar.gz
+-rw-r--r-- 1 root root 2.5M Jul  1 07:55 var_www_html_before_ellipsis_block_20260701_155526.tar.gz
+-rw-r--r-- 1 root root 2.5M Jul  1 07:35 var_www_html_before_group_name_full_20260701_153547.tar.gz
+-rw-r--r-- 1 root root 2.5M Jul  1 07:28 var_www_html_before_group_title_width_20260701_152755.tar.gz
+-rw-r--r-- 1 root root 2.5M Jul  1 05:56 var_www_html_before_log_single_line_20260701_135650.tar.gz
+-rw-r--r-- 1 root root 2.5M Jul  1 07:52 var_www_html_before_template_full_display_20260701_155213.tar.gz
+-rw-r--r-- 1 root root 2.5M Jul  1 08:24 var_www_html_before_utf8_byte_count_20260701_162416.tar.gz
+-rw-r--r-- 1 root root 122K Jul  1 08:46 web_server_before_no_auto_join_on_campaign_20260701_164644.tar.gz

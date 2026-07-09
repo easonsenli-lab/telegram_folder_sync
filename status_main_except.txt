@@ -1,0 +1,70 @@
+7421: 
+7422:         status_res = {
+7423:             "is_connected": is_connected,
+7424:             "is_authorized": is_authorized,
+7425:             "me": me_info,
+7426:             "spambot_status": spambot_status,
+7427:             "spambot_details": spambot_details,
+7428:             "spambot_time": spambot_time,
+7429:             "bot_setup_status": db_acc.bot_setup_status if db_acc and is_authorized else "not_started",
+7430:             "error": "; ".join(check_warnings) if check_warnings else None,
+7431:             "last_error": "; ".join(check_warnings) if check_warnings else None,
+7432:             "status_check_failed": bool(check_warnings),
+7433:             "status_check_warnings": check_warnings,
+7434:         }
+7435:         status_res = set_account_status(account_id, status_res, source="login-status")
+7436:         if is_authorized and spambot_status == "restricted":
+7437:             send_ops_bot_notification(
+7438:                 "\n".join([
+7439:                     "🚨 <b>账号可能被限制</b>",
+7440:                     html_line("账号", get_account_notify_label(account_id)),
+7441:                     html_line("状态", "SpamBot restricted"),
+7442:                     html_line("详情", spambot_details[:800] if spambot_details else "未知"),
+7443:                     html_line("时间", ops_event_time()),
+7444:                 ]),
+7445:                 dedup_key=f"spambot_restricted:{account_id}",
+7446:                 cooldown_seconds=1800,
+7447:             )
+7448:         return status_res
+7449:     except asyncio.TimeoutError:
+7450:         return set_login_status_check_failed(
+7451:             account_id,
+7452:             "检测登录状态超时，已保留上一次登录状态；请稍后重试，或检查代理/Telegram 限流。",
+7453:             source="login-status-timeout",
+7454:             is_connected=bool(active_clients.get(account_id) and active_clients[account_id].is_connected()),
+7455:         )
+7456:     except Exception as e:
+7457:         err_msg = str(e).lower()
+7458:         is_deactivated = False
+7459:         if "deactivated" in err_msg or "deleted" in err_msg or "deactive" in err_msg or isinstance(e, UserDeactivatedError):
+7460:             is_deactivated = True
+7461:         is_auth_lost = any(
+7462:             marker in err_msg
+7463:             for marker in [
+7464:                 "auth key unregistered",
+7465:                 "authkeyunregistered",
+7466:                 "session revoked",
+7467:                 "user deactivated",
+7468:                 "unauthorized",
+7469:                 "not authorized",
+7470:             ]
+7471:         )
+7472:         if not is_deactivated and not is_auth_lost:
+7473:             return set_login_status_check_failed(
+7474:                 account_id,
+7475:                 f"检测登录状态失败，已保留上一次登录状态: {str(e)}",
+7476:                 source="login-status-error",
+7477:                 is_connected=bool(active_clients.get(account_id) and active_clients[account_id].is_connected()),
+7478:             )
+7479:         status_res = {
+7480:             "is_connected": False,
+7481:             "is_authorized": False,
+7482:             "is_deactivated": is_deactivated,
+7483:             "error": str(e),
+7484:             "last_error": str(e),
+7485:             "status_check_failed": True,
+7486:         }
+7487:         status_res = set_account_status(account_id, status_res, source="login-status-error")
+7488:         if is_deactivated:
+7489:             send_ops_bot_notification(
+7490:                 "\n".join([

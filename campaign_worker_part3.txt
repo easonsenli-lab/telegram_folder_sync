@@ -1,0 +1,204 @@
+pe_err:
+                    print(f"Error resolving group type: {gtype_err}")
+                if not current_gtype:
+                    current_gtype = "英文短"
+
+                try:
+                    with Session(engine) as temp_session:
+                        from db import PredefinedAdDb
+                        stmt = select(PredefinedAdDb).where(
+                            PredefinedAdDb.group_type == current_gtype,
+                            PredefinedAdDb.company == task_company
+                        )
+                        matching_ads = temp_session.exec(stmt).all()
+                        if not matching_ads:
+                            stmt_admin = select(PredefinedAdDb).where(
+                                PredefinedAdDb.group_type == current_gtype,
+                                PredefinedAdDb.company == "admin"
+                            )
+                            matching_ads = temp_session.exec(stmt_admin).all()
+                        if matching_ads:
+                            ad = random.choice(matching_ads)
+                            selected = ad.content
+                            ad_ref = f"predefined:{ad.id}"
+                except Exception as e:
+                    print(f"Error fetching strategy ad: {e}")
+            elif msg_pool:
+                msg_index = random.randrange(len(msg_pool))
+                selected = msg_pool[msg_index]
+                ad_ref = f"pool:{msg_index}"
+            else:
+                selected = "🌹 RosePay 广告投放中"
+                ad_ref = "fallback"
+            return selected, current_gtype, ad_ref
+
+        async def campaign_drain_private_queues(max_items_per_account: int = 3) -> int:
+            drained_total = 0
+            for queued_account_id in list(account_ids):
+                try:
+                    queued_client = clients.get(queued_account_id)
+                    if queued_client and queued_client.is_connected():
+                        drained_total += await drain_pending_private_sends(
+                            queued_account_id,
+                            queued_client,
+                            max_items=max_items_per_account,
+                        )
+                except Exception as drain_exc:
+                    print(f"[PrivateSendQueue] Campaign drain failed for {queued_account_id}: {drain_exc}")
+            return drained_total
+
+        async def campaign_sleep_with_private_queue(total_seconds: float, max_items_per_account: int = 2):
+            remaining = max(0.0, float(total_seconds or 0))
+            while remaining > 0:
+                await campaign_drain_private_queues(max_items_per_account=max_items_per_account)
+                step = min(5.0, remaining)
+                await asyncio.sleep(step)
+                remaining -= step
+            await campaign_drain_private_queues(max_items_per_account=max_items_per_account)
+
+        cycle = max(1, int(task_record.current_cycle or 1))
+        while True:
+            # 1. Update status
+            with Session(engine) as session:
+                task = session.get(CampaignTaskDb, task_id)
+                if not task or task.status == "stopped":
+                    break
+                task.current_cycle = cycle
+                session.add(task)
+                session.commit()
+
+            # 2. Iterate through targets in this cycle. Shuffle every round so
+            # repeated tasks do not hit groups in the exact same order.
+            cycle_groups = list(target_groups)
+            random.shuffle(cycle_groups)
+            for idx, group in enumerate(cycle_groups):
+                await campaign_drain_private_queues(max_items_per_account=2)
+
+                # Check cancellation
+                with Session(engine) as session:
+                    task = session.get(CampaignTaskDb, task_id)
+                    if not task or task.status == "stopped":
+                        break
+
+                final_msg = ""
+                chat_id = group["chat_id"]
+                title = group["title"]
+                username = group.get("username")
+                selected_msg, current_gtype, selected_ad_ref = choose_campaign_message_for_group(group, chat_id, title, username)
+
+                log_status = "success"
+                log_detail = ""
+                selected_account_id = ""
+                selected_phone = ""
+                group_key = campaign_group_key(group)
+
+                if group_key in blocked_group_keys:
+                    await write_campaign_log(
+                        cycle,
+                        title,
+                        str(chat_id),
+                        username,
+                        None,
+                        None,
+                        "skipped",
+                        f"本群上一轮已判定不可发言，本轮跳过。原因：{blocked_group_keys[group_key]}",
+                        selected_ad_ref,
+                    )
+                    continue
+
+                try:
+                    candidate_ids = await build_campaign_candidate_order()
+                    skipped_prepare_details: List[str] = []
+                    cannot_speak_details: List[str] = []
+                    invalid_or_warning_details: List[str] = []
+                    last_candidate_error = ""
+                    sent_this_group = False
+
+                    for candidate_account_id in candidate_ids:
+                        selected_account_id = candidate_account_id
+                        selected_phone = phones_by_id.get(selected_account_id, selected_account_id)
+                        client = await get_campaign_client(selected_account_id)
+
+                        if not client.is_connected():
+                            try:
+                                await client.connect()
+                            except Exception as conn_err:
+                                raise Exception(f"客户端连接已断开，尝试自动重连失败: {conn_err}")
+
+                        try:
+                            target_entity, resolved_chat_id, resolved_title, joined_now = await resolve_campaign_target_for_account(client, group)
+                            chat_id = resolved_chat_id or chat_id
+                            title = resolved_title or title
+                        except Exception as account_exc:
+                            last_candidate_error = f"{selected_phone} 检查群组失败：{account_exc}"
+                            if is_campaign_permission_or_invalid_error(account_exc):
+                                invalid_or_warning_details.append(last_candidate_error)
+                            if len(candidate_ids) > 1:
+                                await write_campaign_log(
+                                    cycle,
+                                    title,
+                                    str(chat_id),
+                                    username,
+                                    selected_account_id,
+                                    selected_phone,
+                                    "skipped",
+                                    last_candidate_error,
+                                    selected_ad_ref,
+                                )
+                                continue
+                            raise
+
+                        if joined_now:
+                            prepare_detail = f"{selected_phone} 未加入该群，已先加入准备，本轮不发送，等待下一轮再判断"
+                            skipped_prepare_details.append(prepare_detail)
+                            await write_campaign_log(
+                                cycle,
+                                title,
+                                str(chat_id),
+                                username,
+                                selected_account_id,
+                                selected_phone,
+                                "skipped",
+                                prepare_detail,
+                                selected_ad_ref,
+                            )
+                            if multi_account_safety_enabled:
+                                account_cooldowns[selected_account_id] = time.time() + max(10, min(60, safe_group_interval))
+                            continue
+
+                        try:
+                            if not isinstance(target_entity, int):
+                                can_speak = await check_can_speak(client, target_entity)
+                                if not can_speak:
+                                    no_speak_detail = f"{selected_phone} 已在群内但无发言权限，本轮换下一个账号尝试"
+                                    cannot_speak_details.append(no_speak_detail)
+                                    await write_campaign_log(
+                                        cycle,
+                                        title,
+                                        str(chat_id),
+                                        username,
+                                        selected_account_id,
+                                        selected_phone,
+                                        "skipped",
+                                        no_speak_detail,
+                                        selected_ad_ref,
+                                    )
+                                    continue
+                        except Exception as speak_check_exc:
+                            last_candidate_error = f"{selected_phone} 发言权限检测失败：{speak_check_exc}"
+                            if is_campaign_permission_or_invalid_error(speak_check_exc):
+                                invalid_or_warning_details.append(last_candidate_error)
+                            await write_campaign_log(
+                                cycle,
+                                title,
+                                str(chat_id),
+                                username,
+                                selected_account_id,
+                                selected_phone,
+                                "skipped",
+                                last_candidate_error,
+                                selected_ad_ref,
+                            )
+                            continue
+
+           

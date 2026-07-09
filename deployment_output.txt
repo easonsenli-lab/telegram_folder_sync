@@ -1,0 +1,19 @@
+=== SSH CONNECTED ===
+Backup response: Success
+File uploaded successfully.
+Remote compile check: No syntax errors
+Service restart response: Success
+
+--- Service Status ---
+● rosepay.service - RosePay Telegram Sync & Campaign Control Panel
+     Loaded: loaded (/etc/systemd/system/rosepay.service; enabled; preset: enabled)
+     Active: active (running) since Sun 2026-07-05 11:08:20 UTC; 665ms ago
+ Invocation: dc3d0fa47a26443fac7d8d55d0f1e6f4
+   Main PID: 232144 (python)
+      Tasks: 1 (limit: 3991)
+     Memory: 56.4M (peak: 56.4M)
+        CPU: 656ms
+     CGroup: /system.slice/rosepay.service
+             └─232144 /root/telegram_folder_sync/.venv/bin/python /root/telegram_folder_sync/web_server.py
+
+Jul 05 11:08:20 vultr systemd[1]: Started rosepay.service - RosePay Telegram Sync & Campaign Control Panel.

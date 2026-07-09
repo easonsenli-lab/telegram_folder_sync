@@ -1,0 +1,22 @@
+7946: async def ensure_private_listener_for_account(account_id: str, account_label: str = "") -> bool:
+7947:     if get_private_poll_skip_reason(account_id):
+7948:         return False
+7949:     client = await get_client(account_id)
+7950:     if not await client.is_user_authorized():
+7951:         return False
+7952:     auto_private_listener_accounts.add(account_id)
+7953:     active_clients_last_accessed[account_id] = time.time()
+7954:     set_account_status(
+7955:         account_id,
+7956:         {
+7957:             "is_connected": True,
+7958:             "is_authorized": True,
+7959:             "private_listener": True,
+7960:             "private_listener_source": "auto",
+7961:         },
+7962:         source="private-listener-auto",
+7963:     )
+7964:     print(f"[PrivateListener] Auto listener active for {account_label or account_id}.")
+7965:     return True
+7966: 
+7967: 

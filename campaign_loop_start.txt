@@ -1,0 +1,110 @@
+8941:                             )
+8942:                             if multi_account_safety_enabled:
+8943:                                 account_cooldowns[selected_account_id] = time.time() + max(10, min(60, safe_group_interval))
+8944:                             continue
+8945: 
+8946:                         try:
+8947:                             if not isinstance(target_entity, int):
+8948:                                 can_speak = await check_can_speak(client, target_entity)
+8949:                                 if not can_speak:
+8950:                                     no_speak_detail = f"{selected_phone} 已在群内但无发言权限，本轮换下一个账号尝试"
+8951:                                     cannot_speak_details.append(no_speak_detail)
+8952:                                     await write_campaign_log(
+8953:                                         cycle,
+8954:                                         title,
+8955:                                         str(chat_id),
+8956:                                         username,
+8957:                                         selected_account_id,
+8958:                                         selected_phone,
+8959:                                         "skipped",
+8960:                                         no_speak_detail,
+8961:                                         selected_ad_ref,
+8962:                                     )
+8963:                                     continue
+8964:                         except Exception as speak_check_exc:
+8965:                             last_candidate_error = f"{selected_phone} 发言权限检测失败：{speak_check_exc}"
+8966:                             if is_campaign_permission_or_invalid_error(speak_check_exc):
+8967:                                 invalid_or_warning_details.append(last_candidate_error)
+8968:                             await write_campaign_log(
+8969:                                 cycle,
+8970:                                 title,
+8971:                                 str(chat_id),
+8972:                                 username,
+8973:                                 selected_account_id,
+8974:                                 selected_phone,
+8975:                                 "skipped",
+8976:                                 last_candidate_error,
+8977:                                 selected_ad_ref,
+8978:                             )
+8979:                             continue
+8980: 
+8981:                         if strategy_enabled and not selected_msg:
+8982:                             current_gtype = group.get("group_type") or ""
+8983:                             try:
+8984:                                 with Session(engine) as temp_session:
+8985:                                     from db import GroupDb, ScrapedGroupDb
+8986:                                     db_g = None
+8987:                                     if chat_id:
+8988:                                         g_ids = [str(chat_id), f"-{chat_id}", f"-100{chat_id}"]
+8989:                                         db_g = temp_session.exec(select(GroupDb).where(GroupDb.id.in_(g_ids), GroupDb.company == task_company)).first()
+8990:                                         if not db_g:
+8991:                                             db_g = temp_session.exec(select(GroupDb).where(GroupDb.id.in_(g_ids))).first()
+8992:                                     if not db_g and username:
+8993:                                         db_g = temp_session.exec(select(GroupDb).where(GroupDb.username == username.lstrip("@").strip(), GroupDb.company == task_company)).first()
+8994:                                         if not db_g:
+8995:                                             db_g = temp_session.exec(select(GroupDb).where(GroupDb.username == username.lstrip("@").strip())).first()
+8996: 
+8997:                                     if db_g:
+8998:                                         current_gtype = db_g.category
+8999: 
+9000:                                     db_sg = None
+9001:                                     if chat_id:
+9002:                                         g_ids = [str(chat_id), f"-{chat_id}", f"-100{chat_id}"]
+9003:                                         db_sg = temp_session.exec(select(ScrapedGroupDb).where(ScrapedGroupDb.id.in_(g_ids))).first()
+9004:                                     if not db_sg and username:
+9005:                                         db_sg = temp_session.exec(select(ScrapedGroupDb).where(ScrapedGroupDb.username == username.lstrip("@").strip())).first()
+9006:                                     if not db_sg and title:
+9007:                                         db_sg = temp_session.exec(select(ScrapedGroupDb).where(ScrapedGroupDb.title == title)).first()
+9008:                                     if db_sg and db_sg.group_type:
+9009:                                         current_gtype = db_sg.group_type
+9010:                             except Exception as gtype_err:
+9011:                                 print(f"Error resolving group type: {gtype_err}")
+9012:                             if not current_gtype:
+9013:                                 current_gtype = "英文短"
+9014: 
+9015:                             try:
+9016:                                 with Session(engine) as temp_session:
+9017:                                     from db import PredefinedAdDb
+9018:                                     stmt = select(PredefinedAdDb).where(
+9019:                                         PredefinedAdDb.group_type == current_gtype,
+9020:                                         PredefinedAdDb.company == task_company
+9021:                                     )
+9022:                                     matching_ads = temp_session.exec(stmt).all()
+9023:                                     if not matching_ads:
+9024:                                         stmt_admin = select(PredefinedAdDb).where(
+9025:                                             PredefinedAdDb.group_type == current_gtype,
+9026:                                             PredefinedAdDb.company == "admin"
+9027:                                         )
+9028:                                         matching_ads = temp_session.exec(stmt_admin).all()
+9029:                                     if matching_ads:
+9030:                                         fallback_ad = random.choice(matching_ads)
+9031:                                         selected_msg = fallback_ad.content
+9032:                                         selected_ad_ref = f"predefined:{fallback_ad.id}"
+9033:                             except Exception as e:
+9034:                                 print(f"Error fetching strategy ad: {e}")
+9035: 
+9036:                         if not selected_msg:
+9037:                             if strategy_enabled:
+9038:                                 strategy_skip_detail = f"智能策略未找到【{current_gtype or '英文短'}】分类广告语，本群本轮跳过。"
+9039:                                 await write_campaign_log(
+9040:                                     cycle,
+9041:                                     title,
+9042:                                     str(chat_id),
+9043:                                     username,
+9044:                                     selected_account_id,
+9045:                                     selected_phone,
+9046:                                     "skipped",
+9047:                                     strategy_skip_detail,
+9048:                                     selected_ad_ref,
+9049:                                 )
+9050:                                 continue

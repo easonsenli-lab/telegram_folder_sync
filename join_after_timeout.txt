@@ -1,0 +1,30 @@
+11236:                         "status": "timeout",
+11237:                         "error": "加群超时已超10秒，账号可能被限制或假死",
+11238:                         "group_id": db_group_id,
+11239:                         "title": db_group_title
+11240:                     })
+11241: 
+11242:                 task["progress"]["current"] += 1
+11243:                 save_last_join_task(task_id)
+11244: 
+11245:                 if idx < len(todo_links) and added_this_round < groups_per_round:
+11246:                     delay = base_delay * random.uniform(0.85, 1.15)
+11247:                     task["logs"].append(f"账号 {phone} 等待延迟 {delay:.1f} 秒...")
+11248:                     slept_links = 0
+11249:                     while slept_links < delay and task["status"] == "running":
+11250:                         await asyncio.sleep(1)
+11251:                         slept_links += 1
+11252: 
+11253:             task["logs"].append(f"账号 {phone} 本轮执行完毕，本轮成功加入 {added_this_round} 个群组。")
+11254: 
+11255:         # Outer loop to run rounds
+11256:         current_round = 1
+11257:         while task["status"] == "running":
+11258:             # Check if all links processed for all accounts
+11259:             all_accounts_done = True
+11260:             for acc_id, _ in accounts_info:
+11261:                 idx = accounts_link_index.get(acc_id, 0)
+11262:                 todo = accounts_todo_links.get(acc_id, [])
+11263:                 if idx < len(todo):
+11264:                     all_accounts_done = False
+11265:                     break

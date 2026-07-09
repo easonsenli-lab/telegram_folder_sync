@@ -1,0 +1,65 @@
+9051:                             if msg_pool:
+9052:                                 fallback_index = random.randrange(len(msg_pool))
+9053:                                 selected_msg = msg_pool[fallback_index]
+9054:                                 selected_ad_ref = f"pool:{fallback_index}"
+9055:                             else:
+9056:                                 selected_msg = "🌹 RosePay 广告投放中"
+9057:                                 selected_ad_ref = "fallback"
+9058: 
+9059:                         final_msg = str(selected_msg or "").strip()
+9060:                         if "..." in final_msg or "…" in final_msg:
+9061:                             broken_detail = f"{selected_phone} 广告语疑似被截断（包含省略号），已跳过未发送"
+9062:                             await write_campaign_log(
+9063:                                 cycle,
+9064:                                 title,
+9065:                                 str(chat_id),
+9066:                                 username,
+9067:                                 selected_account_id,
+9068:                                 selected_phone,
+9069:                                 "skipped",
+9070:                                 broken_detail,
+9071:                                 selected_ad_ref,
+9072:                             )
+9073:                             continue
+9074:                         final_msg_bytes = len(final_msg.encode("utf-8"))
+9075:                         if final_msg_bytes > 350:
+9076:                             too_long_detail = f"{selected_phone} 广告语超过350 UTF-8字节，已跳过未发送（当前 {final_msg_bytes} 字节）"
+9077:                             await write_campaign_log(
+9078:                                 cycle,
+9079:                                 title,
+9080:                                 str(chat_id),
+9081:                                 username,
+9082:                                 selected_account_id,
+9083:                                 selected_phone,
+9084:                                 "skipped",
+9085:                                 too_long_detail,
+9086:                                 selected_ad_ref,
+9087:                             )
+9088:                             continue
+9089: 
+9090:                         target_for_send = target_entity or chat_id
+9091:                         can_speak = await check_can_speak(client, target_for_send)
+9092:                         if not can_speak:
+9093:                             no_speak_detail = f"{selected_phone} 无该群发言权限，已跳过未发送"
+9094:                             cannot_speak_details.append(no_speak_detail)
+9095:                             await write_campaign_log(
+9096:                                 cycle,
+9097:                                 title,
+9098:                                 str(chat_id),
+9099:                                 username,
+9100:                                 selected_account_id,
+9101:                                 selected_phone,
+9102:                                 "skipped",
+9103:                                 no_speak_detail,
+9104:                                 selected_ad_ref,
+9105:                             )
+9106:                             continue
+9107: 
+9108:                         try:
+9109:                             await client.send_message(target_for_send, final_msg)
+9110:                         except (errors.ChatAdminRequiredError, errors.ChatWriteForbiddenError, errors.UserBannedInChannelError) as send_perm_exc:
+9111:                             no_speak_detail = f"{selected_phone} 发送失败：无发言权限或账号被群限制 ({type(send_perm_exc).__name__})"
+9112:                             cannot_speak_details.append(no_speak_detail)
+9113:                             await write_campaign_log(
+9114:                                 cycle,
+9115:                                 title,
