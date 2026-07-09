@@ -6372,10 +6372,37 @@ async def get_spambot_status(client) -> dict:
 async def get_login_status(account_id: str, force: bool = False, user: dict = Depends(get_current_user)):
     """Checks the connection and authorization status of a Telegram account."""
     check_account_company(account_id, user)
+    is_connected = False
+    is_authorized = False
+    client = None
+    is_occupied_fallback = False
+    
     try:
-        client = await asyncio.wait_for(get_client(account_id), timeout=15)
-        is_connected = client.is_connected()
-        is_authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=8) if is_connected else False
+        # 1. 优先尝试从内存共享池中穿透获取已经跟 Telegram 连好的活跃 client，免去连接锁定冲突与 API 握手开销
+        from services.client_manager import active_clients
+        mem_client = active_clients.get(account_id)
+        if mem_client and mem_client.is_connected():
+            client = mem_client
+            is_connected = True
+            is_authorized = True
+            print(f"[LoginStatus] Directly reusing active memory client for occupied/live account {account_id}.")
+        else:
+            # 2. 内存无连接，才尝试建立标准加锁连接
+            client = await asyncio.wait_for(get_client(account_id), timeout=15)
+            is_connected = client.is_connected()
+            is_authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=8) if is_connected else False
+    except HTTPException as http_exc:
+        # 3. 如果捕获到 409 或 400（证明大号正被独立子进程或忙碌任务独占），我们启动自适应平滑降级：
+        # 此时账号必定是在线连接着的，我们判定 is_connected = True, is_authorized = True 并在后文使用历史缓存返回健康度，防止假死报错！
+        if http_exc.status_code in (400, 409):
+            is_connected = True
+            is_authorized = True
+            is_occupied_fallback = True
+            print(f"[LoginStatus] Account {account_id} is busy with campaign/task. Triggering occupied cache fallback.")
+        else:
+            raise
+    except Exception as conn_err:
+        raise conn_err
         me_info = None
         spambot_status = "unknown"
         spambot_details = ""
@@ -6385,7 +6412,18 @@ async def get_login_status(account_id: str, force: bool = False, user: dict = De
 
         if is_authorized:
             try:
-                me = await asyncio.wait_for(client.get_me(), timeout=8)
+                # 如果是占用状态，我们尝试从数据库直接读取之前保存的账号名，避免在运行任务时去 call get_me
+                if is_occupied_fallback:
+                    from db import engine, AccountDb, Session
+                    with Session(engine) as db_session:
+                        db_acc = db_session.get(AccountDb, account_id)
+                        if db_acc and db_acc.profile_modified_name:
+                            me_info = f"{db_acc.profile_modified_name} (任务运行中)"
+                        else:
+                            me_info = "账号正在执行任务中"
+                    me = None
+                else:
+                    me = await asyncio.wait_for(client.get_me(), timeout=8)
                 if me:
                     username = f"@{me.username}" if me.username else ""
                     me_info = f"{me.first_name or ''} {me.last_name or ''} {username} (ID: {me.id})".strip()
@@ -6428,6 +6466,11 @@ async def get_login_status(account_id: str, force: bool = False, user: dict = De
                 spambot_status = cached["status"]
                 spambot_details = cached["details"]
                 spambot_time = cached["timestamp"]
+            elif is_occupied_fallback:
+                # 如果是占用降级模式，绝不去并发请求 SpamBot，100% 安全地复用本地缓存数据返回
+                spambot_status = cached.get("status", "unknown") if cached else "unknown"
+                spambot_details = cached.get("details", "账号执行任务中") if cached else "账号执行任务中"
+                spambot_time = cached.get("timestamp") if cached else None
             else:
                 # 只有没有缓存，或 force=True 且缓存过期时才去查重型的 get_spambot_status
                 try:
