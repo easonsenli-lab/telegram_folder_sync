@@ -161,6 +161,9 @@ async def auto_private_listener_loop():
                 try:
                     await ensure_private_listener_for_account(account_id, acc.account_name or account_id)
                 except Exception as exc:
+                    # 如果在静默长连接轮询中发现大号已被官方封禁/注销，立即触发状态置灰并向管理员推送实时 HTML 预警通知！
+                    if is_banned_or_deactivated_error(exc):
+                        await handle_deactivated_or_banned_account(account_id, exc)
                     mark_private_listener_cooldown(account_id, exc, "auto private listener connect")
                     print(f"[PrivateListener] Failed to auto-connect {account_id}: {exc}")
 
