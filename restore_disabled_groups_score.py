@@ -1,6 +1,10 @@
 import os
 import sys
 
+# 强行将工作目录重定向到脚本所在的绝对目录，彻底避免 SQLite 相对路径 data/rosepay.db 漂移到 /root 目录下
+script_dir = os.path.dirname(os.path.abspath(__file__))
+os.chdir(script_dir)
+
 from db import engine, GroupDb, Session, select
 from services.scraping_service import apply_group_library_scores
 
