@@ -6322,28 +6322,48 @@ async def update_account_name_from_tg(account_id: str, client):
 async def get_spambot_status(client) -> dict:
     """Sends /start to @SpamBot and checks its response for account restrictions."""
     try:
-        # Resolve spambot entity
-        entity = await client.get_input_entity('spambot')
-        # Send /start
+        # 1. 使用 get_entity 强制进行电报端实体同步解析（彻底解决新号没有 spambot 会话时的冷启动 ValueError 隐患）
+        entity = await client.get_entity('spambot')
+        
+        # 记录发送前的最后一条消息 ID (如果有)
+        last_msg_id = 0
+        try:
+            old_messages = await client.get_messages(entity, limit=1)
+            if old_messages:
+                last_msg_id = old_messages[0].id
+        except Exception:
+            pass
+
+        # 2. 发送 /start 指令
         await client.send_message(entity, '/start')
 
-        # Wait a short moment for response to arrive
+        # 3. 动态轮询等待电报端响应（最大等待 6.0 秒，每 0.5 秒轮询一次）
+        # 这能彻底防范代理网络慢或者官方 SpamBot 拥堵延迟导致的 1.5 秒硬性超时判定失败 Bug
         import asyncio
-        await asyncio.sleep(1.5)
+        response_msg = None
+        for _ in range(12):
+            await asyncio.sleep(0.5)
+            try:
+                messages = await client.get_messages(entity, limit=1)
+                if messages:
+                    msg = messages[0]
+                    # 必须是对方发来的新消息（msg.out 为 False，且 ID 大于发送前的最后消息 ID）
+                    if not msg.out and msg.id > last_msg_id:
+                        response_msg = msg
+                        break
+            except Exception:
+                pass
 
-        # Fetch the latest message from @SpamBot
-        messages = await client.get_messages(entity, limit=1)
-        if messages:
-            msg = messages[0]
-            if not msg.out:
-                text = msg.message
-                lower_text = text.lower()
-                # Parse the response text
-                if "no limits" in lower_text or "no restrictions" in lower_text or "free as a bird" in lower_text:
-                    return {"status": "free", "details": text}
-                else:
-                    return {"status": "restricted", "details": text}
-        return {"status": "unknown", "details": "没有收到 SpamBot 响应"}
+        if response_msg:
+            text = response_msg.message
+            lower_text = text.lower()
+            # 判定健康状态
+            if "no limits" in lower_text or "no restrictions" in lower_text or "free as a bird" in lower_text:
+                return {"status": "free", "details": text}
+            else:
+                return {"status": "restricted", "details": text}
+                
+        return {"status": "unknown", "details": "没有收到 SpamBot 响应 (官方机器人未在 6 秒内回复，请稍后重试)"}
     except Exception as e:
         return {"status": "unknown", "details": f"SpamBot 检测失败: {str(e)}"}
 
