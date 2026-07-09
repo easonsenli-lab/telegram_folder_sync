@@ -1053,7 +1053,21 @@ async def campaign_worker_task(task_id: str):
                             )
                             continue
                         final_msg_bytes = len(final_msg.encode("utf-8"))
-                        max_len_limit = int(rules_summary.get("max_length", 0)) if rules_summary else 0
+                        
+                        # 100% 安全地从数据库中为当前群组检索字数限制，消除 NameError 跨嵌套函数作用域污染
+                        max_len_limit = 0
+                        try:
+                            from db import engine, GroupDb, Session
+                            from sqlmodel import select
+                            import json
+                            with Session(engine) as temp_session:
+                                db_g = temp_session.exec(select(GroupDb).where(GroupDb.chat_id == chat_id)).first()
+                                if db_g and db_g.bot_rules_summary:
+                                    rules_dict = json.loads(db_g.bot_rules_summary)
+                                    max_len_limit = int(rules_dict.get("max_length", 0))
+                        except Exception as e:
+                            print(f"[CampaignLimit] Failed to query group limit for chat {chat_id}: {e}")
+                            
                         effective_max = max_len_limit if max_len_limit > 0 else 350
                         if final_msg_bytes > effective_max:
                             too_long_detail = f"{selected_phone} 广告语超过{effective_max} UTF-8字节，已跳过未发送（当前 {final_msg_bytes} 字节）"
