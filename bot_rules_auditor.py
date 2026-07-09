@@ -159,24 +159,33 @@ async def audit_group_bot_rules(client, chat_id: int, group_title: str, username
                     break
             return t_admin_ids, t_messages, t_pin
 
-        # 第一步：尝试首选 client (探测号)
+        # 第一步：尝试首选 client (探测号)，设置 5 秒超时防卡死
         try:
-            admin_ids, messages, pin_text = await try_fetch_messages(client)
+            admin_ids, messages, pin_text = await asyncio.wait_for(try_fetch_messages(client), timeout=5.0)
             print(f"[Bot审计] 首选探测大号成功拉取群组 '{group_title}' 的消息。")
         except Exception as client_err:
             print(f"[Bot审计] 探测号拉取群组 '{group_title}' 消息失败 (可能不在群内): {client_err}，尝试降级轮询其他在线大号...")
             # 第二步：轮询其它在线的客户端
             from services.shared_state import active_clients
             fetched_ok = False
+            # 限制最多轮询 2 个备用大号，且每个限制 5.0 秒超时，控制总体流程在 15 秒绝对安全线内
+            fallback_attempts = 0
             for alt_id, alt_client in list(active_clients.items()):
                 if alt_client != client:
+                    if fallback_attempts >= 2:
+                        break
                     try:
                         if alt_client.is_connected() and await alt_client.is_user_authorized():
-                            admin_ids, messages, pin_text = await try_fetch_messages(alt_client)
+                            fallback_attempts += 1
+                            admin_ids, messages, pin_text = await asyncio.wait_for(
+                                try_fetch_messages(alt_client), 
+                                timeout=5.0
+                            )
                             print(f"[Bot审计] 降级大号成功！已使用在线大号 {alt_id} 拉取到群组消息。")
                             fetched_ok = True
                             break
-                    except Exception:
+                    except Exception as alt_err:
+                        print(f"[Bot审计] 降级大号 {alt_id} 尝试拉取消息失败或超时: {alt_err}")
                         continue
             if not fetched_ok:
                 raise Exception(f"所有在线账号均不在此群组内，无法拉取消息：{client_err}")

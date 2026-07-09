@@ -1,120 +1,40 @@
-Jul 09 08:17:16 vultr python[450850]: 正在测试静态代理：socks5://212.68.183.252:50101
-Jul 09 08:17:28 vultr python[450850]: 正在测试静态代理：socks5://212.68.181.201:50101
-Jul 09 08:17:31 vultr python[450850]: [解析群组] 使用账号 919695056074 成功定位并解析群组。
-Jul 09 08:17:31 vultr python[450850]: INFO:     222.187.165.65:47187 - "POST /api/groups/resolve HTTP/1.1" 400 Bad Request
-Jul 09 08:17:31 vultr python[450850]: INFO:     222.187.165.65:47187 - "GET /api/groups HTTP/1.1" 200 OK
-Jul 09 08:17:33 vultr python[450850]: INFO:     127.0.0.1:42788 - "GET / HTTP/1.1" 200 OK
-Jul 09 08:17:37 vultr python[450850]: [解析群组] 使用账号 919695056074 成功定位并解析群组。
-Jul 09 08:17:37 vultr python[450850]: INFO:     222.187.165.65:47187 - "POST /api/groups/resolve HTTP/1.1" 400 Bad Request
-Jul 09 08:17:37 vultr python[450850]: INFO:     222.187.165.65:47187 - "GET /api/groups HTTP/1.1" 200 OK
-Jul 09 08:17:40 vultr python[450850]: 正在测试静态代理：socks5://212.68.183.253:50101
-Jul 09 08:17:42 vultr python[450850]: [Bot审计] 正在为群组 'Talkpay-India-Group' (Talkpaychat) 扫描发言规则...
-Jul 09 08:17:42 vultr python[450850]: [Bot审计] 首选探测大号成功拉取群组 'Talkpay-India-Group' 的消息。
-Jul 09 08:17:42 vultr python[450850]: [Bot审计] 抓取到置顶/警告背景日志，正在向 DeepSeek 请求智能审计归纳...
-Jul 09 08:17:43 vultr python[450850]: 静态代理可用：socks5://212.68.183.253:50101
-Jul 09 08:17:43 vultr python[450850]: [PrivateListener] Auto listener active for RosePay 李勣.
-Jul 09 08:17:43 vultr python[450850]: [Bot审计] DeepSeek 规则提取成功 JSON: {"max_length": 200, "has_sensitive_words": false, "banned_links": true, "banned_media": false, "other_rules": ["禁止转发频道消息"]}
-Jul 09 08:17:43 vultr python[450850]: [HTTP 1297ms] POST /api/groups/4396341290/re-audit
-Jul 09 08:17:43 vultr python[450850]: INFO:     222.187.165.65:47187 - "POST /api/groups/4396341290/re-audit HTTP/1.1" 200 OK
-Jul 09 08:17:49 vultr python[450850]: [ProxyPool] 919608773781 Telegram 连接代理：空闲分配 212.68.183.252:50101
-Jul 09 08:17:49 vultr python[450850]: Telegram 连接代理：已绑定 212.68.183.252:50101
-Jul 09 08:17:49 vultr python[450850]: 正在测试静态代理：socks5://212.68.183.252:50101
-Jul 09 08:18:01 vultr python[450850]: 正在测试静态代理：socks5://212.68.181.201:50101
-Jul 09 08:18:03 vultr python[450850]: INFO:     127.0.0.1:36160 - "GET / HTTP/1.1" 200 OK
-Jul 09 08:18:13 vultr python[450850]: 正在测试静态代理：socks5://212.68.183.253:50101
-Jul 09 08:18:15 vultr python[450850]: 静态代理可用：socks5://212.68.183.253:50101
-Jul 09 08:18:17 vultr python[450850]: [PrivateListener] Auto listener active for RosePay 咪咪.
-Jul 09 08:18:20 vultr python[450850]: [ProxyPool] 919608910336 Telegram 连接代理：空闲分配 212.68.183.252:50101
-Jul 09 08:18:20 vultr python[450850]: Telegram 连接代理：已绑定 212.68.183.252:50101
-Jul 09 08:18:20 vultr python[450850]: 正在测试静态代理：socks5://212.68.183.252:50101
-Jul 09 08:18:32 vultr python[450850]: 正在测试静态代理：socks5://212.68.181.201:50101
-Jul 09 08:18:34 vultr python[450850]: INFO:     127.0.0.1:37892 - "GET / HTTP/1.1" 200 OK
-Jul 09 08:18:44 vultr python[450850]: 正在测试静态代理：socks5://212.68.183.253:50101
-Jul 09 08:18:46 vultr python[450850]: 静态代理可用：socks5://212.68.183.253:50101
-Jul 09 08:18:47 vultr python[450850]: [PrivateListener] Auto listener active for RosePay Tina.
-Jul 09 08:18:50 vultr python[450850]: [ProxyPool] 919611087173 Telegram 连接代理：已绑定 212.68.181.75:50101
-Jul 09 08:18:50 vultr python[450850]: Telegram 连接代理：已绑定 212.68.181.75:50101
-Jul 09 08:18:50 vultr python[450850]: 正在测试静态代理：socks5://212.68.181.75:50101
-Jul 09 08:18:53 vultr python[450850]: 静态代理可用：socks5://212.68.181.75:50101
-Jul 09 08:18:53 vultr python[450850]: [PrivateListener] Auto listener active for RosePay M.
-Jul 09 08:19:03 vultr python[450850]: Server closed the connection: 0 bytes read on a total of 8 expected bytes
-Jul 09 08:19:04 vultr python[450850]: INFO:     127.0.0.1:36130 - "GET / HTTP/1.1" 200 OK
-Jul 09 08:19:34 vultr python[450850]: INFO:     127.0.0.1:42474 - "GET / HTTP/1.1" 200 OK
-Jul 09 08:19:53 vultr systemd[1]: Stopping rosepay.service - RosePay Telegram Sync & Campaign Control Panel...
-Jul 09 08:19:53 vultr python[450850]: INFO:     Shutting down
-Jul 09 08:19:53 vultr python[450850]: INFO:     Waiting for connections to close. (CTRL+C to force quit)
-Jul 09 08:19:56 vultr systemd[1]: rosepay.service: State 'stop-sigterm' timed out. Killing.
-Jul 09 08:19:56 vultr systemd[1]: rosepay.service: Killing process 450850 (python) with signal SIGKILL.
-Jul 09 08:19:56 vultr systemd[1]: rosepay.service: Main process exited, code=killed, status=9/KILL
-Jul 09 08:19:56 vultr systemd[1]: rosepay.service: Failed with result 'timeout'.
-Jul 09 08:19:56 vultr systemd[1]: Stopped rosepay.service - RosePay Telegram Sync & Campaign Control Panel.
-Jul 09 08:19:56 vultr systemd[1]: rosepay.service: Consumed 46.976s CPU time over 4min 59.241s wall clock time, 162.4M memory peak.
-Jul 09 08:19:56 vultr systemd[1]: Started rosepay.service - RosePay Telegram Sync & Campaign Control Panel.
-Jul 09 08:19:58 vultr python[451114]: === 开始检测 groups_library 数据库字段升级 ===
-Jul 09 08:19:58 vultr python[451114]: Successfully migrated '默认公司' to 'admin' in database tables.
-Jul 09 08:19:58 vultr python[451114]: Successfully auto-authorized all accounts in database.
-Jul 09 08:19:58 vultr python[451114]: Successfully migrated '默认公司' to 'admin' in database tables.
-Jul 09 08:19:58 vultr python[451114]: Successfully auto-authorized all accounts in database.
-Jul 09 08:19:58 vultr python[451114]: /root/telegram_folder_sync/web_server.py:6960: DeprecationWarning:
-Jul 09 08:19:58 vultr python[451114]:         on_event is deprecated, use lifespan event handlers instead.
-Jul 09 08:19:58 vultr python[451114]:         Read more about it in the
-Jul 09 08:19:58 vultr python[451114]:         [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
-Jul 09 08:19:58 vultr python[451114]:         
-Jul 09 08:19:58 vultr python[451114]:   @app.on_event("startup")
-Jul 09 08:19:59 vultr python[451114]: Starting web server on 0.0.0.0:8000 (reload=False)...
-Jul 09 08:19:59 vultr python[451114]: INFO:     Started server process [451114]
-Jul 09 08:19:59 vultr python[451114]: INFO:     Waiting for application startup.
-Jul 09 08:19:59 vultr python[451114]: [Startup Resume] Disabled by RESUME_PERSISTENT_TASKS=0; paused 0 loaded join task(s).
-Jul 09 08:19:59 vultr python[451114]: INFO:     Application startup complete.
-Jul 09 08:19:59 vultr python[451114]: INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-Jul 09 08:19:59 vultr python[451114]: Initializing account status store locally...
-Jul 09 08:19:59 vultr python[451114]: INFO:     77.83.241.157:28767 - "GET /api/private-dm/stream?token=eason%3Aadmin%3A1783522504%3A43bde8f5637005c18006b4f48c4c9e7b1b83e5732c88089fe9a861b41e8df7c7 HTTP/1.1" 200 OK
-Jul 09 08:19:59 vultr python[451114]: INFO:     77.83.241.157:49553 - "GET /api/account-status/stream?token=eason%3Aadmin%3A1783522504%3A43bde8f5637005c18006b4f48c4c9e7b1b83e5732c88089fe9a861b41e8df7c7 HTTP/1.1" 200 OK
-Jul 09 08:20:00 vultr python[451114]: INFO:     222.187.165.65:48338 - "GET /api/private-dm/stream?token=eason%3Aadmin%3A1783583071%3A88773623e252ba10bcd5ad9dca2ca3b5acfb5c6113caa22380c675eb574018e1 HTTP/1.1" 200 OK
-Jul 09 08:20:04 vultr python[451114]: INFO:     222.187.165.65:48339 - "GET /api/account-status/stream?token=eason%3Aadmin%3A1783583071%3A88773623e252ba10bcd5ad9dca2ca3b5acfb5c6113caa22380c675eb574018e1 HTTP/1.1" 200 OK
-Jul 09 08:20:04 vultr python[451114]: INFO:     127.0.0.1:48012 - "GET / HTTP/1.1" 200 OK
-Jul 09 08:20:34 vultr python[451114]: INFO:     127.0.0.1:41212 - "GET / HTTP/1.1" 200 OK
-Jul 09 08:20:36 vultr python[451114]: [ProxyPool] 919695056074 Telegram 连接代理：空闲分配 212.68.183.252:50101
-Jul 09 08:20:36 vultr python[451114]: Telegram 连接代理：已绑定 212.68.183.252:50101
-Jul 09 08:20:36 vultr python[451114]: 正在测试静态代理：socks5://212.68.183.252:50101
-Jul 09 08:20:48 vultr python[451114]: 正在测试静态代理：socks5://212.68.181.201:50101
-Jul 09 08:21:00 vultr python[451114]: 正在测试静态代理：socks5://212.68.183.253:50101
-Jul 09 08:21:03 vultr python[451114]: 静态代理可用：socks5://212.68.183.253:50101
-Jul 09 08:21:03 vultr python[451114]: [PrivateListener] Auto listener active for RosePay kiki.
-Jul 09 08:21:04 vultr python[451114]: INFO:     127.0.0.1:50344 - "GET / HTTP/1.1" 200 OK
-Jul 09 08:21:09 vultr python[451114]: [ProxyPool] 919834204069 Telegram 连接代理：空闲分配 212.68.183.252:50101
-Jul 09 08:21:09 vultr python[451114]: Telegram 连接代理：已绑定 212.68.183.252:50101
-Jul 09 08:21:09 vultr python[451114]: 正在测试静态代理：socks5://212.68.183.252:50101
-Jul 09 08:21:21 vultr python[451114]: 正在测试静态代理：socks5://212.68.181.201:50101
-Jul 09 08:21:33 vultr python[451114]: 正在测试静态代理：socks5://212.68.183.253:50101
-Jul 09 08:21:35 vultr python[451114]: INFO:     127.0.0.1:49580 - "GET / HTTP/1.1" 200 OK
-Jul 09 08:21:36 vultr python[451114]: 静态代理可用：socks5://212.68.183.253:50101
-Jul 09 08:21:36 vultr python[451114]: [PrivateListener] Auto listener active for RosePay yoyo.
-Jul 09 08:21:39 vultr python[451114]: [ProxyPool] 919827000284 Telegram 连接代理：空闲分配 212.68.183.252:50101
-Jul 09 08:21:39 vultr python[451114]: Telegram 连接代理：已绑定 212.68.183.252:50101
-Jul 09 08:21:39 vultr python[451114]: 正在测试静态代理：socks5://212.68.183.252:50101
-Jul 09 08:21:51 vultr python[451114]: 正在测试静态代理：socks5://212.68.181.201:50101
-Jul 09 08:21:59 vultr python[451114]: Server closed the connection: 0 bytes read on a total of 8 expected bytes
-Jul 09 08:22:03 vultr python[451114]: 正在测试静态代理：socks5://212.68.183.253:50101
-Jul 09 08:22:05 vultr python[451114]: INFO:     127.0.0.1:33350 - "GET / HTTP/1.1" 200 OK
-Jul 09 08:22:05 vultr python[451114]: 静态代理可用：socks5://212.68.183.253:50101
-Jul 09 08:22:05 vultr python[451114]: [PrivateListener] Auto listener active for RosePay baby.
-Jul 09 08:22:08 vultr python[451114]: [ProxyPool] 919795324362 Telegram 连接代理：已绑定 212.68.181.34:50101
-Jul 09 08:22:08 vultr python[451114]: Telegram 连接代理：已绑定 212.68.181.34:50101
-Jul 09 08:22:08 vultr python[451114]: 正在测试静态代理：socks5://212.68.181.34:50101
-Jul 09 08:22:12 vultr python[451114]: 静态代理可用：socks5://212.68.181.34:50101
-Jul 09 08:22:12 vultr python[451114]: [PrivateListener] Auto listener active for RosePay 安琪拉.
-Jul 09 08:22:15 vultr python[451114]: [ProxyPool] 919792090345 Telegram 连接代理：空闲分配 212.68.183.252:50101
-Jul 09 08:22:15 vultr python[451114]: Telegram 连接代理：已绑定 212.68.183.252:50101
-Jul 09 08:22:15 vultr python[451114]: 正在测试静态代理：socks5://212.68.183.252:50101
-Jul 09 08:22:23 vultr python[451114]: INFO:     222.187.165.65:49091 - "GET /api/groups HTTP/1.1" 200 OK
-Jul 09 08:22:27 vultr python[451114]: 正在测试静态代理：socks5://212.68.181.201:50101
-Jul 09 08:22:35 vultr python[451114]: INFO:     127.0.0.1:47710 - "GET / HTTP/1.1" 200 OK
-Jul 09 08:22:39 vultr python[451114]: 正在测试静态代理：socks5://212.68.183.253:50101
-Jul 09 08:22:41 vultr python[451114]: 静态代理可用：socks5://212.68.183.253:50101
-Jul 09 08:22:41 vultr python[451114]: [PrivateListener] Auto listener active for RosePay 李勣.
-Jul 09 08:22:47 vultr python[451114]: [ProxyPool] 919608773781 Telegram 连接代理：空闲分配 212.68.183.252:50101
-Jul 09 08:22:47 vultr python[451114]: Telegram 连接代理：已绑定 212.68.183.252:50101
-Jul 09 08:22:47 vultr python[451114]: 正在测试静态代理：socks5://212.68.183.252:50101
-Jul 09 08:22:59 vultr python[451114]: 正在测试静态代理：socks5://212.68.181.201:50101
-Jul 09 08:23:05 vultr python[451114]: INFO:     127.0.0.1:50052 - "GET / HTTP/1.1" 200 OK
+Jul 09 08:28:15 vultr python[451382]: INFO:     222.187.165.65:46823 - "GET /api/scraped-groups?sort_by=default HTTP/1.1" 200 OK
+Jul 09 08:28:16 vultr python[451382]: INFO:     222.187.165.65:46833 - "GET /api/config/gemini HTTP/1.1" 200 OK
+Jul 09 08:28:16 vultr python[451382]: INFO:     222.187.165.65:46833 - "GET /api/scraped-groups/task-status HTTP/1.1" 200 OK
+Jul 09 08:28:16 vultr python[451382]: INFO:     222.187.165.65:46833 - "GET /api/expansion/status HTTP/1.1" 200 OK
+Jul 09 08:28:18 vultr python[451382]: INFO:     222.187.165.65:46823 - "GET /api/expansion/groups HTTP/1.1" 200 OK
+Jul 09 08:28:18 vultr python[451382]: INFO:     222.187.165.65:46833 - "GET /api/scraped-groups?sort_by=default HTTP/1.1" 200 OK
+Jul 09 08:28:18 vultr python[451382]: INFO:     222.187.165.65:46823 - "GET /api/expansion/status HTTP/1.1" 200 OK
+Jul 09 08:28:18 vultr python[451382]: INFO:     222.187.165.65:46821 - "GET /api/auth/status HTTP/1.1" 200 OK
+Jul 09 08:28:18 vultr python[451382]: INFO:     222.187.165.65:46823 - "GET /api/expansion/groups HTTP/1.1" 200 OK
+Jul 09 08:28:19 vultr python[451382]: INFO:     222.187.165.65:46821 - "GET /api/groups HTTP/1.1" 200 OK
+Jul 09 08:28:19 vultr python[451382]: INFO:     222.187.165.65:46823 - "GET /api/group-categories HTTP/1.1" 200 OK
+Jul 09 08:28:20 vultr python[451382]: INFO:     222.187.165.65:46833 - "GET /api/expansion/status HTTP/1.1" 200 OK
+Jul 09 08:28:21 vultr python[451382]: INFO:     222.187.165.65:46823 - "GET /api/expansion/groups HTTP/1.1" 200 OK
+Jul 09 08:28:21 vultr python[451382]: [HTTP 199ms] GET /api/accounts/private-unread-summary
+Jul 09 08:28:21 vultr python[451382]: INFO:     222.187.165.65:46833 - "GET /api/accounts/private-unread-summary?scope=all HTTP/1.1" 200 OK
+Jul 09 08:28:21 vultr python[451382]: INFO:     222.187.165.65:46828 - "GET /favicon.ico HTTP/1.1" 404 Not Found
+Jul 09 08:28:21 vultr python[451382]: [AccountsTiming] total=57ms count=19 campaign_scan=0ms busy_scan=14ms
+Jul 09 08:28:21 vultr python[451382]: [HTTP 71ms] GET /api/accounts
+Jul 09 08:28:21 vultr python[451382]: INFO:     222.187.165.65:46828 - "GET /api/accounts?scope=all HTTP/1.1" 200 OK
+Jul 09 08:28:22 vultr python[451382]: INFO:     222.187.165.65:46833 - "GET /api/admin/users HTTP/1.1" 200 OK
+Jul 09 08:28:22 vultr python[451382]: INFO:     222.187.165.65:46823 - "GET /api/expansion/groups HTTP/1.1" 200 OK
+Jul 09 08:28:23 vultr python[451382]: [HTTP 243ms] GET /api/accounts/private-unread-summary
+Jul 09 08:28:23 vultr python[451382]: INFO:     222.187.165.65:46828 - "GET /api/accounts/private-unread-summary?scope=all HTTP/1.1" 200 OK
+Jul 09 08:28:23 vultr python[451382]: INFO:     222.187.165.65:46833 - "GET /api/expansion/status HTTP/1.1" 200 OK
+Jul 09 08:28:23 vultr python[451382]: INFO:     222.187.165.65:46821 - "GET /api/expansion/groups HTTP/1.1" 200 OK
+Jul 09 08:28:23 vultr python[451382]: INFO:     222.187.165.65:46821 - "GET /api/expansion/groups HTTP/1.1" 200 OK
+Jul 09 08:28:24 vultr python[451382]: INFO:     222.187.165.65:46821 - "GET /api/groups HTTP/1.1" 200 OK
+Jul 09 08:28:24 vultr python[451382]: INFO:     222.187.165.65:46823 - "GET /api/group-categories HTTP/1.1" 200 OK
+Jul 09 08:28:24 vultr python[451382]: INFO:     222.187.165.65:46828 - "GET /api/expansion/groups HTTP/1.1" 200 OK
+Jul 09 08:28:25 vultr python[451382]: INFO:     222.187.165.65:46828 - "GET /api/expansion/groups HTTP/1.1" 200 OK
+Jul 09 08:28:25 vultr python[451382]: INFO:     222.187.165.65:46833 - "GET /api/expansion/status HTTP/1.1" 200 OK
+Jul 09 08:28:25 vultr python[451382]: INFO:     222.187.165.65:46823 - "GET /api/expansion/status HTTP/1.1" 200 OK
+Jul 09 08:28:26 vultr python[451382]: INFO:     222.187.165.65:46828 - "GET /api/expansion/status HTTP/1.1" 200 OK
+Jul 09 08:28:26 vultr python[451382]: INFO:     222.187.165.65:46823 - "GET /api/expansion/status HTTP/1.1" 200 OK
+Jul 09 08:28:37 vultr python[451382]: INFO:     127.0.0.1:57996 - "GET / HTTP/1.1" 200 OK
+Jul 09 08:28:58 vultr python[451382]: INFO:     222.187.165.65:47056 - "GET /api/groups HTTP/1.1" 200 OK
+Jul 09 08:29:07 vultr python[451382]: INFO:     127.0.0.1:45270 - "GET / HTTP/1.1" 200 OK
+Jul 09 08:29:14 vultr python[451382]: Server closed the connection: 0 bytes read on a total of 8 expected bytes
+Jul 09 08:29:31 vultr python[451382]: [解析群组] 使用账号 919695056074 成功定位并解析群组。
+Jul 09 08:29:37 vultr python[451382]: INFO:     127.0.0.1:42342 - "GET / HTTP/1.1" 200 OK
