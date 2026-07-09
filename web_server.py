@@ -5920,6 +5920,12 @@ async def re_audit_group_rules(group_id: str, user: dict = Depends(get_current_u
                 g.bot_rules_summary = rules_summary_json
                 g.bot_rules_raw_logs = rules_raw_logs
                 g.updated_by = user["username"]
+                
+                # 重新检测成功：标记启用，并实时重新计算与刷新其质量活跃评分
+                g.enabled = True
+                from services.scraping_service import apply_group_library_scores
+                apply_group_library_scores(g, is_valid=True)
+                
                 session.add(g)
             session.commit()
             
@@ -5930,9 +5936,29 @@ async def re_audit_group_rules(group_id: str, user: dict = Depends(get_current_u
             "logs": logs
         }
     except Exception as exc:
+        # 重新检测失败：如果确证是链接失效或卡死超时，自动将其禁用且评分归零
+        err_name = type(exc).__name__
+        is_definitive_invalid = err_name in (
+            "ChannelPrivateError", "ChannelInvalidError", "ValueError", 
+            "UsernameNotOccupiedError", "TimeoutError", "asyncio.TimeoutError"
+        )
+        
+        with Session(engine) as session:
+            for g in find_group_rows_by_public_identity(session, group_id, user["company"]):
+                if is_definitive_invalid:
+                    g.enabled = False
+                    from services.scraping_service import apply_group_library_scores
+                    apply_group_library_scores(g, is_valid=False)
+                else:
+                    from services.scraping_service import apply_group_library_scores
+                    apply_group_library_scores(g, is_valid=g.enabled)
+                g.updated_by = user["username"]
+                session.add(g)
+            session.commit()
+            
         raise HTTPException(
-            status_code=500,
-            detail=f"重新拉取群规则失败：{exc}"
+            status_code=400,
+            detail=f"重新检测失败：该链接疑似已被官方注销、限制或在电报端挂起 ({exc})"
         )
 
 @app.get("/api/groups", response_model=List[GroupModel])
