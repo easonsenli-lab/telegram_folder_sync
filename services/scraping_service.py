@@ -959,8 +959,8 @@ async def resolve_group(req, user):
     resolved_ok = False
     active_query_client = None
 
-    # 2. 依次轮询大号进行 8 秒的超时容灾解析
-    for account_id, client in available_clients:
+    # 2. 依次轮询前 2 个大号进行 8 秒的超时容灾解析，防防 Nginx 502 超时
+    for account_id, client in available_clients[:2]:
         try:
             if invite_hash:
                 invite = await asyncio.wait_for(
