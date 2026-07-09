@@ -6371,6 +6371,7 @@ async def get_spambot_status(client) -> dict:
 @account_api_operation("login_status", label="检测登录状态")
 async def get_login_status(account_id: str, force: bool = False, user: dict = Depends(get_current_user)):
     """Checks the connection and authorization status of a Telegram account."""
+    import asyncio
     check_account_company(account_id, user)
     is_connected = False
     is_authorized = False
@@ -6394,7 +6395,6 @@ async def get_login_status(account_id: str, force: bool = False, user: dict = De
     except Exception as err:
         # 3. 捕获 400/409 (忙碌锁) 或 TimeoutError (等待锁超时卡死)
         # 证明大号正在运行任务且 Session 被独占，我们启动自适应降级，直接提取最新缓存数据，确保前台流畅秒回！
-        import asyncio
         err_name = type(err).__name__
         is_error_to_fallback = False
         
