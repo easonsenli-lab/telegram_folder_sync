@@ -38,8 +38,8 @@ def check_ad_against_rules(ad_text: str, rules_summary: dict) -> tuple[bool, str
         
     ad_len_bytes = len(ad_text.encode('utf-8'))
     max_len_limit = int(rules_summary.get("max_length", 0))
-    # 默认全局安全字数限制为 350 字节，除非群组限制有更小值
-    effective_max = min(350, max_len_limit) if max_len_limit > 0 else 350
+    # 默认安全字数限制为 350 字节，但如果群组有更宽大/精确的限制，则直接遵循群组真实字数限制
+    effective_max = max_len_limit if max_len_limit > 0 else 350
     
     if ad_len_bytes > effective_max:
         return False, f"字数超限 (文案字节: {ad_len_bytes}，本群上限: {effective_max}字节)"
@@ -1053,8 +1053,10 @@ async def campaign_worker_task(task_id: str):
                             )
                             continue
                         final_msg_bytes = len(final_msg.encode("utf-8"))
-                        if final_msg_bytes > 350:
-                            too_long_detail = f"{selected_phone} 广告语超过350 UTF-8字节，已跳过未发送（当前 {final_msg_bytes} 字节）"
+                        max_len_limit = int(rules_summary.get("max_length", 0)) if rules_summary else 0
+                        effective_max = max_len_limit if max_len_limit > 0 else 350
+                        if final_msg_bytes > effective_max:
+                            too_long_detail = f"{selected_phone} 广告语超过{effective_max} UTF-8字节，已跳过未发送（当前 {final_msg_bytes} 字节）"
                             await write_campaign_log(
                                 cycle,
                                 title,
