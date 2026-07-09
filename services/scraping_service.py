@@ -854,12 +854,38 @@ async def stream_groups_sync(user: dict):
                             "title": group.title,
                             "username": group.username
                         })
-                        if group.enabled:
-                            group.enabled = False
-                            status_data["disabled_count"] += 1
-                        apply_group_library_scores(group, is_valid=False)
-                        session.add(group)
-                        yield log(f"[{index}/{total_groups}] 检测失败并标记禁用：{group.title or group.id}，评分 0 / 疑似失效。")
+                        
+                        # 只有在 AI 评估中明确返回 is_valid = False，或者明确捕获到官方封禁失效异常时，才执行禁用与评分归零。
+                        # 普通的网络请求超时或大号连接卡顿（is_valid 为 False 且没有得到 entity 时）我们保持原有启用状态和分数，防误杀！
+                        is_definitive_invalid = False
+                        
+                        # 检查当前异常类型，如果是非致命的网络超时或连接错误，不禁用
+                        # 我们去外层获取引发错误的真实异常，如果是 ChannelPrivateError / ChannelInvalidError 则是确切失效
+                        # 如果 entity 是 None 且并没有确定已销毁，我们视为临时网络故障，仅警告不禁用
+                        if "get_err" in locals() or "update_err" in locals():
+                            err_obj = locals().get("get_err") or locals().get("update_err")
+                            err_name = type(err_obj).__name__
+                            if err_name in ("ChannelPrivateError", "ChannelInvalidError", "ValueError", "UsernameNotOccupiedError"):
+                                is_definitive_invalid = True
+                                yield log(f"  ❌ 确切失效异常 ({err_name})，执行禁用。")
+                        
+                        # 如果是 AI 明确判定的无效，也是确切失效
+                        if "ai_res" in locals() and ai_res is not None and not ai_res.get("is_valid", True):
+                            is_definitive_invalid = True
+                            yield log(f"  🤖 AI 智能诊断判定群组不可用，执行禁用。")
+
+                        if is_definitive_invalid:
+                            if group.enabled:
+                                group.enabled = False
+                                status_data["disabled_count"] += 1
+                            apply_group_library_scores(group, is_valid=False)
+                            session.add(group)
+                            yield log(f"[{index}/{total_groups}] 检测确认失效/违规并标记禁用：{group.title or group.id}，评分已归零。")
+                        else:
+                            # 临时性网络连接波动导致的未获取成功：我们保留其原有启用状态及评分，仅报警记录，彻底防误杀！
+                            apply_group_library_scores(group, is_valid=group.enabled)
+                            session.add(group)
+                            yield log(f"[{index}/{total_groups}] 本次检测由于网络或大号限制连接挂起，已保留其原有状态及评分 (防止误杀)。")
 
                     session.commit()
 
