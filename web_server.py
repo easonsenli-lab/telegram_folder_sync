@@ -6436,168 +6436,123 @@ async def get_login_status(account_id: str, force: bool = False, user: dict = De
             print(f"[LoginStatus] Account {account_id} is locked/busy ({err_name}). Triggering occupied cache fallback.")
         else:
             raise err
-        me_info = None
-        spambot_status = "unknown"
-        spambot_details = ""
-        spambot_time = None
-        db_acc = None
-        check_warnings = []
+    me_info = None
+    spambot_status = "unknown"
+    spambot_details = ""
+    spambot_time = None
+    db_acc = None
+    check_warnings = []
 
-        if is_authorized:
-            try:
-                # 如果是占用状态，我们尝试从数据库直接读取之前保存的账号名，避免在运行任务时去 call get_me
-                if is_occupied_fallback:
-                    from db import engine, AccountDb, Session
-                    with Session(engine) as db_session:
-                        db_acc = db_session.get(AccountDb, account_id)
-                        if db_acc and db_acc.profile_modified_name:
-                            me_info = f"{db_acc.profile_modified_name} (任务运行中)"
-                        else:
-                            me_info = "账号正在执行任务中"
-                    me = None
-                else:
-                    me = await asyncio.wait_for(client.get_me(), timeout=8)
-                if me:
-                    username = f"@{me.username}" if me.username else ""
-                    me_info = f"{me.first_name or ''} {me.last_name or ''} {username} (ID: {me.id})".strip()
-                    # 只有在 force=True 时才才去同步账号名到 TG（或更新数据库），日常同步避免该重型操作
-                    if force:
-                        try:
-                            await asyncio.wait_for(update_account_name_from_tg(account_id, client), timeout=5)
-                        except asyncio.TimeoutError:
-                            warning = "账号名同步超时，登录状态已确认"
-                            check_warnings.append(warning)
-                            print(f"[LoginStatus] update_account_name timeout for {account_id}")
-            except Exception as e:
-                warning = f"读取账号资料失败，登录状态已确认: {e}"
-                check_warnings.append(warning)
-                print(f"[LoginStatus] get_me failed for {account_id}: {e}")
-
-            # Check and update translation bot status (只有 force=True 时才执行重型检测)
-            if force:
-                try:
-                    from db import engine, AccountDb, Session
-                    with Session(engine) as db_session:
-                        db_acc = db_session.get(AccountDb, account_id)
-                        if db_acc and db_acc.bot_setup_status != "approved":
-                            await asyncio.wait_for(check_and_update_bot_approval_status(account_id, client, db_session), timeout=8)
-                except Exception as e:
-                    warning = f"Bot 授权状态检查失败，登录状态已确认: {e}"
-                    check_warnings.append(warning)
-                    print(f"Error checking bot status in login/status check: {e}")
-
-            # Fetch or use cached spambot status (日常 force=False 的检测不重新查 SpamBot 以规避限流)
-            import time
-            cached = spambot_cache.get(account_id)
-            if cached and not force:
-                # 日常同步直接复用历史缓存，不查 SpamBot
-                spambot_status = cached["status"]
-                spambot_details = cached["details"]
-                spambot_time = cached["timestamp"]
-            elif cached and force and (time.time() - cached["timestamp"] < 300):
-                # 即使 force=True，如果 5 分钟内刚查过，也复用缓存，防止频率过高被限流
-                spambot_status = cached["status"]
-                spambot_details = cached["details"]
-                spambot_time = cached["timestamp"]
-            elif is_occupied_fallback:
-                # 如果是占用降级模式，绝不去并发请求 SpamBot，100% 安全地复用本地缓存数据返回
-                spambot_status = cached.get("status", "unknown") if cached else "unknown"
-                spambot_details = cached.get("details", "账号执行任务中") if cached else "账号执行任务中"
-                spambot_time = cached.get("timestamp") if cached else None
+    if is_authorized:
+        try:
+            # 如果是占用状态，我们尝试从数据库直接读取之前保存的账号名，避免在运行任务时去 call get_me
+            if is_occupied_fallback:
+                from db import engine, AccountDb, Session
+                with Session(engine) as db_session:
+                    db_acc = db_session.get(AccountDb, account_id)
+                    if db_acc and db_acc.profile_modified_name:
+                        me_info = f"{db_acc.profile_modified_name} (任务运行中)"
+                    else:
+                        me_info = "账号正在执行任务中"
+                me = None
             else:
-                # 只有没有缓存，或 force=True 且缓存过期时才去查重型的 get_spambot_status
-                try:
-                    res = await asyncio.wait_for(get_spambot_status(client), timeout=12)
-                    spambot_status = res["status"]
-                    spambot_details = res["details"]
-                    spambot_time = time.time()
-                    spambot_cache[account_id] = {
-                        "status": spambot_status,
-                        "details": spambot_details,
-                        "timestamp": spambot_time
-                    }
-                    save_spambot_cache(spambot_cache)
-                except Exception as e:
-                    warning = f"SpamBot 检测失败，登录状态已确认: {e}"
-                    check_warnings.append(warning)
-                    if cached:
-                        spambot_status = cached.get("status", "unknown")
-                        spambot_details = cached.get("details", "")
-                        spambot_time = cached.get("timestamp")
-                    print(f"[LoginStatus] spambot check failed for {account_id}: {e}")
+                me = await asyncio.wait_for(client.get_me(), timeout=8)
+            if me:
+                username = f"@{me.username}" if me.username else ""
+                me_info = f"{me.first_name or ''} {me.last_name or ''} {username} (ID: {me.id})".strip()
+                # 只有在 force=True 时才才去同步账号名到 TG（或更新数据库），日常同步避免该重型操作
+                if force:
+                    try:
+                        await asyncio.wait_for(update_account_name_from_tg(account_id, client), timeout=5)
+                    except asyncio.TimeoutError:
+                        warning = "账号名同步超时，登录状态已确认"
+                        check_warnings.append(warning)
+                        print(f"[LoginStatus] update_account_name timeout for {account_id}")
+        except Exception as e:
+            warning = f"读取账号资料失败，登录状态已确认: {e}"
+            check_warnings.append(warning)
+            print(f"[LoginStatus] get_me failed for {account_id}: {e}")
 
-        status_res = {
-            "is_connected": is_connected,
-            "is_authorized": is_authorized,
-            "me": me_info,
-            "spambot_status": spambot_status,
-            "spambot_details": spambot_details,
-            "spambot_time": spambot_time,
-            "bot_setup_status": db_acc.bot_setup_status if db_acc and is_authorized else "not_started",
-            "error": "; ".join(check_warnings) if check_warnings else None,
-            "last_error": "; ".join(check_warnings) if check_warnings else None,
-            "status_check_failed": bool(check_warnings),
-            "status_check_warnings": check_warnings,
-        }
-        status_res = set_account_status(account_id, status_res, source="login-status")
-        if is_authorized and spambot_status == "restricted":
-            send_ops_bot_notification(
-                "\n".join([
-                    "🚨 <b>账号可能被限制</b>",
-                    html_line("账号", get_account_notify_label(account_id)),
-                    html_line("状态", "SpamBot restricted"),
-                    html_line("详情", spambot_details[:800] if spambot_details else "未知"),
-                    html_line("时间", ops_event_time()),
-                ]),
-                dedup_key=f"spambot_restricted:{account_id}",
-                cooldown_seconds=1800,
-            )
-        return status_res
-    except asyncio.TimeoutError:
-        return set_login_status_check_failed(
-            account_id,
-            "检测登录状态超时，已保留上一次登录状态；请稍后重试，或检查代理/Telegram 限流。",
-            source="login-status-timeout",
-            is_connected=bool(active_clients.get(account_id) and active_clients[account_id].is_connected()),
+        # Check and update translation bot status (只有 force=True 时才执行重型检测)
+        if force:
+            try:
+                from db import engine, AccountDb, Session
+                with Session(engine) as db_session:
+                    db_acc = db_session.get(AccountDb, account_id)
+                    if db_acc and db_acc.bot_setup_status != "approved":
+                        await asyncio.wait_for(check_and_update_bot_approval_status(account_id, client, db_session), timeout=8)
+            except Exception as e:
+                warning = f"Bot 授权状态检查失败，登录状态已确认: {e}"
+                check_warnings.append(warning)
+                print(f"Error checking bot status in login/status check: {e}")
+
+        # Fetch or use cached spambot status (日常 force=False 的检测不重新查 SpamBot 以规避限流)
+        import time
+        cached = spambot_cache.get(account_id)
+        if cached and not force:
+            # 日常同步直接复用历史缓存，不查 SpamBot
+            spambot_status = cached["status"]
+            spambot_details = cached["details"]
+            spambot_time = cached["timestamp"]
+        elif cached and force and (time.time() - cached["timestamp"] < 300):
+            # 即使 force=True，如果 5 分钟内刚查过，也复用缓存，防止频率过高被限流
+            spambot_status = cached["status"]
+            spambot_details = cached["details"]
+            spambot_time = cached["timestamp"]
+        elif is_occupied_fallback:
+            # 如果是占用降级模式，绝不去并发请求 SpamBot，100% 安全地复用本地缓存数据返回
+            spambot_status = cached.get("status", "unknown") if cached else "unknown"
+            spambot_details = cached.get("details", "账号执行任务中") if cached else "账号执行任务中"
+            spambot_time = cached.get("timestamp") if cached else None
+        else:
+            # 只有没有缓存，或 force=True 且缓存过期时才去查重型的 get_spambot_status
+            try:
+                res = await asyncio.wait_for(get_spambot_status(client), timeout=12)
+                spambot_status = res["status"]
+                spambot_details = res["details"]
+                spambot_time = time.time()
+                spambot_cache[account_id] = {
+                    "status": spambot_status,
+                    "details": spambot_details,
+                    "timestamp": spambot_time
+                }
+                save_spambot_cache(spambot_cache)
+            except Exception as e:
+                warning = f"SpamBot 检测失败，登录状态已确认: {e}"
+                check_warnings.append(warning)
+                if cached:
+                    spambot_status = cached.get("status", "unknown")
+                    spambot_details = cached.get("details", "")
+                    spambot_time = cached.get("timestamp")
+                print(f"[LoginStatus] spambot check failed for {account_id}: {e}")
+
+    status_res = {
+        "is_connected": is_connected,
+        "is_authorized": is_authorized,
+        "me": me_info,
+        "spambot_status": spambot_status,
+        "spambot_details": spambot_details,
+        "spambot_time": spambot_time,
+        "bot_setup_status": db_acc.bot_setup_status if db_acc and is_authorized else "not_started",
+        "error": "; ".join(check_warnings) if check_warnings else None,
+        "last_error": "; ".join(check_warnings) if check_warnings else None,
+        "status_check_failed": bool(check_warnings),
+        "status_check_warnings": check_warnings,
+    }
+    status_res = set_account_status(account_id, status_res, source="login-status")
+    if is_authorized and spambot_status == "restricted":
+        send_ops_bot_notification(
+            "\n".join([
+                "🚨 <b>账号可能被限制</b>",
+                html_line("账号", get_account_notify_label(account_id)),
+                html_line("状态", "SpamBot restricted"),
+                html_line("详情", spambot_details[:800] if spambot_details else "未知"),
+                html_line("时间", ops_event_time()),
+            ]),
+            dedup_key=f"spambot_restricted:{account_id}",
+            cooldown_seconds=1800,
         )
-    except Exception as e:
-        err_msg = str(e).lower()
-        is_deactivated = False
-        if "deactivated" in err_msg or "deleted" in err_msg or "deactive" in err_msg or isinstance(e, UserDeactivatedError):
-            is_deactivated = True
-        is_auth_lost = any(
-            marker in err_msg
-            for marker in [
-                "auth key unregistered",
-                "authkeyunregistered",
-                "session revoked",
-                "user deactivated",
-                "unauthorized",
-                "not authorized",
-            ]
-        )
-        if not is_deactivated and not is_auth_lost:
-            return set_login_status_check_failed(
-                account_id,
-                f"检测登录状态失败，已保留上一次登录状态: {str(e)}",
-                source="login-status-error",
-                is_connected=bool(active_clients.get(account_id) and active_clients[account_id].is_connected()),
-            )
-
-        # Handle deactivated or banned account by updating DB/config, memory store, and notifying via Bot
-        await handle_deactivated_or_banned_account(account_id, e)
-
-        status_res = {
-            "is_connected": False,
-            "is_authorized": False,
-            "is_deactivated": is_deactivated,
-            "error": str(e),
-            "last_error": str(e),
-            "status_check_failed": True,
-        }
-        status_res = set_account_status(account_id, status_res, source="login-status-error")
-        return status_res
-
+    return status_res
 @app.post("/api/login/send-code")
 async def login_send_code(req: LoginStartRequest, user: dict = Depends(get_current_user)):
     """Initializes connection and requests login verification code."""
