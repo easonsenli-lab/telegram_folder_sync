@@ -90,16 +90,68 @@ async def audit_group_bot_rules(client, chat_id: int, group_title: str, username
         human_message_bytes = []
 
         async def try_fetch_messages(target_client):
+            from telethon import types
+            resolved_entity = None
+            
+            # 1. 优先使用公开用户名 username 获取，这在 Telegram 中是最稳健、最不容易出错的方法
+            if username:
+                try:
+                    resolved_entity = await target_client.get_entity(str(username).strip())
+                except Exception as ent_err:
+                    print(f"[Bot审计] 尝试使用用户名 '{username}' 获取实体失败: {ent_err}")
+            
+            # 2. 如果用户名没拿到，通过 ID 进行多重 Peer 类型重试获取
+            if not resolved_entity:
+                clean_id_str = str(chat_id).strip()
+                # 提取纯数字部分
+                raw_id_str = clean_id_str
+                if raw_id_str.startswith("-100"):
+                    raw_id_str = raw_id_str[4:]
+                elif raw_id_str.startswith("-"):
+                    raw_id_str = raw_id_str[1:]
+                
+                try:
+                    val_id = int(raw_id_str)
+                except ValueError:
+                    val_id = None
+                
+                if val_id is not None:
+                    # 依次尝试：PeerChannel -> PeerChat -> 负数整数 -> 原始整数
+                    for peer in [
+                        types.PeerChannel(val_id),
+                        types.PeerChat(val_id),
+                        -val_id,
+                        int(clean_id_str)
+                    ]:
+                        try:
+                            resolved_entity = await target_client.get_entity(peer)
+                            if resolved_entity:
+                                print(f"[Bot审计] 通过 Peer/ID 转换模式 ({type(peer).__name__}) 成功定位实体。")
+                                break
+                        except Exception:
+                            continue
+            
+            # 3. 兜底：如果上面均失败，使用原始 chat_id 直接获取
+            if not resolved_entity:
+                try:
+                    # 尝试转成整数，或者直接传
+                    try:
+                        resolved_entity = await target_client.get_entity(int(str(chat_id).strip()))
+                    except ValueError:
+                        resolved_entity = await target_client.get_entity(chat_id)
+                except Exception as final_err:
+                    raise Exception(f"无法定位群组实体: {final_err}")
+
             t_admin_ids = set()
             try:
                 from telethon.tl.types import ChannelParticipantsAdmins
-                participants = await target_client.get_participants(chat_id, filter=ChannelParticipantsAdmins())
+                participants = await target_client.get_participants(resolved_entity, filter=ChannelParticipantsAdmins())
                 for p in participants:
                     t_admin_ids.add(p.id)
             except Exception:
                 pass
             
-            t_messages = await target_client.get_messages(chat_id, limit=90)
+            t_messages = await target_client.get_messages(resolved_entity, limit=90)
             t_pin = ""
             for m in t_messages:
                 if m and getattr(m, "pinned", False) and m.text:
