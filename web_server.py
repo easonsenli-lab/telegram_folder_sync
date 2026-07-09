@@ -158,6 +158,10 @@ from services.scraping_service import (
 )
 # --- MODULAR SERVICES IMPORTS ---
 from services.shared_state import (
+    get_account_status,
+    save_spambot_cache,
+    login_states,
+    cleanup_tasks_progress,
     account_operation_locks,
     active_clients,
     active_clients_last_accessed,
@@ -4774,6 +4778,8 @@ async def update_profile_username(account_id: str, req: ProfileUsernameRequest, 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update username: {str(e)}")
 
+HISTORICAL_FIGURES = []
+
 def profile_name_to_username_part(value: str, *, keep_case: bool = False) -> str:
     raw = str(value or "").strip()
     if not raw:
@@ -7745,6 +7751,9 @@ async def send_strategy_message(req: SendStrategyMessageRequest):
 
         if not await check_can_speak(selected_client, peer):
             raise Exception("无该群发言权限，已跳过未发送")
+        
+        audit = {"message_id": 0, "reason": "手动测试发送，跳过审计限制"}
+        audit_hint = ""
         await selected_client.send_message(peer, selected_message)
 
         # Log this send operation

@@ -386,3 +386,11 @@ def release_account_task_usage(task_id: str, account_ids: Optional[List[str]] = 
         if not tasks:
             account_task_registry.pop(account_id, None)
     publish_task_status_for_accounts(list(affected), source=source)
+
+
+# Login temporary verification code states
+login_states = {}  # Dict[str, dict]
+
+
+def get_account_status(account_id: str) -> dict:
+    return account_status_store.get(str(account_id)) or {}
