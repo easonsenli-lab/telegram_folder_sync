@@ -915,15 +915,16 @@ async def resolve_group(req, user):
         stmt = query_allowed_accounts(session, user)
         allowed_account_ids = {a.id for a in filter_executable_accounts_for_task(session.exec(stmt).all())}
 
-    # 1. Get first authorized client
-    client = None
+    # 1. 收集当前所有可用的在线客户端
+    available_clients = []
     for account_id, c in list(active_clients.items()):
-        if account_id in allowed_account_ids and c.is_connected() and await c.is_user_authorized():
-            client = c
-            break
+        try:
+            if account_id in allowed_account_ids and c.is_connected() and await c.is_user_authorized():
+                available_clients.append((account_id, c))
+        except Exception:
+            continue
 
-    if not client:
-        # Check list of accounts to see if any can be connected and verified
+    if not available_clients:
         from account_manager import list_accounts
         accounts = list_accounts()
         for path in accounts:
@@ -933,12 +934,11 @@ async def resolve_group(req, user):
             try:
                 c = await get_client(account_id)
                 if c.is_connected() and await c.is_user_authorized():
-                    client = c
-                    break
+                    available_clients.append((account_id, c))
             except Exception:
                 continue
 
-    if not client:
+    if not available_clients:
         raise HTTPException(
             status_code=400,
             detail="检测到未登录任何电报账号。请先到“账号登录”页面成功登录一个账号后重试。"
@@ -950,83 +950,112 @@ async def resolve_group(req, user):
 
     import re
     invite_hash = None
-    private_match = re.search(r'(?:t\.me|telegram\.me)/(?:joinchat/|\+)?([a-zA-Z0-9_\-]{5,32})', re.sub(r"^https?:/*", "", link, flags=re.IGNORECASE))
+    private_match = re.search(r'(?:t\.me|telegram\.me)/(?:joinchat/|\+)?([a-zA-Z0-9_\\-]{5,32})', re.sub(r"^https?:/*", "", link, flags=re.IGNORECASE))
     if private_match and ("joinchat/" in link or "+" in link):
         invite_hash = private_match.group(1)
 
-    if invite_hash:
+    res_data = None
+    last_exception = None
+    resolved_ok = False
+
+    # 2. 依次轮询大号进行 8 秒的超时容灾解析
+    for account_id, client in available_clients:
         try:
-            invite = await client(functions.messages.CheckChatInviteRequest(hash=invite_hash))
-            if isinstance(invite, types.ChatInviteAlready):
-                chat = invite.chat
-                chat_type = "channel" if getattr(chat, "broadcast", False) else "group"
-                member_count = getattr(chat, "participants_count", 0) or 0
+            if invite_hash:
+                invite = await asyncio.wait_for(
+                    client(functions.messages.CheckChatInviteRequest(hash=invite_hash)),
+                    timeout=8.0
+                )
+                if isinstance(invite, types.ChatInviteAlready):
+                    chat = invite.chat
+                    chat_type = "channel" if getattr(chat, "broadcast", False) else "group"
+                    member_count = getattr(chat, "participants_count", 0) or 0
+                    res_data = {
+                        "id": str(chat.id),
+                        "title": chat.title,
+                        "username": getattr(chat, "username", "") or "",
+                        "type": chat_type,
+                        "memberCount": member_count,
+                        "enabled": True,
+                        "category": classify_group_category_from_text(chat.title, []),
+                        "price": req.price or 0.0
+                    }
+                else: # ChatInvite
+                    chat_type = "channel" if invite.broadcast else "group"
+                    res_data = {
+                        "id": f"invite_{invite_hash}",
+                        "title": invite.title,
+                        "username": "",
+                        "type": chat_type,
+                        "memberCount": invite.participants_count,
+                        "enabled": True,
+                        "category": classify_group_category_from_text(invite.title, []),
+                        "price": req.price or 0.0
+                    }
+            else:
+                # Public username, link, or ID
+                identifier = normalize_group_identifier(link)
+                if isinstance(identifier, str) and (identifier.isdigit() or (identifier.startswith("-") and identifier[1:].isdigit())):
+                    identifier = int(identifier)
+
+                entity = await asyncio.wait_for(
+                    client.get_entity(identifier),
+                    timeout=8.0
+                )
+                if isinstance(entity, types.User):
+                    raise HTTPException(status_code=400, detail="该链接指向的是个人账户，群组库只允许添加群组或频道。")
+
+                chat_type = "channel" if getattr(entity, "broadcast", False) else "group"
+
+                # Get participant count
+                member_count = 0
+                try:
+                    if isinstance(entity, types.Chat):
+                        full_chat = await asyncio.wait_for(
+                            client(functions.messages.GetFullChatRequest(chat_id=entity.id)),
+                            timeout=6.0
+                        )
+                    else:
+                        full_chat = await asyncio.wait_for(
+                            client(functions.channels.GetFullChannelRequest(channel=entity)),
+                            timeout=6.0
+                        )
+
+                    if hasattr(full_chat, "full_chat") and hasattr(full_chat.full_chat, "participants_count"):
+                        member_count = full_chat.full_chat.participants_count
+                    elif hasattr(full_chat, "chats") and len(full_chat.chats) > 0:
+                        member_count = getattr(full_chat.chats[0], "participants_count", 0) or 0
+                except Exception:
+                    member_count = getattr(entity, "participants_count", 0) or 0
+
                 res_data = {
-                    "id": str(chat.id),
-                    "title": chat.title,
-                    "username": getattr(chat, "username", "") or "",
+                    "id": str(entity.id),
+                    "title": getattr(entity, "title", ""),
+                    "username": getattr(entity, "username", "") or "",
                     "type": chat_type,
                     "memberCount": member_count,
                     "enabled": True,
-                    "category": classify_group_category_from_text(chat.title, []),
+                    "category": await classify_group_category_for_import(client, entity, getattr(entity, "title", ""), req.category),
                     "price": req.price or 0.0
                 }
-            else: # ChatInvite
-                chat_type = "channel" if invite.broadcast else "group"
-                res_data = {
-                    "id": f"invite_{invite_hash}",
-                    "title": invite.title,
-                    "username": "",
-                    "type": chat_type,
-                    "memberCount": invite.participants_count,
-                    "enabled": True,
-                    "category": classify_group_category_from_text(invite.title, []),
-                    "price": req.price or 0.0
-                }
+            
+            resolved_ok = True
+            print(f"[解析群组] 使用账号 {account_id} 成功定位并解析群组。")
+            break
         except Exception as e:
-            raise HTTPException(status_code=400, detail=map_telegram_error(e, "解析私有邀请链接失败"))
-    else:
-        # Public username, link, or ID
-        identifier = normalize_group_identifier(link)
+            last_exception = e
+            print(f"[解析群组] 使用账号 {account_id} 解析失败或超时: {e}，尝试下一个账号...")
+            continue
 
-        # Handle numeric ID
-        if isinstance(identifier, str) and (identifier.isdigit() or (identifier.startswith("-") and identifier[1:].isdigit())):
-            identifier = int(identifier)
+    if not resolved_ok:
+        detail_msg = "目标链接在电报端响应卡死或失效，已记录并跳过。"
+        if last_exception:
+            if isinstance(last_exception, asyncio.TimeoutError):
+                detail_msg = "校验超时 (15s) - 目标链接在电报端响应卡死，已记录并跳过。"
+            else:
+                detail_msg = map_telegram_error(last_exception, "无法解析该群组/频道标识符")
+        raise HTTPException(status_code=400, detail=detail_msg)
 
-        try:
-            entity = await client.get_entity(identifier)
-            if isinstance(entity, types.User):
-                raise HTTPException(status_code=400, detail="该链接指向的是个人账户，群组库只允许添加群组或频道。")
-
-            chat_type = "channel" if getattr(entity, "broadcast", False) else "group"
-
-            # Get participant count
-            member_count = 0
-            try:
-                if isinstance(entity, types.Chat):
-                    full_chat = await client(functions.messages.GetFullChatRequest(chat_id=entity.id))
-                else:
-                    full_chat = await client(functions.channels.GetFullChannelRequest(channel=entity))
-
-                if hasattr(full_chat, "full_chat") and hasattr(full_chat.full_chat, "participants_count"):
-                    member_count = full_chat.full_chat.participants_count
-                elif hasattr(full_chat, "chats") and len(full_chat.chats) > 0:
-                    member_count = getattr(full_chat.chats[0], "participants_count", 0) or 0
-            except Exception:
-                member_count = getattr(entity, "participants_count", 0) or 0
-
-            res_data = {
-                "id": str(entity.id),
-                "title": getattr(entity, "title", ""),
-                "username": getattr(entity, "username", "") or "",
-                "type": chat_type,
-                "memberCount": member_count,
-                "enabled": True,
-                "category": await classify_group_category_for_import(client, entity, getattr(entity, "title", ""), req.category),
-                "price": req.price or 0.0
-            }
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=map_telegram_error(e, "无法解析该群组/频道标识符"))
 
     # 3. Add to database if not already there
     from db import engine, GroupDb, Session, select
