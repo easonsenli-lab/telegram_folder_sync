@@ -6378,20 +6378,39 @@ async def get_login_status(account_id: str, force: bool = False, user: dict = De
     client = None
     is_occupied_fallback = False
     
+    # 0. 【核心前置过滤器】先判定大号是否正被子进程或忙碌任务独占，100% 避免去强行获取 get_client 导致 Session 锁竞争挂起超时
+    from services.client_manager import active_processes, find_campaign_process
+    from services.shared_state import get_account_status
+    
+    acc_status = get_account_status(account_id) or {}
+    is_occupied_db = acc_status.get("availability_status") == "occupied"
+    is_subprocess_campaign_running = account_id in active_processes and active_processes[account_id].poll() is None
+    if not is_subprocess_campaign_running:
+        is_subprocess_campaign_running = find_campaign_process(account_id) is not None
+        
+    if is_occupied_db or is_subprocess_campaign_running:
+        is_occupied_fallback = True
+        is_connected = True
+        is_authorized = True
+        print(f"[LoginStatus] Proactively detected occupied account {account_id}. Bypassing connection to avoid lock block.")
     try:
-        # 1. 优先尝试从内存共享池中穿透获取已经跟 Telegram 连好的活跃 client，免去连接锁定冲突与 API 握手开销
-        from services.client_manager import active_clients
-        mem_client = active_clients.get(account_id)
-        if mem_client and mem_client.is_connected():
-            client = mem_client
-            is_connected = True
-            is_authorized = True
-            print(f"[LoginStatus] Directly reusing active memory client for occupied/live account {account_id}.")
+        if is_occupied_fallback:
+            # 既然已被判定为占用，直接跳过连接建立
+            pass
         else:
-            # 2. 内存无连接，才尝试建立标准加锁连接
-            client = await asyncio.wait_for(get_client(account_id), timeout=15)
-            is_connected = client.is_connected()
-            is_authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=8) if is_connected else False
+            # 1. 优先尝试从内存共享池中穿透获取已经跟 Telegram 连好的活跃 client，免去连接锁定冲突与 API 握手开销
+            from services.client_manager import active_clients
+            mem_client = active_clients.get(account_id)
+            if mem_client and mem_client.is_connected():
+                client = mem_client
+                is_connected = True
+                is_authorized = True
+                print(f"[LoginStatus] Directly reusing active memory client for occupied/live account {account_id}.")
+            else:
+                # 2. 内存无连接，才尝试建立标准加锁连接
+                client = await asyncio.wait_for(get_client(account_id), timeout=15)
+                is_connected = client.is_connected()
+                is_authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=8) if is_connected else False
     except Exception as err:
         # 3. 捕获 400/409 (忙碌锁) 或 TimeoutError (等待锁超时卡死)
         # 证明大号正在运行任务且 Session 被独占，我们启动自适应降级，直接提取最新缓存数据，确保前台流畅秒回！
