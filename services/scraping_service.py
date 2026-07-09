@@ -7,6 +7,7 @@ import logging
 import traceback
 from pathlib import Path
 from typing import Dict, Any, List, Optional
+from typing import Any
 from datetime import datetime, timezone
 
 from pydantic import BaseModel
@@ -26,6 +27,63 @@ from services.maintenance_service import load_expansion_config, get_company_expa
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config.json"
+
+
+def calculate_group_library_scores(member_count: int = 0, group_type: str = "group", has_username: bool = False, is_valid: bool = True) -> dict:
+    """Cheap sync-time score for the group library; deep message analysis stays in scraper/expansion."""
+    if not is_valid:
+        return {
+            "quality_score": 0,
+            "relevance_score": 0,
+            "activity_score": 0,
+            "engagement_score": 0,
+        }
+
+    members = max(0, int(member_count or 0))
+    if members >= 10000:
+        activity = 80
+    elif members >= 5000:
+        activity = 70
+    elif members >= 1000:
+        activity = 58
+    elif members >= 100:
+        activity = 42
+    elif members > 0:
+        activity = 25
+    else:
+        activity = 10
+
+    if group_type == "supergroup":
+        engagement = 70
+    elif group_type == "group":
+        engagement = 58
+    elif group_type == "channel":
+        engagement = 28
+    else:
+        engagement = 35
+
+    relevance = 55 if has_username else 45
+    quality = round(activity * 0.55 + engagement * 0.25 + relevance * 0.20)
+    return {
+        "quality_score": max(0, min(100, quality)),
+        "relevance_score": max(0, min(100, relevance)),
+        "activity_score": max(0, min(100, activity)),
+        "engagement_score": max(0, min(100, engagement)),
+    }
+
+
+def apply_group_library_scores(group: Any, is_valid: bool = True) -> dict:
+    scores = calculate_group_library_scores(
+        member_count=getattr(group, "memberCount", 0) or 0,
+        group_type=getattr(group, "type", "group") or "group",
+        has_username=bool(getattr(group, "username", "") or ""),
+        is_valid=is_valid,
+    )
+    group.quality_score = scores["quality_score"]
+    group.relevance_score = scores["relevance_score"]
+    group.activity_score = scores["activity_score"]
+    group.engagement_score = scores["engagement_score"]
+    return scores
 
 
 def format_sse(event: str, data: dict) -> str:
