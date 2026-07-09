@@ -16,6 +16,7 @@ from fastapi import HTTPException, BackgroundTasks, Depends
 from sqlmodel import Session, select
 
 from db import engine, AccountDb, GroupDb
+from telethon import types, functions, errors
 
 # Import our client and DB layers
 from services.shared_state import (
