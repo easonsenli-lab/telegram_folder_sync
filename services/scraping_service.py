@@ -19,7 +19,8 @@ from db import engine, AccountDb, GroupDb
 # Import our client and DB layers
 from services.shared_state import (
     active_scraper_tasks, active_clients, client_locks,
-    register_account_task_usage, filter_executable_accounts_for_task
+    register_account_task_usage, filter_executable_accounts_for_task,
+    release_account_task_usage
 )
 from services.client_manager import get_client, account_operation_guard
 from typing import Any
@@ -191,6 +192,7 @@ async def sync_groups_status(user: dict):
     (title, username, memberCount, enabled) using an active Telegram client.
     """
     from db import engine, GroupDb, AccountDb, Session, select
+    from web_server import load_groups
     import asyncio
     import random
     logs = []
@@ -879,6 +881,7 @@ async def stream_groups_sync(user: dict):
 
 
 async def classify_group_category_for_import(client, entity, fallback_title: str, fallback_category: Optional[str] = None) -> str:
+    from web_server import classify_group_category_from_text
     valid_categories = {"中文长", "中文短", "英文长", "英文短"}
     if fallback_category in valid_categories:
         default_category = fallback_category
@@ -898,6 +901,12 @@ async def classify_group_category_for_import(client, entity, fallback_title: str
 
 
 async def resolve_group(req, user):
+    from web_server import (
+        normalize_group_identifier,
+        map_telegram_error,
+        find_group_by_username_or_id,
+        classify_group_category_from_text
+    )
     # Get all account IDs of this user's company
     from db import engine, AccountDb, Session, select
     with Session(engine) as session:
