@@ -6400,7 +6400,7 @@ async def get_login_status(account_id: str, force: bool = False, user: dict = De
         
         if err_name == "HTTPException" and getattr(err, "status_code", 0) in (400, 409):
             is_error_to_fallback = True
-        elif err_name in ("TimeoutError", "asyncio.TimeoutError") or isinstance(err, (TimeoutError, asyncio.TimeoutError)):
+        elif err_name in ("TimeoutError", "asyncio.TimeoutError") or isinstance(err, TimeoutError) or "timeout" in err_name.lower():
             is_error_to_fallback = True
             
         if is_error_to_fallback:
